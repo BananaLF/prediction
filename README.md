@@ -1,0 +1,86 @@
+# Prediction-market structural-arbitrage scanner
+
+This is a read-only research scanner. It reads public Polymarket catalog,
+order-book, fee, and WebSocket data; it cannot authenticate, sign, hold a
+wallet, place an order, or execute a trade.
+
+The default research budget is `1000`, and the minimum modeled return is
+`"0.0075"`: **0.75% = 0.0075**, not 0.75. All financial inputs and evidence
+remain exact decimal strings.
+
+## Quick start
+
+```console
+python -m venv .venv
+.venv/bin/pip install -e '.[test]'
+.venv/bin/predmarket --help
+.venv/bin/predmarket sync-markets --limit 100 --max-pages 2
+.venv/bin/predmarket scan-once --limit 100
+.venv/bin/predmarket --json report --limit 100
+```
+
+A deterministic targeted confirmation can be requested when the exact
+condition and token IDs are already known:
+
+```console
+.venv/bin/predmarket scan-once \
+  --condition CONDITION_ID --yes-token YES_TOKEN_ID --no-token NO_TOKEN_ID
+```
+
+`watch` uses the public WebSocket only to discover a possible price movement.
+Every callback then obtains two independent REST book snapshots and the
+authoritative CLOB market fee schedule before assigning a formal status:
+
+```console
+.venv/bin/predmarket watch --max-connections 3 --max-events 500
+```
+
+Audited logical rules are managed without silently replacing an existing
+ID/version:
+
+```console
+.venv/bin/predmarket relations validate rules/example-implication.yaml
+.venv/bin/predmarket relations import my-reviewed-rule.yaml
+.venv/bin/predmarket relations list
+```
+
+## Architecture and evidence
+
+The pipeline is:
+
+1. Gamma discovers exact binary YES/NO markets.
+2. One CLOB REST client finds a cheap complete set.
+3. An independent CLOB REST client confirms full executable depth.
+4. Market-info binds the authoritative fee curve to both legs.
+5. Simulation walks depth using exact decimals; latency, partial-fill, rule,
+   conversion, settlement, bankroll, and return gates then classify the result.
+6. SQLite stores canonical evidence before a notification can be claimed.
+
+`REJECTED` means a required gate failed. `RESEARCH_CANDIDATE` means the
+mathematics may be interesting but unresolved risk prevents an executable
+classification. `SNAPSHOT_EXECUTABLE` means all modeled gates passed for the
+captured REST snapshots; it is not a promise that a real trade can be filled.
+
+`replay OPPORTUNITY_ID` returns immutable core evidence separately from the
+notification audit. `report` produces bounded status/reason/path counts,
+executable economics, nearest-rank p50/p95/p99 latency, and delivery outcomes.
+For empty latency samples all quantiles are `null`; for one sample all three
+equal that sample.
+
+## Important limitations
+
+- The scanner does not execute both legs, so it cannot provide simultaneous
+  fills.
+- Prices can move between observation and any manual action.
+- Partial fills, shallow unwind liquidity, fee changes, data latency, local
+  queue overflow, and connection loss can erase an apparent edge.
+- Logical rules require human semantic review and can still be wrong or become
+  stale.
+- Conversion, settlement interpretation, release timing, and platform behavior
+  remain risks even where currently evidenced.
+- Desktop delivery can fail or be uncertain; SQLite evidence remains the source
+  of truth.
+- No 24-hour soak test or seven-day observation is claimed by this repository.
+
+The program is a measurement and evidence tool, not financial advice and not a
+guaranteed-profit system.

@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any
@@ -1497,11 +1498,117 @@ class OpportunityStore:
             raise ValueError("stored evidence is not canonical")
         return replayed
 
+    async def replay_opportunity(
+        self, opportunity_id: str
+    ) -> NotificationAuditReplay:
+        _identifier("opportunity_id", opportunity_id)
+        rows = await self._require_connection().execute_fetchall(
+            """SELECT bundle_id FROM opportunities WHERE id = ?
+               ORDER BY bundle_id DESC LIMIT 2""",
+            (opportunity_id,),
+        )
+        if not rows:
+            raise KeyError(opportunity_id)
+        return await self.replay_with_notification_audit(str(rows[0][0]))
+
     async def list_opportunities(self) -> list[tuple[str, str, str]]:
         rows = await self._require_connection().execute_fetchall(
             "SELECT id, status, bundle_id FROM opportunities ORDER BY bundle_id"
         )
         return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
+
+    async def report(self, *, limit: int = 100) -> dict[str, object]:
+        """Return a bounded deterministic summary.
+
+        Latency quantiles use nearest-rank. Empty samples produce ``None``;
+        a one-element sample returns that value for every percentile.
+        """
+        if type(limit) is not int or not 1 <= limit <= 10_000:
+            raise ValueError("limit must be an integer in 1..10000")
+        connection = self._require_connection()
+        rows = await connection.execute_fetchall(
+            """SELECT o.status, o.payload, r.payload, b.canonical_json
+               FROM opportunities o
+               JOIN risk_assessments r
+                 ON r.bundle_id = o.bundle_id AND r.opportunity_id = o.id
+               JOIN evidence_bundles b ON b.id = o.bundle_id
+               ORDER BY o.bundle_id DESC LIMIT ?""",
+            (limit + 1,),
+        )
+        truncated = len(rows) > limit
+        rows = rows[:limit]
+        statuses: dict[str, int] = {}
+        reasons: dict[str, int] = {}
+        paths: dict[str, int] = {}
+        economics: list[dict[str, str]] = []
+        latencies: list[int] = []
+        for status, opportunity_json, risk_json, canonical_json in rows:
+            status_text = str(status)
+            statuses[status_text] = statuses.get(status_text, 0) + 1
+            opportunity = json.loads(opportunity_json)
+            risk = json.loads(risk_json)
+            bundle = json.loads(canonical_json)
+            for reason in risk.get("reasons", ()):
+                reasons[str(reason)] = reasons.get(str(reason), 0) + 1
+            actions = bundle.get("actions", [])
+            kinds = {str(action.get("kind", "unknown")) for action in actions}
+            path = (
+                "IMMEDIATE_CONVERSION"
+                if "MERGE" in kinds or "NEG_RISK_CONVERT" in kinds
+                else ("HOLD_TO_RESOLUTION" if "REDEEM" in kinds else "unknown")
+            )
+            paths[path] = paths.get(path, 0) + 1
+            if status_text == "SNAPSHOT_EXECUTABLE":
+                economics.append({
+                    key: str(opportunity[key])
+                    for key in (
+                        "quantity", "total_investment", "minimum_proceeds",
+                        "net_profit", "net_return",
+                    )
+                })
+            latencies.extend(
+                int(item["processing_latency_ms"])
+                for item in bundle.get("latency_metrics", [])
+            )
+        latencies.sort()
+
+        def nearest_rank(percentile: int) -> int | None:
+            if not latencies:
+                return None
+            rank = max(1, math.ceil(percentile * len(latencies) / 100))
+            return latencies[rank - 1]
+
+        notification_rows = await connection.execute_fetchall(
+            """SELECT status, COUNT(*) FROM notification_attempts
+               GROUP BY status ORDER BY status"""
+        )
+        claims = await connection.execute_fetchall(
+            """SELECT state, COUNT(*) FROM notification_claims
+               GROUP BY state ORDER BY state"""
+        )
+        return {
+            "total": len(rows),
+            "truncated": truncated,
+            "by_status": dict(sorted(statuses.items())),
+            "by_reason": dict(sorted(reasons.items())),
+            "by_path": dict(sorted(paths.items())),
+            "executable_economics": economics,
+            "latency_ms": {
+                "p50": nearest_rank(50),
+                "p95": nearest_rank(95),
+                "p99": nearest_rank(99),
+            },
+            "notification_attempts": {
+                str(status): int(count) for status, count in notification_rows
+            },
+            "notification_claims": {
+                str(state): int(count) for state, count in claims
+            },
+            "delivery_uncertain": sum(
+                int(count) for state, count in claims if state == "CLAIMED"
+            ),
+            "ws_metrics": None,
+        }
 
     async def list_runs(self) -> list[tuple[str, str]]:
         rows = await self._require_connection().execute_fetchall(

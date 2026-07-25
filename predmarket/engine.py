@@ -196,6 +196,8 @@ class EngineResult:
     minimum_profit: Decimal | None
     minimum_return: Decimal | None
     risk_reasons: tuple[str, ...]
+    condition_id: str = "unknown"
+    book_hashes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _identifier("opportunity_id", self.opportunity_id)
@@ -221,6 +223,12 @@ class EngineResult:
                 raise TypeError(f"{name} must be Decimal or None")
         if type(self.risk_reasons) is not tuple:
             raise TypeError("risk_reasons must be tuple")
+        _identifier("condition_id", self.condition_id)
+        if (
+            type(self.book_hashes) is not tuple
+            or any(type(value) is not str or not value for value in self.book_hashes)
+        ):
+            raise TypeError("book_hashes must be a tuple of nonempty strings")
         if (
             self.notification_fingerprint is not None
             and type(self.notification_fingerprint) is not str
@@ -528,6 +536,11 @@ class StructuralArbitrageEngine:
             economics.profit if economics else None,
             economics.rate if economics else None,
             tuple(risk_reasons),
+            market.condition_id,
+            tuple(
+                confirmed[token].book.book_hash
+                for token in market.token_ids if token in confirmed
+            ),
         )
         if status is OpportunityStatus.SNAPSHOT_EXECUTABLE and newly_persisted:
             assert economics is not None and fee_confirmation is not None
