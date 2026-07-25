@@ -232,7 +232,13 @@ def optimize_quantities(
             cumulative += level.size
             candidates.add(cumulative / action.units)
 
-    results: list[SimulationResult] = []
+    # Capital is piecewise affine between depth breakpoints: at a fixed price,
+    # both gross cash and the fee formula are linear in shares.  Evaluate every
+    # anchor (including over-bankroll anchors), then interpolate the exact
+    # bankroll crossing within the first straddling segment.  Decimal division
+    # may round upward at the active context precision, so conservatively move
+    # one representable Decimal down if verification finds an overshoot.
+    anchors: list[SimulationResult] = []
     for candidate in sorted(candidates):
         if any(
             candidate * action.units < books[action.token_id].minimum_order_size
@@ -246,8 +252,40 @@ def optimize_quantities(
             )
         except InsufficientDepth:
             continue
+        anchors.append(result)
+
+    extra: list[SimulationResult] = []
+    for lower, upper in zip(anchors, anchors[1:]):
+        low_cap = lower.maximum_capital_used
+        high_cap = upper.maximum_capital_used
+        if not (low_cap <= bankroll < high_cap):
+            continue
+        if high_cap <= low_cap:
+            continue
+        boundary = lower.quantity + (
+            (bankroll - low_cap)
+            * (upper.quantity - lower.quantity)
+            / (high_cap - low_cap)
+        )
+        if boundary <= lower.quantity or boundary >= upper.quantity:
+            continue
+        result = simulate_path(
+            path, boundary, books, fees, safety_buffer, conversion_cost
+        )
+        while result.maximum_capital_used > bankroll:
+            boundary = boundary.next_minus()
+            if boundary <= lower.quantity:
+                break
+            result = simulate_path(
+                path, boundary, books, fees, safety_buffer, conversion_cost
+            )
         if result.maximum_capital_used <= bankroll:
-            results.append(result)
+            extra.append(result)
+
+    results = [
+        result for result in (*anchors, *extra)
+        if result.maximum_capital_used <= bankroll
+    ]
     return tuple(sorted(results, key=lambda result: (
         result.maximum_capital_used, result.minimum_profit
     )))

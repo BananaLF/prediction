@@ -265,6 +265,24 @@ def test_optimizer_uses_relevant_depth_breakpoints_and_bankroll(
     assert max(r.quantity for r in reduced_results) <= max(r.quantity for r in results)
 
 
+def test_optimizer_adds_exact_bankroll_boundary_inside_depth_segment() -> None:
+    deep = {
+        "yes": book("yes", ((".39", "1000"),), ((".40", "1000"),), minimum="1"),
+        "no": book("no", ((".39", "1000"),), ((".40", "1000"),), minimum="1"),
+    }
+    results = optimize_quantities(
+        binary_underpriced_path("yes", "no"),
+        deep,
+        {"yes": fee(), "no": fee()},
+        D("0"),
+        D("0"),
+        D("100"),
+    )
+    best = max(results, key=lambda item: item.quantity)
+    assert best.quantity == D("125")
+    assert best.maximum_capital_used == D("100")
+
+
 def test_optimizer_reports_exact_scaled_relevant_side_breakpoints() -> None:
     scaled_books = {
         "yes": book(

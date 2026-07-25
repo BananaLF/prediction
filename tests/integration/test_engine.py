@@ -1,4 +1,5 @@
 from decimal import Decimal
+from types import MappingProxyType
 
 import pytest
 
@@ -13,6 +14,14 @@ from predmarket.engine import (
 from predmarket.fees import FeeSchedule
 from predmarket.orderbook import OrderBook
 from predmarket.polymarket.clob import BookSnapshot
+from predmarket.relations import (
+    Relation,
+    RelationLeg,
+    RelationState,
+    RelationStatus,
+    SemanticReview,
+)
+from predmarket.storage import OpportunityStore
 
 
 def book(token, ask, bid="0.20", *, now=10_000, received=10_001, mono=10.0, size="100"):
@@ -54,10 +63,11 @@ class Fees:
 
 
 class Store:
-    def __init__(self, fail=False, order=None):
+    def __init__(self, fail=False, order=None, save_result=True):
         self.items = []
         self.fail = fail
         self.order = order
+        self.save_result = save_result
 
     async def save(self, bundle):
         if self.order is not None:
@@ -65,7 +75,7 @@ class Store:
         if self.fail:
             raise RuntimeError("disk")
         self.items.append(bundle)
-        return True
+        return self.save_result
 
 
 class Notice:
@@ -103,6 +113,18 @@ def settings(**changes):
 
 
 def market(**changes):
+    relation = Relation(
+        "binary-rel",
+        1,
+        RelationStatus.ACTIVE,
+        "sha256:abc",
+        (RelationLeg("yes-1", 1), RelationLeg("no-1", 1)),
+        (
+            RelationState("YES", MappingProxyType({"yes-1": 1, "no-1": 0})),
+            RelationState("NO", MappingProxyType({"yes-1": 0, "no-1": 1})),
+        ),
+        SemanticReview("alice", "2026-07-26", "binary complete set"),
+    )
     values = dict(
         event_id="event-1",
         market_id="market-1",
@@ -111,13 +133,7 @@ def market(**changes):
         no_token_id="no-1",
         active=True,
         tradeable=True,
-        relation_id="binary-rel",
-        relation_set_id="binary-set",
-        relation_version=1,
-        relation_audited=True,
-        auditor="alice",
-        provenance_source="catalog",
-        provenance_hash="sha256:abc",
+        relation=relation,
         immediate_conversion_evidenced=True,
         settlement_evidenced=True,
         release_date_known=True,
@@ -162,8 +178,14 @@ async def test_no_initial_candidate_persists_research_without_confirmation_or_no
     confirmation = Books(())
     subject, store, notice = engine(discovery, confirmation)
     result = await subject.evaluate_binary(market())
-    assert result.status is OpportunityStatus.RESEARCH_CANDIDATE
+    assert result.status is OpportunityStatus.REJECTED
     assert result.reason == "no_candidate"
+    assert result.total_investment is None
+    assert store.items[0].data["economics"] == {
+        "status": "NOT_EVALUATED",
+        "reason": "no_candidate",
+    }
+    assert len(store.items[0].data["discovery_books"]) == 2
     assert confirmation.calls == 0
     assert len(store.items) == 1
     assert notice.calls == []
@@ -178,7 +200,24 @@ async def test_candidate_disappears_during_independent_confirmation():
     assert result.status is OpportunityStatus.REJECTED
     assert result.reason == "expired_before_confirmation"
     assert store.items[0].data["producer"]["metadata"]["discovery"]["candidate"] is True
+    assert len(store.items[0].data["discovery_books"]) == 2
+    assert len(store.items[0].data["books"]) == 2
     assert notice.calls == []
+
+
+@pytest.mark.asyncio
+async def test_discovery_and_confirmation_stages_round_trip_replay(tmp_path):
+    discovery = (book("yes-1", "0.45"), book("no-1", "0.45"))
+    confirmation = (book("yes-1", "0.60"), book("no-1", "0.45"))
+    async with OpportunityStore(tmp_path / "engine.sqlite3") as real_store:
+        subject, _, _ = engine(
+            Books(discovery), Books(confirmation), store=real_store
+        )
+        result = await subject.evaluate_binary(market())
+        replayed = await real_store.replay(result.opportunity_id)
+    assert [row["snapshot"]["book_hash"] for row in replayed.data["discovery_books"]]
+    assert [row["snapshot"]["book_hash"] for row in replayed.data["books"]]
+    assert replayed.data["producer"]["metadata"]["pipeline_reason"] == "expired_before_confirmation"
 
 
 @pytest.mark.asyncio
@@ -214,26 +253,30 @@ async def test_exact_profitable_path_persists_before_notify_and_replays():
     assert order == ["save", "notify"]
     assert notice.calls
     evidence = store.items[0]
+    assert {row["direction"] for row in evidence.data["fee_schedules"]} == {"BOTH"}
     assert evidence.data["economics"]["gross_investment"] + evidence.data["economics"]["fees"] == evidence.data["economics"]["total_costs"]
     assert evidence.canonical_json == type(evidence).from_mapping(evidence.data).canonical_json
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "snapshots,changes,reason",
+    "snapshots,changes,timing_reason",
     [
-        ((book("yes-1", "0.45", now=8_000), book("no-1", "0.45", now=8_000)), {}, "data_invalid"),
-        ((book("yes-1", "0.45", now=11_000), book("no-1", "0.45", now=11_000)), {}, "data_invalid"),
-        ((book("yes-1", "0.45", now=10_000), book("no-1", "0.45", now=9_000)), {}, "data_invalid"),
-        ((book("yes-1", "0.45", mono=9.0), book("no-1", "0.45", mono=9.0)), {}, "data_invalid"),
+        ((book("yes-1", "0.45", now=8_000), book("no-1", "0.45", now=8_000)), {}, "stale"),
+        ((book("yes-1", "0.45", now=11_000), book("no-1", "0.45", now=11_000)), {}, "future_exchange_ts"),
+        ((book("yes-1", "0.45", now=10_000), book("no-1", "0.45", now=9_000)), {}, "leg_skew"),
+        ((book("yes-1", "0.45", mono=9.0), book("no-1", "0.45", mono=9.0)), {}, "processing_latency"),
     ],
 )
-async def test_timing_failures_reject(snapshots, changes, reason):
+async def test_timing_failures_reject(snapshots, changes, timing_reason):
     subject, store, notice = engine(Books(snapshots), Books(copies(snapshots)), **changes)
     result = await subject.evaluate_binary(market())
     assert result.status is OpportunityStatus.REJECTED
-    assert reason in result.risk_reasons
-    assert store.items[0].data["risk"]["status"] == "REJECTED"
+    assert "data_invalid" in result.risk_reasons
+    assert timing_reason in result.risk_reasons
+    evidence_reasons = store.items[0].data["risk"]["reasons"]
+    assert "data_invalid" in evidence_reasons
+    assert timing_reason in evidence_reasons
     assert notice.calls == []
 
 
@@ -281,12 +324,47 @@ async def test_market_identity_mismatch_is_persisted_and_rejected():
 
 @pytest.mark.asyncio
 async def test_unaudited_catalog_relation_fails_closed_with_evidence():
+    pending = Relation(
+        "binary-rel", 1, RelationStatus.PENDING, "sha256:pending",
+        (RelationLeg("yes-1", 1), RelationLeg("no-1", 1)),
+        (
+            RelationState("YES", MappingProxyType({"yes-1": 1, "no-1": 0})),
+            RelationState("NO", MappingProxyType({"yes-1": 0, "no-1": 1})),
+        ),
+        None,
+    )
     subject, store, notice = engine(Books(()), Books(()))
-    result = await subject.evaluate_binary(market(relation_audited=False))
+    result = await subject.evaluate_binary(market(relation=pending))
     assert result.reason == "invalid_relation"
     assert result.status is OpportunityStatus.REJECTED
     assert len(store.items) == 1
+    assert store.items[0].data["relation"]["set"]["status"] == "pending"
+    assert store.items[0].data["relation"]["set"]["metadata"]["audited"] is False
     assert notice.calls == []
+
+
+@pytest.mark.asyncio
+async def test_audited_but_non_binary_payoff_relation_is_not_rewritten():
+    wrong = Relation(
+        "wrong-rel", 4, RelationStatus.ACTIVE, "sha256:wrong",
+        (RelationLeg("yes-1", 1), RelationLeg("no-1", 1)),
+        (
+            RelationState("both", MappingProxyType({"yes-1": 1, "no-1": 1})),
+            RelationState("neither", MappingProxyType({"yes-1": 0, "no-1": 0})),
+        ),
+        SemanticReview("bob", "2026-07-26", "reviewed but wrong for binary merge"),
+    )
+    subject, store, _ = engine(Books(()), Books(()))
+    result = await subject.evaluate_binary(market(relation=wrong))
+    assert result.reason == "invalid_relation"
+    data = store.items[0].data
+    assert data["relation"]["relations"][0]["id"] == "wrong-rel"
+    assert {
+        (row["token_id"], row["amount"]) for row in data["relation"]["payoffs"]
+    } == {
+        ("yes-1", Decimal("1")), ("no-1", Decimal("1")),
+        ("yes-1", Decimal("0")), ("no-1", Decimal("0")),
+    }
 
 
 @pytest.mark.asyncio
@@ -314,6 +392,24 @@ async def test_store_failure_propagates_and_never_notifies():
     subject, _, notice = engine(Books(snapshots), Books(copies(snapshots)), store=Store(fail=True))
     with pytest.raises(RuntimeError, match="disk"):
         await subject.evaluate_binary(market())
+    assert notice.calls == []
+
+
+@pytest.mark.asyncio
+async def test_idempotent_duplicate_save_does_not_notify_again():
+    snapshots = (book("yes-1", "0.45"), book("no-1", "0.45"))
+    order = []
+    subject, _, notice = engine(
+        Books(snapshots), Books(copies(snapshots)),
+        store=Store(order=order, save_result=False),
+        notice=Notice(order=order),
+    )
+    result = await subject.evaluate_binary(market())
+    assert result.status is OpportunityStatus.SNAPSHOT_EXECUTABLE
+    assert result.notified is False
+    assert result.notification_failed is False
+    assert result.newly_persisted is False
+    assert order == ["save"]
     assert notice.calls == []
 
 

@@ -14,7 +14,7 @@ from predmarket.simulator import SimulationResult
 def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
     exact_return = Decimal("0.25")
     return {
-        "version": 1,
+        "version": 2,
         "id": bundle_id,
         "producer": {
             "engine": "predmarket",
@@ -39,6 +39,7 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
             "net_return": exact_return,
         },
         "economics": {
+            "status": "EVALUATED",
             "gross_investment": Decimal("7.99"),
             "gross_proceeds": Decimal("10"),
             "fees": Decimal("0.01"),
@@ -103,6 +104,7 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
                 {"state_id": "no", "token_id": "no-1", "amount": Decimal("1")},
             ],
         },
+        "discovery_books": [],
         "books": [
             {
                 "epoch": {
@@ -115,7 +117,9 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
                     "id": "snap-yes",
                     "exchange_ts_ms": 990,
                     "received_ts_ms": 992,
+                    "received_monotonic": Decimal("1.25"),
                     "tick_size": Decimal("0.01"),
+                    "book_hash": "hash-yes",
                 },
                 "levels": [
                     {
@@ -375,6 +379,42 @@ def test_non_executable_status_must_not_contain_notifications():
     value["opportunity"]["status"] = "RESEARCH_CANDIDATE"
     value["risk"]["status"] = "RESEARCH_CANDIDATE"
     with pytest.raises(ValueError, match="notification"):
+        EvidenceBundle.from_mapping(value)
+
+
+def test_not_evaluated_rejection_has_no_invented_financial_fields():
+    value = bundle()
+    value["opportunity"] = {
+        "id": "opp-1",
+        "status": "REJECTED",
+        "relation_id": "rel-1",
+    }
+    value["economics"] = {
+        "status": "NOT_EVALUATED",
+        "reason": "invalid_catalog",
+    }
+    value["risk"]["status"] = "REJECTED"
+    value["risk"]["reasons"] = ["invalid_catalog"]
+    value["legs"] = []
+    value["actions"] = []
+    value["notifications"] = []
+    evidence = EvidenceBundle.from_mapping(value)
+    assert "total_investment" not in evidence.data["opportunity"]
+    assert evidence.data["economics"] == {
+        "status": "NOT_EVALUATED",
+        "reason": "invalid_catalog",
+    }
+
+
+def test_not_evaluated_economics_prohibits_financial_placeholders():
+    value = bundle()
+    value["opportunity"]["status"] = "REJECTED"
+    value["risk"]["status"] = "REJECTED"
+    value["risk"]["reasons"] = ["invalid_catalog"]
+    value["notifications"] = []
+    value["economics"]["status"] = "NOT_EVALUATED"
+    value["economics"]["reason"] = "invalid_catalog"
+    with pytest.raises(ValueError, match="must not contain financial"):
         EvidenceBundle.from_mapping(value)
 
 

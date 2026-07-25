@@ -16,6 +16,11 @@ from predmarket.fees import FeeSchedule
 from predmarket.latency import Timing, validate_timings
 from predmarket.orderbook import InsufficientDepth, OrderBook
 from predmarket.polymarket.clob import BookSnapshot
+from predmarket.relations import (
+    Relation,
+    RelationValidationError,
+    require_audited_active_relation,
+)
 from predmarket.risk import RiskInputs, assess_risk, worst_partial_fill
 from predmarket.simulator import optimize_quantities
 from predmarket.storage import EvidenceBundle
@@ -62,13 +67,7 @@ class BinaryMarket:
     no_token_id: str
     active: bool
     tradeable: bool
-    relation_id: str
-    relation_set_id: str
-    relation_version: int
-    relation_audited: bool
-    auditor: str
-    provenance_source: str
-    provenance_hash: str
+    relation: Relation
     immediate_conversion_evidenced: bool
     settlement_evidenced: bool
     release_date_known: bool
@@ -76,20 +75,15 @@ class BinaryMarket:
     def __post_init__(self) -> None:
         for name in (
             "event_id", "market_id", "condition_id", "yes_token_id",
-            "no_token_id", "relation_id", "relation_set_id",
+            "no_token_id",
         ):
             _identifier(name, getattr(self, name))
         if self.yes_token_id == self.no_token_id:
             raise ValueError("YES and NO token IDs must differ")
-        for name in ("auditor", "provenance_source", "provenance_hash"):
-            value = getattr(self, name)
-            if type(value) is not str or not value:
-                raise ValueError(f"{name} must be nonempty")
-        if type(self.relation_version) is not int or self.relation_version <= 0:
-            raise ValueError("relation_version must be a positive integer")
+        if not isinstance(self.relation, Relation):
+            raise TypeError("relation must be a Relation")
         for name in (
-            "active", "tradeable", "relation_audited",
-            "immediate_conversion_evidenced",
+            "active", "tradeable", "immediate_conversion_evidenced",
             "settlement_evidenced", "release_date_known",
         ):
             if type(getattr(self, name)) is not bool:
@@ -170,11 +164,12 @@ class EngineResult:
     stage: str
     notified: bool
     notification_failed: bool
-    quantity: Decimal
-    total_investment: Decimal
-    minimum_proceeds: Decimal
-    minimum_profit: Decimal
-    minimum_return: Decimal
+    newly_persisted: bool
+    quantity: Decimal | None
+    total_investment: Decimal | None
+    minimum_proceeds: Decimal | None
+    minimum_profit: Decimal | None
+    minimum_return: Decimal | None
     risk_reasons: tuple[str, ...]
 
 
@@ -302,7 +297,7 @@ class StructuralArbitrageEngine:
                 base_reason = "invalid_discovery"
         candidate = base_reason is None and _candidate(discovery, market, self._d.settings)
         if base_reason is None and not candidate:
-            status, reason, stage = OpportunityStatus.RESEARCH_CANDIDATE, "no_candidate", "discovery"
+            status, reason, stage = OpportunityStatus.REJECTED, "no_candidate", "discovery"
         elif base_reason is not None:
             status, reason, stage = OpportunityStatus.REJECTED, base_reason, "catalog"
         else:
@@ -408,17 +403,17 @@ class StructuralArbitrageEngine:
             status, reason, candidate, discovery, confirmed, fee_confirmation,
             economics, risk_reasons, partial_loss, unhedged,
         )
-        await self._d.store.save(bundle)
+        newly_persisted = await self._d.store.save(bundle)
         result = EngineResult(
-            opportunity_id, status, reason, stage, False, False,
-            economics.quantity if economics else ZERO,
-            economics.total if economics else Decimal("1"),
-            economics.proceeds if economics else ZERO,
-            economics.profit if economics else Decimal("-1"),
-            economics.rate if economics else Decimal("-1"),
+            opportunity_id, status, reason, stage, False, False, newly_persisted,
+            economics.quantity if economics else None,
+            economics.total if economics else None,
+            economics.proceeds if economics else None,
+            economics.profit if economics else None,
+            economics.rate if economics else None,
             tuple(risk_reasons),
         )
-        if status is OpportunityStatus.SNAPSHOT_EXECUTABLE:
+        if status is OpportunityStatus.SNAPSHOT_EXECUTABLE and newly_persisted:
             try:
                 await self._d.notifier.notify(result)
             except Exception:
@@ -430,11 +425,24 @@ class StructuralArbitrageEngine:
     def _catalog_reason(market: BinaryMarket) -> str | None:
         if not market.active or not market.tradeable:
             return "market_not_tradeable"
+        try:
+            require_audited_active_relation(market.relation)
+        except (TypeError, RelationValidationError):
+            return "invalid_relation"
+        leg_tokens = tuple(leg.token_id for leg in market.relation.legs)
         if (
-            not market.relation_audited
-            or not market.auditor
-            or not market.provenance_hash
+            len(leg_tokens) != 2
+            or set(leg_tokens) != set(market.token_ids)
+            or any(leg.weight != 1 for leg in market.relation.legs)
+            or len(market.relation.states) != 2
         ):
+            return "invalid_relation"
+        payoff_vectors = {
+            tuple(state.proceeds[token] for token in market.token_ids)
+            for state in market.relation.states
+            if set(state.proceeds) == set(market.token_ids)
+        }
+        if payoff_vectors != {(1, 0), (0, 1)}:
             return "invalid_relation"
         return None
 
@@ -458,9 +466,9 @@ class StructuralArbitrageEngine:
         risk_reasons: tuple[str, ...], partial_loss: Decimal, unhedged: Decimal,
     ) -> EvidenceBundle:
         econ = economics
-        gross, proceeds, costs = (econ.gross, econ.proceeds, econ.fees) if econ else (Decimal("1"), ZERO, ZERO)
-        total = econ.total if econ else Decimal("1")
-        profit, rate, quantity = (econ.profit, econ.rate, econ.quantity) if econ else (Decimal("-1"), Decimal("-1"), ZERO)
+        gross, proceeds, costs = (econ.gross, econ.proceeds, econ.fees) if econ else (None, None, None)
+        total = econ.total if econ else None
+        profit, rate, quantity = (econ.profit, econ.rate, econ.quantity) if econ else (None, None, None)
         cost_rows = []
         if econ:
             for token in market.token_ids:
@@ -470,25 +478,39 @@ class StructuralArbitrageEngine:
                               "component": "safety_buffer", "amount": econ.buffer})
             cost_rows.append({"id": "cost-conversion", "kind": "CONVERSION",
                               "component": "merge", "amount": self._d.settings.conversion_cost})
-        book_rows, latency = [], []
+        def staged_books(stage: str, values: Mapping[str, BookSnapshot]) -> list[dict]:
+            rows = []
+            for token in market.token_ids:
+                if token not in values:
+                    continue
+                snapshot = values[token]
+                levels = []
+                for side, depth in (("BUY", snapshot.book.bids), ("SELL", snapshot.book.asks)):
+                    for level in depth:
+                        levels.append({"side": side, "price": level.price,
+                                       "size": level.size, "position": len(levels)})
+                rows.append({
+                    "epoch": {"id": f"epoch-{stage}-{token}", "token_id": token,
+                              "state": "LIVE", "started_at_ms": snapshot.received_at_ms},
+                    "snapshot": {"id": f"snapshot-{stage}-{token}",
+                                 "exchange_ts_ms": snapshot.book.exchange_ts_ms,
+                                 "received_ts_ms": snapshot.received_at_ms,
+                                 "received_monotonic": Decimal(
+                                     str(snapshot.received_monotonic)
+                                 ),
+                                 "tick_size": snapshot.book.tick_size,
+                                 "book_hash": snapshot.book.book_hash},
+                    "levels": levels,
+                })
+            return rows
+
+        discovery_rows = staged_books("discovery", discovery)
+        book_rows = staged_books("confirmation", confirmed)
+        latency = []
         for token in market.token_ids:
             if token not in confirmed:
                 continue
             snapshot = confirmed[token]
-            levels = []
-            for side, values in (("BUY", snapshot.book.bids), ("SELL", snapshot.book.asks)):
-                for level in values:
-                    levels.append({"side": side, "price": level.price, "size": level.size,
-                                   "position": len(levels)})
-            book_rows.append({
-                "epoch": {"id": f"epoch-{token}", "token_id": token, "state": "LIVE",
-                          "started_at_ms": snapshot.received_at_ms},
-                "snapshot": {"id": f"snapshot-{token}",
-                             "exchange_ts_ms": snapshot.book.exchange_ts_ms,
-                             "received_ts_ms": snapshot.received_at_ms,
-                             "tick_size": snapshot.book.tick_size},
-                "levels": levels,
-            })
             processing = (
                 (Decimal(str(evaluated_mono)) - Decimal(str(snapshot.received_monotonic))) * 1000
             ).to_integral_value(rounding=ROUND_CEILING)
@@ -498,7 +520,7 @@ class StructuralArbitrageEngine:
                             "processing_latency_ms": max(0, int(processing))})
         fee_rows = [] if fees is None else [
             {"id": f"fee-{token}", "token_id": token, "rate": schedule.rate,
-             "exponent": Decimal(schedule.exponent), "direction": "BUY",
+             "exponent": Decimal(schedule.exponent), "direction": "BOTH",
              "retrieved_at_ms": schedule.captured_at_ms, "source": fees.source}
             for token, schedule in ((token, fees.schedules[token]) for token in market.token_ids)
         ]
@@ -518,8 +540,29 @@ class StructuralArbitrageEngine:
                 (ActionKind.MERGE.value, None),
             ))
         ]
+        opportunity = {
+            "id": opportunity_id, "status": status.value,
+            "relation_id": market.relation.relation_id,
+        }
+        if econ is not None:
+            opportunity.update({
+                "quantity": quantity, "total_investment": total,
+                "minimum_proceeds": proceeds, "net_profit": profit,
+                "net_return": rate,
+            })
+            economics_data = {
+                "status": "EVALUATED", "gross_investment": gross,
+                "gross_proceeds": proceeds, "fees": costs,
+                "total_costs": total, "net_profit": profit,
+                "net_return": rate, "costs": cost_rows,
+            }
+        else:
+            economics_data = {"status": "NOT_EVALUATED", "reason": reason}
+        relation = market.relation
+        review = relation.semantic_review
+        state_ids = tuple(f"state-{index}" for index in range(len(relation.states)))
         value = {
-            "version": 1, "id": opportunity_id,
+            "version": 2, "id": opportunity_id,
             "producer": {"engine": "predmarket", "version": self._d.engine_version,
                          "metadata": {"strategy": "binary_underpriced",
                                       "pipeline_reason": reason,
@@ -531,13 +574,8 @@ class StructuralArbitrageEngine:
                            "maximum_leg_skew_ms": self._d.settings.maximum_leg_skew_ms,
                            "minimum_return": self._d.settings.minimum_return},
             "run": {"id": run_id, "status": "COMPLETED", "started_at_ms": now_ms},
-            "opportunity": {"id": opportunity_id, "status": status.value,
-                            "relation_id": market.relation_id, "quantity": quantity,
-                            "total_investment": total, "minimum_proceeds": proceeds,
-                            "net_profit": profit, "net_return": rate},
-            "economics": {"gross_investment": gross, "gross_proceeds": proceeds,
-                          "fees": costs, "total_costs": total,
-                          "net_profit": profit, "net_return": rate, "costs": cost_rows},
+            "opportunity": opportunity,
+            "economics": economics_data,
             "events": [{"id": market.event_id, "metadata": {}}],
             "markets": [{"id": market.market_id, "event_id": market.event_id,
                          "metadata": {"active": market.active, "tradeable": market.tradeable,
@@ -550,20 +588,25 @@ class StructuralArbitrageEngine:
             ],
             "fee_schedules": fee_rows,
             "relation": {
-                "set": {"id": market.relation_set_id, "version": market.relation_version,
-                        "status": "active", "metadata": {"audited": True, "auditor": market.auditor},
-                        "provenance": {"source": market.provenance_source,
-                                       "content_hash": market.provenance_hash}},
-                "relations": [{"id": market.relation_id, "kind": "BINARY_COMPLETE"}],
-                "states": [{"id": "state-yes", "label": "YES"},
-                           {"id": "state-no", "label": "NO"}],
+                "set": {"id": f"set:{relation.relation_id}", "version": relation.version,
+                        "status": relation.status.value,
+                        "metadata": {"audited": review is not None,
+                                     "auditor": review.reviewer if review else None},
+                        "provenance": {"source": "Relation",
+                                       "content_hash": relation.source_rules_hash}},
+                "relations": [{"id": relation.relation_id, "kind": "BINARY_COMPLETE"}],
+                "states": [
+                    {"id": state_ids[index], "label": state.name}
+                    for index, state in enumerate(relation.states)
+                ],
                 "payoffs": [
-                    {"state_id": "state-yes", "token_id": market.yes_token_id, "amount": ONE},
-                    {"state_id": "state-yes", "token_id": market.no_token_id, "amount": ZERO},
-                    {"state_id": "state-no", "token_id": market.yes_token_id, "amount": ZERO},
-                    {"state_id": "state-no", "token_id": market.no_token_id, "amount": ONE},
+                    {"state_id": state_ids[index], "token_id": token,
+                     "amount": Decimal(state.proceeds[token])}
+                    for index, state in enumerate(relation.states)
+                    for token in state.proceeds
                 ],
             },
+            "discovery_books": discovery_rows,
             "books": book_rows, "legs": legs, "actions": actions,
             "risk": {"status": status.value, "reasons": list(risk_reasons),
                      "worst_leg_failure_loss": partial_loss,

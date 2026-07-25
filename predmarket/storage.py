@@ -16,7 +16,7 @@ import aiosqlite
 from predmarket.exact_math import decimal_ratio
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OPPORTUNITY_STATUSES = {
     "REJECTED",
@@ -104,25 +104,27 @@ def _restore_schema_decimals(value: Any) -> dict[str, Any]:
         raise ValueError("stored evidence root must be an object")
     for field in ("minimum_return",):
         _restore_decimal(value["evaluation"], field)
-    for field in (
-        "quantity", "total_investment", "minimum_proceeds", "net_profit",
-        "net_return",
-    ):
-        _restore_decimal(value["opportunity"], field)
-    for field in (
-        "gross_investment", "gross_proceeds", "fees", "total_costs",
-        "net_profit", "net_return",
-    ):
-        _restore_decimal(value["economics"], field)
-    for cost in value["economics"]["costs"]:
-        _restore_decimal(cost, "amount")
+    if value["economics"]["status"] == "EVALUATED":
+        for field in (
+            "quantity", "total_investment", "minimum_proceeds", "net_profit",
+            "net_return",
+        ):
+            _restore_decimal(value["opportunity"], field)
+        for field in (
+            "gross_investment", "gross_proceeds", "fees", "total_costs",
+            "net_profit", "net_return",
+        ):
+            _restore_decimal(value["economics"], field)
+        for cost in value["economics"]["costs"]:
+            _restore_decimal(cost, "amount")
     for fee in value["fee_schedules"]:
         _restore_decimal(fee, "rate")
         _restore_decimal(fee, "exponent")
     for payoff in value["relation"]["payoffs"]:
         _restore_decimal(payoff, "amount")
-    for book in value["books"]:
+    for book in value["discovery_books"] + value["books"]:
         _restore_decimal(book["snapshot"], "tick_size")
+        _restore_decimal(book["snapshot"], "received_monotonic")
         for level in book["levels"]:
             _restore_decimal(level, "price")
             _restore_decimal(level, "size")
@@ -182,13 +184,64 @@ def _validate_unique_ids(name: str, records: object) -> None:
         seen.add(identifier)
 
 
+def _validate_book_collection(
+    name: str, records: object, token_ids: set[str]
+) -> tuple[set[str], set[str]]:
+    epoch_ids: set[str] = set()
+    snapshot_ids: set[str] = set()
+    for index, raw_book in enumerate(_sequence(name, records)):
+        book = _mapping(f"{name}[{index}]", raw_book)
+        _required(book, "epoch", "snapshot", "levels")
+        epoch = _mapping("epoch", book["epoch"])
+        snapshot = _mapping("snapshot", book["snapshot"])
+        _required(epoch, "id", "token_id", "state", "started_at_ms")
+        _required(
+            snapshot, "id", "exchange_ts_ms", "received_ts_ms",
+            "received_monotonic", "tick_size", "book_hash",
+        )
+        epoch_id = _identifier("epoch.id", epoch["id"])
+        snapshot_id = _identifier("snapshot.id", snapshot["id"])
+        if epoch_id in epoch_ids or snapshot_id in snapshot_ids:
+            raise ValueError("duplicate epoch or snapshot identifier")
+        epoch_ids.add(epoch_id)
+        snapshot_ids.add(snapshot_id)
+        if _identifier("epoch.token_id", epoch["token_id"]) not in token_ids:
+            raise ValueError("book epoch references an unknown token")
+        if epoch["state"] != "LIVE":
+            raise ValueError("evidence books must be LIVE")
+        _integer("epoch.started_at_ms", epoch["started_at_ms"])
+        _integer("snapshot.exchange_ts_ms", snapshot["exchange_ts_ms"])
+        _integer("snapshot.received_ts_ms", snapshot["received_ts_ms"])
+        _nonnegative_decimal(
+            "snapshot.received_monotonic", snapshot["received_monotonic"]
+        )
+        if type(snapshot["book_hash"]) is not str or not snapshot["book_hash"]:
+            raise ValueError("snapshot book_hash must be nonempty")
+        tick_size = _nonnegative_decimal("snapshot.tick_size", snapshot["tick_size"])
+        if not Decimal("0") < tick_size <= Decimal("1"):
+            raise ValueError("snapshot tick size must be in (0, 1]")
+        for position, raw_level in enumerate(_sequence("levels", book["levels"])):
+            level = _mapping("level", raw_level)
+            _required(level, "side", "price", "size", "position")
+            if level["side"] not in {"BUY", "SELL"}:
+                raise ValueError("invalid level side")
+            price = _decimal("level.price", level["price"])
+            if not Decimal("0") < price < Decimal("1"):
+                raise ValueError("level price must be in (0, 1)")
+            if _nonnegative_decimal("level.size", level["size"]) == 0:
+                raise ValueError("level size must be positive")
+            if _integer("level.position", level["position"]) != position:
+                raise ValueError("level positions must be contiguous and ordered")
+    return epoch_ids, snapshot_ids
+
+
 def _validate_bundle(raw: Mapping[str, object]) -> None:
     _required(
         raw,
         "version", "id", "producer", "evaluation", "run", "opportunity",
         "economics", "events", "markets",
         "tokens", "fee_schedules", "relation", "books", "legs", "actions",
-        "risk", "latency_metrics", "notifications",
+        "discovery_books", "risk", "latency_metrics", "notifications",
     )
     if type(raw["version"]) is not int:
         raise TypeError("version must be an integer")
@@ -225,71 +278,96 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
     _integer("run.started_at_ms", run["started_at_ms"])
 
     opportunity = _mapping("opportunity", raw["opportunity"])
-    _required(
-        opportunity, "id", "status", "relation_id", "quantity",
-        "total_investment", "minimum_proceeds", "net_profit", "net_return",
-    )
+    _required(opportunity, "id", "status", "relation_id")
     _identifier("opportunity.id", opportunity["id"])
     _identifier("opportunity.relation_id", opportunity["relation_id"])
     if opportunity["status"] not in _OPPORTUNITY_STATUSES:
         raise ValueError("invalid opportunity status")
-    for name in (
-        "quantity", "total_investment", "minimum_proceeds", "net_profit",
-        "net_return",
-    ):
-        _decimal(f"opportunity.{name}", opportunity[name])
-    _nonnegative_decimal("opportunity.quantity", opportunity["quantity"])
-    _nonnegative_decimal(
-        "opportunity.total_investment", opportunity["total_investment"]
-    )
-    _nonnegative_decimal(
-        "opportunity.minimum_proceeds", opportunity["minimum_proceeds"]
-    )
-
     economics = _mapping("economics", raw["economics"])
-    _required(
-        economics, "gross_investment", "gross_proceeds", "fees", "total_costs",
-        "net_profit", "net_return", "costs",
-    )
-    for name in ("gross_investment", "gross_proceeds", "fees", "total_costs"):
-        _nonnegative_decimal(f"economics.{name}", economics[name])
-    _decimal("economics.net_profit", economics["net_profit"])
-    _decimal("economics.net_return", economics["net_return"])
-    if (
-        economics["total_costs"] != opportunity["total_investment"]
-        or economics["gross_proceeds"] != opportunity["minimum_proceeds"]
-        or economics["net_profit"] != opportunity["net_profit"]
-        or economics["net_return"] != opportunity["net_return"]
-    ):
-        raise ValueError("economics and opportunity totals must agree")
-    costs = _sequence("economics.costs", economics["costs"])
-    _validate_unique_ids("economics.costs", costs)
-    cost_total = Decimal("0")
-    for item in costs:
-        cost = _mapping("cost", item)
-        _required(cost, "id", "kind", "amount")
-        if type(cost["kind"]) is not str or not cost["kind"]:
-            raise ValueError("cost kind must be a nonempty string")
-        if ("leg_id" in cost) == ("component" in cost):
-            raise ValueError("cost requires exactly one of leg_id or component")
-        if "leg_id" in cost:
-            _identifier("cost.leg_id", cost["leg_id"])
-        elif type(cost["component"]) is not str or not cost["component"]:
-            raise ValueError("cost component must be a nonempty string")
-        cost_total += _nonnegative_decimal("cost.amount", cost["amount"])
-    if cost_total != economics["fees"]:
-        raise ValueError("cost breakdown must sum exactly to fees")
-    if economics["gross_investment"] + economics["fees"] != economics["total_costs"]:
-        raise ValueError("gross investment plus fees must equal total costs")
-    if economics["gross_proceeds"] - economics["total_costs"] != economics["net_profit"]:
-        raise ValueError("gross proceeds minus total costs must equal net profit")
-    if economics["total_costs"] <= 0:
-        raise ValueError("total costs must be positive")
-    derived_return = decimal_ratio(
-        economics["net_profit"], economics["total_costs"]
-    )
-    if economics["net_return"] != derived_return:
-        raise ValueError("net return must equal net profit divided by total costs")
+    _required(economics, "status")
+    if economics["status"] not in {"NOT_EVALUATED", "EVALUATED"}:
+        raise ValueError("invalid economics status")
+    if economics["status"] == "NOT_EVALUATED":
+        if set(economics) != {"status", "reason"}:
+            raise ValueError("not-evaluated economics must not contain financial fields")
+        if type(economics["reason"]) is not str or not economics["reason"]:
+            raise ValueError("not-evaluated economics requires a reason")
+        forbidden = {
+            "quantity", "total_investment", "minimum_proceeds",
+            "net_profit", "net_return",
+        }
+        if forbidden & set(opportunity):
+            raise ValueError("not-evaluated opportunity must not contain financial fields")
+        if opportunity["status"] == "SNAPSHOT_EXECUTABLE":
+            raise ValueError("executable opportunity economics must be evaluated")
+        if opportunity["status"] != "REJECTED":
+            raise ValueError("not-evaluated economics requires rejected status")
+        costs: list[object] | tuple[object, ...] = []
+    else:
+        _required(
+            opportunity, "quantity", "total_investment", "minimum_proceeds",
+            "net_profit", "net_return",
+        )
+        for name in (
+            "quantity", "total_investment", "minimum_proceeds", "net_profit",
+            "net_return",
+        ):
+            _decimal(f"opportunity.{name}", opportunity[name])
+        _nonnegative_decimal("opportunity.quantity", opportunity["quantity"])
+        _nonnegative_decimal("opportunity.total_investment", opportunity["total_investment"])
+        _nonnegative_decimal("opportunity.minimum_proceeds", opportunity["minimum_proceeds"])
+        _required(
+            economics, "gross_investment", "gross_proceeds", "fees", "total_costs",
+            "net_profit", "net_return", "costs",
+        )
+        costs = _sequence("economics.costs", economics["costs"])
+        _validate_unique_ids("economics.costs", costs)
+    _validate_bundle_tail(raw, minimum_return, opportunity, economics, costs)
+
+
+def _validate_bundle_tail(
+    raw: Mapping[str, object],
+    minimum_return: Decimal,
+    opportunity: Mapping[str, object],
+    economics: Mapping[str, object],
+    costs: list[object] | tuple[object, ...],
+) -> None:
+    if economics["status"] == "EVALUATED":
+        for name in ("gross_investment", "gross_proceeds", "fees", "total_costs"):
+            _nonnegative_decimal(f"economics.{name}", economics[name])
+        _decimal("economics.net_profit", economics["net_profit"])
+        _decimal("economics.net_return", economics["net_return"])
+        if (
+            economics["total_costs"] != opportunity["total_investment"]
+            or economics["gross_proceeds"] != opportunity["minimum_proceeds"]
+            or economics["net_profit"] != opportunity["net_profit"]
+            or economics["net_return"] != opportunity["net_return"]
+        ):
+            raise ValueError("economics and opportunity totals must agree")
+        cost_total = Decimal("0")
+        for item in costs:
+            cost = _mapping("cost", item)
+            _required(cost, "id", "kind", "amount")
+            if type(cost["kind"]) is not str or not cost["kind"]:
+                raise ValueError("cost kind must be a nonempty string")
+            if ("leg_id" in cost) == ("component" in cost):
+                raise ValueError("cost requires exactly one of leg_id or component")
+            if "leg_id" in cost:
+                _identifier("cost.leg_id", cost["leg_id"])
+            elif type(cost["component"]) is not str or not cost["component"]:
+                raise ValueError("cost component must be a nonempty string")
+            cost_total += _nonnegative_decimal("cost.amount", cost["amount"])
+        if cost_total != economics["fees"]:
+            raise ValueError("cost breakdown must sum exactly to fees")
+        if economics["gross_investment"] + economics["fees"] != economics["total_costs"]:
+            raise ValueError("gross investment plus fees must equal total costs")
+        if economics["gross_proceeds"] - economics["total_costs"] != economics["net_profit"]:
+            raise ValueError("gross proceeds minus total costs must equal net profit")
+        if economics["total_costs"] <= 0:
+            raise ValueError("total costs must be positive")
+        derived_return = decimal_ratio(economics["net_profit"], economics["total_costs"])
+        if economics["net_return"] != derived_return:
+            raise ValueError("net return must equal net profit divided by total costs")
 
     for name in (
         "events", "markets", "tokens", "fee_schedules", "legs", "actions",
@@ -356,14 +434,22 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
     _identifier("relation.set.id", relation_set["id"])
     if type(relation_set["version"]) is not int or relation_set["version"] <= 0:
         raise ValueError("relation.set.version must be a positive integer")
-    if relation_set["status"] != "active":
-        raise ValueError("relation set must be active")
+    if relation_set["status"] not in {"active", "pending"}:
+        raise ValueError("invalid relation set status")
     audit_metadata = _mapping("relation.set.metadata", relation_set["metadata"])
     _validate_opaque_json("relation.set.metadata", audit_metadata)
-    if audit_metadata.get("audited") is not True:
-        raise ValueError("active relation set must be explicitly audited")
-    if type(audit_metadata.get("auditor")) is not str or not audit_metadata["auditor"]:
-        raise ValueError("active relation set must identify its auditor")
+    if type(audit_metadata.get("audited")) is not bool:
+        raise ValueError("relation audit status must be explicit")
+    if audit_metadata["audited"] and (
+        type(audit_metadata.get("auditor")) is not str
+        or not audit_metadata["auditor"]
+    ):
+        raise ValueError("audited relation set must identify its auditor")
+    if opportunity["status"] == "SNAPSHOT_EXECUTABLE" and (
+        relation_set["status"] != "active"
+        or audit_metadata["audited"] is not True
+    ):
+        raise ValueError("executable evidence requires an active audited relation")
     provenance = _mapping("relation.set.provenance", relation_set["provenance"])
     _validate_opaque_json("relation.set.provenance", provenance)
     _required(provenance, "source", "content_hash")
@@ -414,46 +500,53 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
     expected_payoffs = {(state, token) for state in state_ids for token in token_ids}
     if payoff_pairs != expected_payoffs:
         raise ValueError("payoff matrix must cover every state/token pair exactly")
+    if opportunity["status"] == "SNAPSHOT_EXECUTABLE":
+        payoff_by_state = {
+            state_id: tuple(
+                payoff["amount"]
+                for token_id in sorted(token_ids)
+                for payoff in relation["payoffs"]
+                if payoff["state_id"] == state_id and payoff["token_id"] == token_id
+            )
+            for state_id in state_ids
+        }
+        if (
+            len(token_ids) != 2
+            or len(state_ids) != 2
+            or set(payoff_by_state.values()) != {
+                (Decimal("1"), Decimal("0")),
+                (Decimal("0"), Decimal("1")),
+            }
+            or any(item["kind"] != "BINARY_COMPLETE" for item in relation["relations"])
+        ):
+            raise ValueError("executable relation must have binary complete-set payoffs")
 
-    book_ids: set[str] = set()
-    snapshot_ids: set[str] = set()
-    for index, raw_book in enumerate(_sequence("books", raw["books"])):
-        book = _mapping(f"books[{index}]", raw_book)
-        _required(book, "epoch", "snapshot", "levels")
-        epoch = _mapping("epoch", book["epoch"])
-        snapshot = _mapping("snapshot", book["snapshot"])
-        _required(epoch, "id", "token_id", "state", "started_at_ms")
-        _required(
-            snapshot, "id", "exchange_ts_ms", "received_ts_ms", "tick_size",
-        )
-        epoch_id = _identifier("epoch.id", epoch["id"])
-        snapshot_id = _identifier("snapshot.id", snapshot["id"])
-        if epoch_id in book_ids or snapshot_id in snapshot_ids:
-            raise ValueError("duplicate epoch or snapshot identifier")
-        book_ids.add(epoch_id)
-        snapshot_ids.add(snapshot_id)
-        if _identifier("epoch.token_id", epoch["token_id"]) not in token_ids:
-            raise ValueError("book epoch references an unknown token")
-        if epoch["state"] != "LIVE":
-            raise ValueError("evidence books must be LIVE")
-        _integer("epoch.started_at_ms", epoch["started_at_ms"])
-        _integer("snapshot.exchange_ts_ms", snapshot["exchange_ts_ms"])
-        _integer("snapshot.received_ts_ms", snapshot["received_ts_ms"])
-        tick_size = _nonnegative_decimal("snapshot.tick_size", snapshot["tick_size"])
-        if not Decimal("0") < tick_size <= Decimal("1"):
-            raise ValueError("snapshot tick size must be in (0, 1]")
-        for position, raw_level in enumerate(_sequence("levels", book["levels"])):
-            level = _mapping("level", raw_level)
-            _required(level, "side", "price", "size", "position")
-            if level["side"] not in {"BUY", "SELL"}:
-                raise ValueError("invalid level side")
-            price = _decimal("level.price", level["price"])
-            if not Decimal("0") < price < Decimal("1"):
-                raise ValueError("level price must be in (0, 1)")
-            if _nonnegative_decimal("level.size", level["size"]) == 0:
-                raise ValueError("level size must be positive")
-            if _integer("level.position", level["position"]) != position:
-                raise ValueError("level positions must be contiguous and ordered")
+    discovery_epoch_ids, discovery_snapshot_ids = _validate_book_collection(
+        "discovery_books", raw["discovery_books"], token_ids
+    )
+    book_ids, snapshot_ids = _validate_book_collection("books", raw["books"], token_ids)
+    if discovery_epoch_ids & book_ids or discovery_snapshot_ids & snapshot_ids:
+        raise ValueError("discovery and confirmation book identifiers must differ")
+    pipeline_reason = _mapping(
+        "producer.metadata",
+        _mapping("producer", raw["producer"])["metadata"],
+    ).get("pipeline_reason")
+    discovery_tokens = {
+        _mapping("book", item)["epoch"]["token_id"]
+        for item in _sequence("discovery_books", raw["discovery_books"])
+    }
+    confirmation_tokens = {
+        _mapping("book", item)["epoch"]["token_id"]
+        for item in _sequence("books", raw["books"])
+    }
+    if pipeline_reason == "no_candidate" and (
+        discovery_tokens != token_ids or confirmation_tokens
+    ):
+        raise ValueError("no-candidate evidence requires only complete discovery books")
+    if pipeline_reason == "expired_before_confirmation" and (
+        discovery_tokens != token_ids or confirmation_tokens != token_ids
+    ):
+        raise ValueError("expired evidence requires complete discovery and confirmation books")
 
     for item in _sequence("legs", raw["legs"]):
         leg = _mapping("leg", item)
