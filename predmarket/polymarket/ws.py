@@ -53,6 +53,24 @@ class BookDepth:
 
 
 @dataclass(frozen=True)
+class BookMetadata:
+    condition_id: str
+    tick_size: Decimal
+    minimum_order_size: Decimal
+
+    def __post_init__(self) -> None:
+        _identifier(self.condition_id, "condition_id")
+        for name in ("tick_size", "minimum_order_size"):
+            value = getattr(self, name)
+            if type(value) is not Decimal:
+                raise TypeError(f"{name} must be Decimal")
+            if not value.is_finite() or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if self.tick_size >= 1:
+            raise ValueError("tick_size must be less than one")
+
+
+@dataclass(frozen=True)
 class WsMetrics:
     received: int = 0
     dropped: int = 0
@@ -99,6 +117,15 @@ def _freeze(value: object) -> object:
     return value
 
 
+def _canonical_decimal(value: Decimal) -> str:
+    rendered = format(value, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    if rendered.startswith("."):
+        rendered = f"0{rendered}"
+    return rendered or "0"
+
+
 class MarketWebSocket:
     """Owns bounded ingestion and per-token epoch state for discovery."""
 
@@ -116,6 +143,7 @@ class MarketWebSocket:
         sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         heartbeat_interval_seconds: int | float = 10,
         heartbeat_timeout_seconds: int | float = 3,
+        book_metadata: Mapping[str, BookMetadata] | None = None,
     ) -> None:
         if not isinstance(token_conditions, Mapping) or not token_conditions:
             raise ValueError("token_conditions must be a nonempty mapping")
@@ -134,6 +162,19 @@ class MarketWebSocket:
             raise TypeError("clocks must be callable")
         if candidate_callback is not None and not callable(candidate_callback):
             raise TypeError("candidate_callback must be callable")
+        if book_metadata is None:
+            metadata_copy: dict[str, BookMetadata] = {}
+        elif not isinstance(book_metadata, Mapping):
+            raise TypeError("book_metadata must be a mapping")
+        else:
+            metadata_copy = dict(book_metadata)
+        if not set(metadata_copy).issubset(copied):
+            raise ValueError("book_metadata contains unsubscribed tokens")
+        for token, metadata in metadata_copy.items():
+            if not isinstance(metadata, BookMetadata):
+                raise TypeError("book_metadata values must be BookMetadata")
+            if metadata.condition_id != copied[token]:
+                raise ValueError("book metadata condition binding mismatch")
         if not callable(sleeper):
             raise TypeError("sleeper must be callable")
         for name, value in (
@@ -149,6 +190,7 @@ class MarketWebSocket:
                 raise ValueError(f"{name} must be finite and positive")
 
         self._conditions = MappingProxyType(copied)
+        self._book_metadata = MappingProxyType(metadata_copy)
         self.epochs = {token: EpochBook(token) for token in copied}
         self._depth = {token: BookDepth() for token in copied}
         self._queue: asyncio.Queue[ReceivedMessage] = asyncio.Queue(queue_capacity)
@@ -363,7 +405,12 @@ class MarketWebSocket:
             size = _decimal(level.get("size"), "size", allow_zero=False)
             if price >= 1:
                 raise WsProtocolError("price is out of range")
-            parsed[price] = (str(level["price"]), str(level["size"]))
+            if price in parsed:
+                raise WsProtocolError("duplicate equivalent price levels")
+            parsed[price] = (
+                _canonical_decimal(price),
+                _canonical_decimal(size),
+            )
         reverse = side == "bids"
         return tuple(parsed[key] for key in sorted(parsed, reverse=reverse))
 
@@ -375,10 +422,20 @@ class MarketWebSocket:
             raise WsProtocolError("missing_hash", token)
         bids = self._levels(message.payload.get("bids"), "bids")
         asks = self._levels(message.payload.get("asks"), "asks")
-        tick = _decimal(message.payload.get("tick_size"), "tick_size", allow_zero=False)
-        minimum = _decimal(message.payload.get("min_order_size"), "min_order_size", allow_zero=False)
-        if tick >= 1 or minimum <= 0:
-            raise WsProtocolError("invalid_snapshot_metadata", token)
+        metadata = self._book_metadata.get(token)
+        if metadata is None:
+            raise WsProtocolError("missing_authoritative_book_metadata", token)
+        tick = metadata.tick_size
+        minimum = metadata.minimum_order_size
+        for field, authoritative in (
+            ("tick_size", tick),
+            ("min_order_size", minimum),
+        ):
+            supplied = message.payload.get(field)
+            if supplied is not None and _decimal(
+                supplied, field, allow_zero=False
+            ) != authoritative:
+                raise WsProtocolError("book_metadata_mismatch", token)
         if any(Decimal(price) % tick for price, _ in bids + asks):
             raise WsProtocolError("price_not_tick_aligned", token)
         if bids and asks and Decimal(bids[0][0]) >= Decimal(asks[0][0]):
@@ -423,7 +480,15 @@ class MarketWebSocket:
                 change_hash = change.get("hash")
                 if type(change_hash) is not str or not change_hash:
                     raise WsProtocolError("missing_hash", token)
-                validated.append((token, str(price), str(size), side, change_hash))
+                validated.append(
+                    (
+                        token,
+                        _canonical_decimal(decimal_price),
+                        _canonical_decimal(_decimal(size, "size", allow_zero=True)),
+                        side,
+                        change_hash,
+                    )
+                )
         except WsProtocolError as error:
             self._invalidate_condition(message.condition_id, error.reason)
             raise
@@ -514,6 +579,7 @@ class MarketWebSocket:
                 self._metrics,
                 callback_failures=self._metrics.callback_failures + 1,
             )
+            self._trigger_keys.discard(key)
 
     def _fail_scope(self, token: str | None, reason: str) -> None:
         if token in self.epochs:

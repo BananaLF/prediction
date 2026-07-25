@@ -1,4 +1,5 @@
 import asyncio
+from decimal import Decimal
 import json
 from pathlib import Path
 from types import MappingProxyType
@@ -7,6 +8,7 @@ import pytest
 
 from predmarket.epochs import EpochState
 from predmarket.polymarket.ws import (
+    BookMetadata,
     MARKET_CHANNEL_URL,
     MarketWebSocket,
     WsProtocolError,
@@ -34,6 +36,17 @@ class Clock:
 
 def scanner(*, capacity: int = 4, callback=None, **kwargs) -> MarketWebSocket:
     clock = Clock()
+    kwargs.setdefault(
+        "book_metadata",
+        {
+            token: BookMetadata(
+                condition_id="condition",
+                tick_size=Decimal("0.01"),
+                minimum_order_size=Decimal("1"),
+            )
+            for token in ("yes", "no")
+        },
+    )
     return MarketWebSocket(
         {"yes": "condition", "no": "condition"},
         queue_capacity=capacity,
@@ -516,3 +529,88 @@ async def test_processor_failure_closes_connection_and_reconnects_without_dead_c
     assert ws.metrics().reconnects == 1
     assert ws.queue_size == 0
     assert all(epoch.state is EpochState.RESYNC for epoch in ws.epochs.values())
+
+
+@pytest.mark.asyncio
+async def test_official_snapshot_uses_authoritative_metadata_when_fields_absent() -> None:
+    ws = scanner()
+    await ws.ingest(fixture("ws_book_official.json"))
+    await ws.process_one()
+    assert ws.epochs["yes"].state is EpochState.LIVE
+
+
+@pytest.mark.asyncio
+async def test_snapshot_fails_closed_when_metadata_missing_or_payload_mismatches() -> None:
+    clock = Clock()
+    missing = MarketWebSocket(
+        {"yes": "condition"},
+        queue_capacity=2,
+        wall_clock_ms=clock.wall_ms,
+        monotonic=clock.monotonic,
+        book_metadata={},
+    )
+    await missing.ingest(fixture("ws_book_official.json"))
+    with pytest.raises(WsProtocolError):
+        await missing.process_one()
+    assert missing.epochs["yes"].state is EpochState.RESYNC
+
+    mismatch = scanner()
+    payload = json.loads(fixture("ws_book_yes.json"))
+    payload["tick_size"] = "0.001"
+    await mismatch.ingest(json.dumps(payload))
+    with pytest.raises(WsProtocolError):
+        await mismatch.process_one()
+    assert mismatch.epochs["yes"].state is EpochState.RESYNC
+
+
+@pytest.mark.asyncio
+async def test_equivalent_decimal_spellings_delete_same_level_without_ghost_liquidity() -> None:
+    ws = scanner()
+    snapshot = json.loads(fixture("ws_book_yes.json"))
+    snapshot["asks"][0]["price"] = ".480"
+    await ws.ingest(json.dumps(snapshot))
+    await ws.process_one()
+    event = json.loads(fixture("ws_delta.json"))
+    event["price_changes"] = [
+        {"asset_id": "yes", "price": "0.48", "size": "0", "side": "SELL", "hash": "h2"}
+    ]
+    await ws.ingest(json.dumps(event))
+    await ws.process_one()
+    assert ws.depth("yes").asks == ()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_rejects_canonically_duplicate_price_levels() -> None:
+    ws = scanner()
+    snapshot = json.loads(fixture("ws_book_yes.json"))
+    snapshot["asks"] = [
+        {"price": ".48", "size": "1"},
+        {"price": "0.480", "size": "2"},
+    ]
+    await ws.ingest(json.dumps(snapshot))
+    with pytest.raises(WsProtocolError):
+        await ws.process_one()
+    assert ws.epochs["yes"].state is EpochState.RESYNC
+
+
+@pytest.mark.asyncio
+async def test_failed_candidate_callback_releases_key_for_unchanged_hash_retry() -> None:
+    attempts = 0
+
+    async def flaky(*_):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary")
+
+    ws = scanner(callback=flaky)
+    for name in ("ws_book_yes.json", "ws_book_no.json"):
+        await ws.ingest(fixture(name))
+        await ws.process_one()
+    assert attempts == 1
+    await ws.ingest(fixture("ws_book_no.json"))
+    await ws.process_one()
+    assert attempts == 2
+    await ws.ingest(fixture("ws_book_no.json"))
+    await ws.process_one()
+    assert attempts == 2
