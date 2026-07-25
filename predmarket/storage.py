@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Context, Decimal, InvalidOperation, localcontext
 import json
 from pathlib import Path
 import re
@@ -15,34 +15,13 @@ import aiosqlite
 
 
 SCHEMA_VERSION = 1
+RETURN_PRECISION = 50
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OPPORTUNITY_STATUSES = {
     "REJECTED",
     "RESEARCH_CANDIDATE",
     "SNAPSHOT_EXECUTABLE",
 }
-_DECIMAL_FIELDS = {
-    "amount",
-    "exponent",
-    "fees",
-    "gross_investment",
-    "gross_proceeds",
-    "max_unhedged_notional",
-    "minimum_proceeds",
-    "net_profit",
-    "net_return",
-    "notional",
-    "price",
-    "quantity",
-    "rate",
-    "size",
-    "tick_size",
-    "total_costs",
-    "total_investment",
-    "worst_leg_failure_loss",
-}
-
-
 class EvidenceConflictError(ValueError):
     """An immutable evidence identifier already exists with different content."""
 
@@ -91,9 +70,7 @@ def _canonical_decimal(value: Decimal) -> str:
     return rendered
 
 
-def _canonicalize(value: object, *, field: str | None = None) -> Any:
-    if field in _DECIMAL_FIELDS:
-        return _canonical_decimal(_decimal(field, value))
+def _canonicalize(value: object) -> Any:
     if value is None or type(value) in (str, bool, int):
         return value
     if type(value) is Decimal:
@@ -103,28 +80,59 @@ def _canonicalize(value: object, *, field: str | None = None) -> Any:
         for key, child in value.items():
             if type(key) is not str:
                 raise TypeError("JSON object keys must be strings")
-            result[key] = _canonicalize(child, field=key)
+            result[key] = _canonicalize(child)
         return result
     if type(value) in (list, tuple):
         return [_canonicalize(child) for child in value]
     raise TypeError(f"unsupported evidence value: {type(value).__name__}")
 
 
-def _restore_decimals(value: Any, *, field: str | None = None) -> Any:
-    if field in _DECIMAL_FIELDS:
-        if type(value) is not str:
-            raise ValueError(f"stored {field} is not a canonical decimal string")
-        restored = Decimal(value)
-        if _canonical_decimal(restored) != value:
-            raise ValueError(f"stored {field} is not canonical")
-        return restored
-    if isinstance(value, dict):
-        return {
-            key: _restore_decimals(child, field=key)
-            for key, child in value.items()
-        }
-    if isinstance(value, list):
-        return [_restore_decimals(child) for child in value]
+def _restore_decimal(record: dict[str, Any], field: str) -> None:
+    value = record.get(field)
+    if type(value) is not str:
+        raise ValueError(f"stored {field} is not a canonical decimal string")
+    restored = Decimal(value)
+    if _canonical_decimal(restored) != value:
+        raise ValueError(f"stored {field} is not canonical")
+    record[field] = restored
+
+
+def _restore_schema_decimals(value: Any) -> dict[str, Any]:
+    """Restore only schema-defined financial paths, never opaque metadata keys."""
+    if not isinstance(value, dict):
+        raise ValueError("stored evidence root must be an object")
+    for field in ("minimum_return",):
+        _restore_decimal(value["evaluation"], field)
+    for field in (
+        "quantity", "total_investment", "minimum_proceeds", "net_profit",
+        "net_return",
+    ):
+        _restore_decimal(value["opportunity"], field)
+    for field in (
+        "gross_investment", "gross_proceeds", "fees", "total_costs",
+        "net_profit", "net_return",
+    ):
+        _restore_decimal(value["economics"], field)
+    for cost in value["economics"]["costs"]:
+        _restore_decimal(cost, "amount")
+    for fee in value["fee_schedules"]:
+        _restore_decimal(fee, "rate")
+        _restore_decimal(fee, "exponent")
+    for payoff in value["relation"]["payoffs"]:
+        _restore_decimal(payoff, "amount")
+    for book in value["books"]:
+        _restore_decimal(book["snapshot"], "tick_size")
+        for level in book["levels"]:
+            _restore_decimal(level, "price")
+            _restore_decimal(level, "size")
+    for leg in value["legs"]:
+        _restore_decimal(leg, "quantity")
+        _restore_decimal(leg, "notional")
+    for action in value["actions"]:
+        _restore_decimal(action, "quantity")
+        _restore_decimal(action, "amount")
+    _restore_decimal(value["risk"], "worst_leg_failure_loss")
+    _restore_decimal(value["risk"], "max_unhedged_notional")
     return value
 
 
@@ -138,6 +146,22 @@ def _mapping(name: str, value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{name} must be a mapping")
     return value
+
+
+def _validate_opaque_json(name: str, value: object) -> None:
+    if value is None or type(value) in (str, bool, int):
+        return
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if type(key) is not str:
+                raise TypeError(f"{name} keys must be strings")
+            _validate_opaque_json(f"{name}.{key}", child)
+        return
+    if type(value) in (list, tuple):
+        for index, child in enumerate(value):
+            _validate_opaque_json(f"{name}[{index}]", child)
+        return
+    raise TypeError(f"{name} contains unsupported JSON value")
 
 
 def _sequence(name: str, value: object) -> list[object] | tuple[object, ...]:
@@ -177,16 +201,20 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         if type(producer[name]) is not str or not producer[name]:
             raise ValueError(f"producer.{name} must be a nonempty string")
     _mapping("producer.metadata", producer["metadata"])
+    _validate_opaque_json("producer.metadata", producer["metadata"])
 
     evaluation = _mapping("evaluation", raw["evaluation"])
     _required(
         evaluation, "evaluated_at_ms", "maximum_book_age_ms",
-        "maximum_leg_skew_ms",
+        "maximum_leg_skew_ms", "minimum_return",
     )
     for name in (
         "evaluated_at_ms", "maximum_book_age_ms", "maximum_leg_skew_ms",
     ):
         _integer(f"evaluation.{name}", evaluation[name])
+    minimum_return = _nonnegative_decimal(
+        "evaluation.minimum_return", evaluation["minimum_return"]
+    )
 
     run = _mapping("run", raw["run"])
     _required(run, "id", "status", "started_at_ms")
@@ -254,6 +282,12 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         raise ValueError("gross investment plus fees must equal total costs")
     if economics["gross_proceeds"] - economics["total_costs"] != economics["net_profit"]:
         raise ValueError("gross proceeds minus total costs must equal net profit")
+    if economics["total_costs"] <= 0:
+        raise ValueError("total costs must be positive")
+    with localcontext(Context(prec=RETURN_PRECISION)):
+        derived_return = economics["net_profit"] / economics["total_costs"]
+    if economics["net_return"] != derived_return:
+        raise ValueError("net return must equal net profit divided by total costs")
 
     for name in (
         "events", "markets", "tokens", "fee_schedules", "legs", "actions",
@@ -267,6 +301,7 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         _required(event, "id", "metadata")
         event_ids.add(_identifier("event.id", event["id"]))
         _mapping("event.metadata", event["metadata"])
+        _validate_opaque_json("event.metadata", event["metadata"])
 
     market_ids: set[str] = set()
     for item in _sequence("markets", raw["markets"]):
@@ -276,6 +311,7 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         if _identifier("market.event_id", market["event_id"]) not in event_ids:
             raise ValueError("market references an unknown event")
         _mapping("market.metadata", market["metadata"])
+        _validate_opaque_json("market.metadata", market["metadata"])
 
     token_ids: set[str] = set()
     for item in _sequence("tokens", raw["tokens"]):
@@ -287,6 +323,7 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         if type(token["outcome"]) is not str or not token["outcome"]:
             raise ValueError("token outcome must be a nonempty string")
         _mapping("token.metadata", token["metadata"])
+        _validate_opaque_json("token.metadata", token["metadata"])
 
     for item in _sequence("fee_schedules", raw["fee_schedules"]):
         fee = _mapping("fee schedule", item)
@@ -320,11 +357,13 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
     if relation_set["status"] != "active":
         raise ValueError("relation set must be active")
     audit_metadata = _mapping("relation.set.metadata", relation_set["metadata"])
+    _validate_opaque_json("relation.set.metadata", audit_metadata)
     if audit_metadata.get("audited") is not True:
         raise ValueError("active relation set must be explicitly audited")
     if type(audit_metadata.get("auditor")) is not str or not audit_metadata["auditor"]:
         raise ValueError("active relation set must identify its auditor")
     provenance = _mapping("relation.set.provenance", relation_set["provenance"])
+    _validate_opaque_json("relation.set.provenance", provenance)
     _required(provenance, "source", "content_hash")
     if any(
         type(provenance[name]) is not str or not provenance[name]
@@ -494,8 +533,17 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         )
 
     if opportunity["status"] == "SNAPSHOT_EXECUTABLE":
-        if opportunity["quantity"] <= 0 or opportunity["total_investment"] <= 0:
-            raise ValueError("executable opportunity quantity and investment must be positive")
+        if (
+            opportunity["quantity"] <= 0
+            or opportunity["total_investment"] <= 0
+            or opportunity["net_profit"] <= 0
+            or opportunity["net_return"] <= 0
+        ):
+            raise ValueError(
+                "executable quantity, investment, profit, and return must be positive"
+            )
+        if opportunity["net_return"] < minimum_return:
+            raise ValueError("executable return is below the recorded minimum threshold")
         for section in (
             "legs", "actions", "books", "fee_schedules", "latency_metrics",
         ):
@@ -550,7 +598,7 @@ class EvidenceBundle:
             raise TypeError("canonical_json must be a string")
         try:
             decoded = json.loads(self.canonical_json)
-            restored = _restore_decimals(decoded)
+            restored = _restore_schema_decimals(decoded)
             _validate_bundle(restored)
             rebuilt = json.dumps(
                 _canonicalize(restored),
@@ -583,7 +631,7 @@ class EvidenceBundle:
 
     @property
     def data(self) -> dict[str, Any]:
-        return json.loads(self.canonical_json)
+        return _restore_schema_decimals(json.loads(self.canonical_json))
 
     @property
     def id(self) -> str:
@@ -698,7 +746,12 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 
 def _json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        _canonicalize(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 class OpportunityStore:
@@ -726,25 +779,27 @@ class OpportunityStore:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._path = str(path)
         connection = await aiosqlite.connect(self._path)
-        self._connection = connection
-        await connection.execute("PRAGMA foreign_keys = ON")
-        await connection.execute("PRAGMA journal_mode = WAL")
-        version_rows = await connection.execute_fetchall("PRAGMA user_version")
-        existing_version = int(version_rows[0][0])
-        if existing_version > SCHEMA_VERSION:
-            await connection.close()
-            self._connection = None
-            raise RuntimeError(
-                f"database schema {existing_version} is newer than supported "
-                f"schema {SCHEMA_VERSION}"
+        try:
+            await connection.execute("PRAGMA foreign_keys = ON")
+            await connection.execute("PRAGMA journal_mode = WAL")
+            version_rows = await connection.execute_fetchall("PRAGMA user_version")
+            existing_version = int(version_rows[0][0])
+            if existing_version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"database schema {existing_version} is newer than supported "
+                    f"schema {SCHEMA_VERSION}"
+                )
+            await connection.executescript(_SCHEMA)
+            await connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
+                (SCHEMA_VERSION,),
             )
-        await connection.executescript(_SCHEMA)
-        await connection.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
-            (SCHEMA_VERSION,),
-        )
-        await connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        await connection.commit()
+            await connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            await connection.commit()
+        except BaseException:
+            await connection.close()
+            raise
+        self._connection = connection
         return self
 
     async def initialize(self) -> "OpportunityStore":
@@ -821,7 +876,10 @@ class OpportunityStore:
         for fee in data["fee_schedules"]:
             await self._connection.execute(
                 "INSERT INTO fee_schedules VALUES (?, ?, ?, ?, ?)",
-                (bundle_id, fee["id"], fee["token_id"], fee["rate"], _json(fee)),
+                (
+                    bundle_id, fee["id"], fee["token_id"],
+                    _canonical_decimal(fee["rate"]), _json(fee),
+                ),
             )
         relation = data["relation"]
         relation_set = relation["set"]
@@ -843,7 +901,10 @@ class OpportunityStore:
         for position, payoff in enumerate(relation["payoffs"]):
             await self._connection.execute(
                 "INSERT INTO relation_payoffs VALUES (?, ?, ?, ?, ?)",
-                (bundle_id, set_id, position, payoff["amount"], _json(payoff)),
+                (
+                    bundle_id, set_id, position,
+                    _canonical_decimal(payoff["amount"]), _json(payoff),
+                ),
             )
         for book in data["books"]:
             epoch, snapshot = book["epoch"], book["snapshot"]
@@ -860,7 +921,8 @@ class OpportunityStore:
                     "INSERT INTO levels VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         bundle_id, snapshot["id"], level["position"], level["side"],
-                        level["price"], level["size"],
+                        _canonical_decimal(level["price"]),
+                        _canonical_decimal(level["size"]),
                     ),
                 )
         opportunity = data["opportunity"]
@@ -913,7 +975,7 @@ class OpportunityStore:
             raise KeyError(bundle_id)
         # The canonical payload is immutable; validate again to detect corruption.
         decoded = json.loads(rows[0][0])
-        replayed = EvidenceBundle.from_mapping(_restore_decimals(decoded))
+        replayed = EvidenceBundle.from_mapping(_restore_schema_decimals(decoded))
         if replayed.canonical_json != rows[0][0]:
             raise ValueError("stored evidence is not canonical")
         return replayed

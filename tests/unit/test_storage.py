@@ -5,9 +5,11 @@ import aiosqlite
 import pytest
 
 from predmarket.storage import EvidenceBundle, EvidenceConflictError, OpportunityStore
+import predmarket.storage as storage_module
 
 
 def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
+    exact_return = Decimal("0.25")
     return {
         "version": 1,
         "id": bundle_id,
@@ -20,6 +22,7 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
             "evaluated_at_ms": 1000,
             "maximum_book_age_ms": 1000,
             "maximum_leg_skew_ms": 250,
+            "minimum_return": Decimal("0.0075"),
         },
         "run": {"id": "run-1", "status": "COMPLETED", "started_at_ms": 1000},
         "opportunity": {
@@ -27,18 +30,18 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
             "status": "SNAPSHOT_EXECUTABLE",
             "relation_id": "rel-1",
             "quantity": Decimal("10.000"),
-            "total_investment": Decimal("9.10"),
+            "total_investment": Decimal("8.00"),
             "minimum_proceeds": Decimal("10"),
-            "net_profit": Decimal("0.900"),
-            "net_return": Decimal("0.098901098901098901"),
+            "net_profit": Decimal("2.00"),
+            "net_return": exact_return,
         },
         "economics": {
-            "gross_investment": Decimal("9.09"),
+            "gross_investment": Decimal("7.99"),
             "gross_proceeds": Decimal("10"),
             "fees": Decimal("0.01"),
-            "total_costs": Decimal("9.10"),
-            "net_profit": Decimal("0.900"),
-            "net_return": Decimal("0.098901098901098901"),
+            "total_costs": Decimal("8.00"),
+            "net_profit": Decimal("2.00"),
+            "net_return": exact_return,
             "costs": [
                 {
                     "id": "cost-1",
@@ -164,7 +167,7 @@ def test_bundle_canonicalizes_exact_decimals_and_unicode():
     evidence = EvidenceBundle.from_mapping(bundle())
     decoded = json.loads(evidence.canonical_json)
     assert decoded["opportunity"]["quantity"] == "10"
-    assert decoded["opportunity"]["total_investment"] == "9.1"
+    assert decoded["opportunity"]["total_investment"] == "8"
     assert decoded["fee_schedules"][0]["rate"] == "0.001"
     assert "天气 ☀" in evidence.canonical_json
     assert ": " not in evidence.canonical_json
@@ -230,6 +233,22 @@ async def test_explicit_lifecycle_is_idempotent_and_closed_operations_fail():
     await store.close()
     with pytest.raises(RuntimeError, match="not open"):
         await store.replay("bundle-1")
+
+
+@pytest.mark.asyncio
+async def test_failed_initialization_leaves_store_closed_and_retryable(monkeypatch):
+    store = OpportunityStore(":memory:")
+    original = storage_module._SCHEMA
+    monkeypatch.setattr(storage_module, "_SCHEMA", "THIS IS NOT SQL")
+    with pytest.raises(aiosqlite.OperationalError):
+        await store.open()
+    assert store._connection is None
+    with pytest.raises(RuntimeError, match="not open"):
+        await store.list_runs()
+    monkeypatch.setattr(storage_module, "_SCHEMA", original)
+    assert await store.open() is store
+    assert await store.list_runs() == []
+    await store.close()
 
 
 @pytest.mark.asyncio
@@ -353,4 +372,64 @@ def test_non_executable_status_must_not_contain_notifications():
     value["opportunity"]["status"] = "RESEARCH_CANDIDATE"
     value["risk"]["status"] = "RESEARCH_CANDIDATE"
     with pytest.raises(ValueError, match="notification"):
+        EvidenceBundle.from_mapping(value)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["opportunity"].__setitem__(
+            "net_return", Decimal("999")
+        ),
+        lambda value: value["economics"].__setitem__("net_return", Decimal("999")),
+        lambda value: (
+            value["opportunity"].__setitem__("net_profit", Decimal("-0.1")),
+            value["economics"].__setitem__("net_profit", Decimal("-0.1")),
+        ),
+        lambda value: (
+            value["opportunity"].__setitem__("total_investment", Decimal("0")),
+            value["economics"].__setitem__("gross_investment", Decimal("0")),
+            value["economics"].__setitem__("fees", Decimal("0")),
+            value["economics"].__setitem__("total_costs", Decimal("0")),
+            value["economics"].__setitem__("net_profit", Decimal("10")),
+            value["opportunity"].__setitem__("net_profit", Decimal("10")),
+        ),
+        lambda value: value["evaluation"].__setitem__(
+            "minimum_return", Decimal("0.3")
+        ),
+    ],
+)
+def test_economics_are_derived_and_threshold_consistent(mutate):
+    value = bundle()
+    mutate(value)
+    with pytest.raises(ValueError):
+        EvidenceBundle.from_mapping(value)
+
+
+@pytest.mark.asyncio
+async def test_metadata_financial_name_collisions_round_trip_unchanged(tmp_path):
+    value = bundle()
+    value["producer"]["metadata"] = {
+        "price": "原样价格",
+        "rate": "not-a-decimal",
+        "nested": {"amount": "金额文本 ☀"},
+    }
+    value["relation"]["set"]["provenance"]["price"] = "source-field"
+    expected = EvidenceBundle.from_mapping(value)
+    path = tmp_path / "metadata.sqlite3"
+    async with OpportunityStore(path) as store:
+        await store.save(expected)
+    async with OpportunityStore(path) as store:
+        replayed = await store.replay("bundle-1")
+    assert replayed.canonical_json == expected.canonical_json
+    assert replayed.data["producer"]["metadata"]["price"] == "原样价格"
+    assert replayed.data["producer"]["metadata"]["nested"]["amount"] == "金额文本 ☀"
+    assert replayed.data["opportunity"]["net_return"] == Decimal("0.25")
+
+
+@pytest.mark.parametrize("unsupported", [1.5, Decimal("1.5"), {"bad"}])
+def test_opaque_metadata_rejects_unsupported_json_types(unsupported):
+    value = bundle()
+    value["producer"]["metadata"]["price"] = unsupported
+    with pytest.raises(TypeError):
         EvidenceBundle.from_mapping(value)
