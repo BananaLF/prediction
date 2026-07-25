@@ -10,6 +10,7 @@ from typing import Mapping
 
 from predmarket.actions import Action, ActionKind, ActionPath
 from predmarket.domain import PathKind, Side
+from predmarket.exact_math import decimal_ratio
 from predmarket.fees import FeeSchedule
 from predmarket.orderbook import InsufficientDepth, OrderBook
 from predmarket.relations import Relation, require_audited_active_relation
@@ -64,7 +65,7 @@ class SimulationResult:
         rate = _decimal(self.minimum_return, "minimum_return", signed=True)
         if received - capital != profit:
             raise ValueError("minimum_received - maximum_capital_used must equal profit")
-        if profit / capital != rate:
+        if decimal_ratio(profit, capital) != rate:
             raise ValueError("minimum_return must equal profit / maximum_capital_used")
 
 
@@ -199,7 +200,7 @@ def simulate_path(
         maximum_capital,
         received,
         cash,
-        cash / maximum_capital,
+        decimal_ratio(cash, maximum_capital),
     )
 
 

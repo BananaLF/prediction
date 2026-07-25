@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Context, Decimal, InvalidOperation, localcontext
+from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
 import re
@@ -13,9 +13,10 @@ from typing import Any
 
 import aiosqlite
 
+from predmarket.exact_math import decimal_ratio
+
 
 SCHEMA_VERSION = 1
-RETURN_PRECISION = 50
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OPPORTUNITY_STATUSES = {
     "REJECTED",
@@ -284,8 +285,9 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         raise ValueError("gross proceeds minus total costs must equal net profit")
     if economics["total_costs"] <= 0:
         raise ValueError("total costs must be positive")
-    with localcontext(Context(prec=RETURN_PRECISION)):
-        derived_return = economics["net_profit"] / economics["total_costs"]
+    derived_return = decimal_ratio(
+        economics["net_profit"], economics["total_costs"]
+    )
     if economics["net_return"] != derived_return:
         raise ValueError("net return must equal net profit divided by total costs")
 

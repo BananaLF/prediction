@@ -6,6 +6,9 @@ import pytest
 
 from predmarket.storage import EvidenceBundle, EvidenceConflictError, OpportunityStore
 import predmarket.storage as storage_module
+from predmarket.actions import Action, ActionKind
+from predmarket.exact_math import decimal_ratio
+from predmarket.simulator import SimulationResult
 
 
 def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
@@ -432,4 +435,38 @@ def test_opaque_metadata_rejects_unsupported_json_types(unsupported):
     value = bundle()
     value["producer"]["metadata"]["price"] = unsupported
     with pytest.raises(TypeError):
+        EvidenceBundle.from_mapping(value)
+
+
+def test_nonterminating_simulation_return_is_valid_storage_economics():
+    result = SimulationResult(
+        actions=(Action(ActionKind.MERGE),),
+        quantity=Decimal("10"),
+        maximum_capital_used=Decimal("9.3"),
+        minimum_received=Decimal("10"),
+        minimum_profit=Decimal("0.7"),
+        minimum_return=decimal_ratio(Decimal("0.7"), Decimal("9.3")),
+    )
+    value = bundle()
+    value["opportunity"].update(
+        total_investment=result.maximum_capital_used,
+        minimum_proceeds=result.minimum_received,
+        net_profit=result.minimum_profit,
+        net_return=result.minimum_return,
+    )
+    value["economics"].update(
+        gross_investment=result.maximum_capital_used,
+        gross_proceeds=result.minimum_received,
+        fees=Decimal("0"),
+        total_costs=result.maximum_capital_used,
+        net_profit=result.minimum_profit,
+        net_return=result.minimum_return,
+        costs=[],
+    )
+    evidence = EvidenceBundle.from_mapping(value)
+    assert evidence.data["opportunity"]["net_return"] == result.minimum_return
+
+    value["economics"]["net_return"] += Decimal("0.0000000000000000000000000001")
+    value["opportunity"]["net_return"] = value["economics"]["net_return"]
+    with pytest.raises(ValueError, match="net return"):
         EvidenceBundle.from_mapping(value)
