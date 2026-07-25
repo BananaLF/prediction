@@ -101,7 +101,10 @@ class TokenMetadata:
 
 @dataclass(frozen=True)
 class EventMetadata:
-    event_id: str | None
+    event_id: str
+    slug: str | None
+    title: str | None
+    source_metadata_json: str
 
 
 @dataclass(frozen=True)
@@ -110,7 +113,7 @@ class MarketMetadata:
     condition_id: str
     question: str
     slug: str | None
-    event: EventMetadata
+    events: tuple[EventMetadata, ...]
     tokens: tuple[TokenMetadata, TokenMetadata]
     active: bool | None
     closed: bool | None
@@ -121,7 +124,13 @@ class MarketMetadata:
     end_date: str | None
     fees_enabled: bool | None
     fee_schedule_source_json: str | None
+    fee_schedule_source: str | None
     source_metadata_json: str
+
+    @property
+    def event(self) -> EventMetadata | None:
+        """Return the unambiguous event, never guess among multiple relations."""
+        return self.events[0] if len(self.events) == 1 else None
 
     @property
     def yes_token_id(self) -> str:
@@ -153,6 +162,61 @@ class MarketDiagnostic:
     reason: str
 
 
+def _canonical_json(value: Any, name: str) -> str:
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    except (TypeError, ValueError) as exc:
+        raise AdapterPayloadError(f"{name} is not JSON-compatible") from exc
+
+
+def _normalize_events(raw: dict[str, Any]) -> tuple[EventMetadata, ...]:
+    # Gamma has emitted both the current lower-case relation and a legacy
+    # ORM-style capitalized alias. Ambiguous dual representations fail closed.
+    keys = [key for key in ("events", "Events") if key in raw]
+    if len(keys) > 1:
+        raise AdapterInvariantError("events and Events aliases conflict")
+    if not keys:
+        return ()
+    value = raw[keys[0]]
+    if not isinstance(value, list):
+        raise AdapterPayloadError(f"{keys[0]} must be an array")
+    result: list[EventMetadata] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise AdapterPayloadError("nested events must be objects")
+        result.append(
+            EventMetadata(
+                event_id=_required_string(item, "id"),
+                slug=_optional_string(item, "slug"),
+                title=_optional_string(item, "title"),
+                source_metadata_json=_canonical_json(item, "nested event"),
+            )
+        )
+    ids = [event.event_id for event in result]
+    if len(ids) != len(set(ids)):
+        raise AdapterInvariantError("nested event IDs must be unique")
+    return tuple(result)
+
+
+def _normalize_fee_schedule(raw: dict[str, Any]) -> tuple[str | None, str | None]:
+    # feeSchedule is current Gamma spelling. fee_schedule remains a strict
+    # compatibility alias for previously captured payloads.
+    keys = [key for key in ("feeSchedule", "fee_schedule") if key in raw]
+    if len(keys) > 1:
+        raise AdapterInvariantError("feeSchedule aliases conflict")
+    if not keys:
+        return None, None
+    key = keys[0]
+    value = raw[key]
+    if value is None:
+        return key, "null"
+    if not isinstance(value, dict):
+        raise AdapterPayloadError(f"{key} must be an object")
+    return key, _canonical_json(value, key)
+
+
 @dataclass(frozen=True)
 class GammaDiscovery(Sequence[MarketMetadata]):
     markets: tuple[MarketMetadata, ...]
@@ -180,15 +244,13 @@ def _normalize_market(raw: Any) -> MarketMetadata:
         raise AdapterInvariantError("market is not binary YES/NO")
     if len(set(normalized)) != 2 or len(set(token_ids)) != len(token_ids):
         raise AdapterInvariantError("outcomes and token IDs must be unique")
-    fee_source = raw.get("fee_schedule")
-    if fee_source is not None and not isinstance(fee_source, dict):
-        raise AdapterPayloadError("fee_schedule must be an object when present")
+    fee_source, fee_source_json = _normalize_fee_schedule(raw)
     return MarketMetadata(
         market_id=_required_string(raw, "id"),
         condition_id=_required_string(raw, "conditionId"),
         question=_required_string(raw, "question"),
         slug=_optional_string(raw, "slug"),
-        event=EventMetadata(_optional_string(raw, "eventId")),
+        events=_normalize_events(raw),
         tokens=tuple(TokenMetadata(token, outcome) for token, outcome in zip(token_ids, normalized)),  # type: ignore[arg-type]
         active=_optional_bool(raw, "active"),
         closed=_optional_bool(raw, "closed"),
@@ -198,12 +260,9 @@ def _normalize_market(raw: Any) -> MarketMetadata:
         neg_risk=_optional_bool(raw, "negRisk"),
         end_date=_optional_string(raw, "endDate"),
         fees_enabled=_optional_bool(raw, "feesEnabled"),
-        fee_schedule_source_json=(
-            json.dumps(fee_source, sort_keys=True, separators=(",", ":"))
-            if fee_source is not None
-            else None
-        ),
-        source_metadata_json=json.dumps(raw, sort_keys=True, separators=(",", ":")),
+        fee_schedule_source_json=fee_source_json,
+        fee_schedule_source=fee_source,
+        source_metadata_json=_canonical_json(raw, "market"),
     )
 
 
@@ -268,6 +327,7 @@ class GammaClient:
         next_cursor = payload.get("next_cursor", "")
         if not isinstance(next_cursor, str):
             raise AdapterPayloadError("next_cursor must be a string")
+        payload["next_cursor"] = next_cursor
         return payload
 
     async def active_markets(

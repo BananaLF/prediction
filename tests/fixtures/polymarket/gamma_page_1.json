@@ -5,7 +5,13 @@
       "slug": "example-market",
       "question": "Will the example happen?",
       "conditionId": "condition-101",
-      "eventId": "event-10",
+      "events": [
+        {
+          "id": "event-10",
+          "slug": "example-event",
+          "title": "Example Event"
+        }
+      ],
       "active": true,
       "closed": false,
       "archived": false,
@@ -15,7 +21,11 @@
       "outcomes": "[\"Yes\", \"No\"]",
       "clobTokenIds": "[\"yes-101\", \"no-101\"]",
       "endDate": "2027-01-01T00:00:00Z",
-      "feesEnabled": true
+      "feesEnabled": true,
+      "feeSchedule": {
+        "baseFee": 0,
+        "source": "gamma"
+      }
     }
   ],
   "next_cursor": "next/+=="
