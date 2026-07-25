@@ -47,7 +47,7 @@ class SimulationResult:
         if not self.actions:
             raise ValueError("actions must be non-empty")
         capital = _decimal(self.maximum_capital_used, "maximum_capital_used", positive=True)
-        received = _decimal(self.minimum_received, "minimum_received", signed=True)
+        received = _decimal(self.minimum_received, "minimum_received")
         profit = _decimal(self.minimum_profit, "minimum_profit", signed=True)
         rate = _decimal(self.minimum_return, "minimum_return", signed=True)
         if received - capital != profit:
@@ -181,11 +181,17 @@ def optimize_quantities(
 
     results: list[SimulationResult] = []
     for candidate in sorted(candidates):
+        if any(
+            candidate * action.units < books[action.token_id].minimum_order_size
+            for action in trading_actions
+            if action.token_id is not None
+        ):
+            continue
         try:
             result = simulate_path(
                 path, candidate, books, fees, safety_buffer, conversion_cost
             )
-        except (InsufficientDepth, ValueError):
+        except InsufficientDepth:
             continue
         if result.maximum_capital_used <= bankroll:
             results.append(result)

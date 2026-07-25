@@ -133,6 +133,15 @@ def test_action_path_and_result_validation_and_immutability() -> None:
         ActionPath("x", PathKind.IMMEDIATE_CONVERSION, [Action(ActionKind.MERGE)])  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         SimulationResult((), D("1"), D("2"), D("2"), D("2"))
+    with pytest.raises(ValueError, match="minimum_received"):
+        SimulationResult((Action(ActionKind.MERGE),), D("1"), D("-1"), D("-2"), D("-2"))
+
+    zero_received = SimulationResult(
+        (Action(ActionKind.MERGE),), D("1"), D("0"), D("-1"), D("-1")
+    )
+    assert zero_received.minimum_received == D("0")
+    with pytest.raises(FrozenInstanceError):
+        zero_received.minimum_profit = D("0")
 
     action = Action(ActionKind.MERGE)
     path = ActionPath("x", PathKind.IMMEDIATE_CONVERSION, (action,))
@@ -171,6 +180,24 @@ def test_optimizer_uses_relevant_depth_breakpoints_and_bankroll(
     assert max(r.maximum_capital_used for r in reduced_results) <= max(
         r.maximum_capital_used for r in results
     )
+
+
+def test_optimizer_propagates_unsupported_action_errors(
+    books: dict[str, OrderBook],
+) -> None:
+    path = ActionPath(
+        "unsupported",
+        PathKind.IMMEDIATE_CONVERSION,
+        (
+            Action(ActionKind.BUY, "yes", Side.BUY),
+            Action(ActionKind.REDEEM),
+        ),
+    )
+    with pytest.raises(ValueError, match="unsupported"):
+        optimize_quantities(
+            path, {"yes": books["yes"]}, {"yes": fee()},
+            D("0"), D("0"), D("1000")
+        )
 
 
 @pytest.mark.parametrize("bankroll", [D("0"), D("-1"), D("NaN"), D("Infinity")])
