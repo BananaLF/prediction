@@ -1,0 +1,16 @@
+{
+  "markets": [
+    {
+      "id": "102",
+      "question": "Array-shaped fields?",
+      "conditionId": "condition-102",
+      "active": true,
+      "closed": false,
+      "enableOrderBook": true,
+      "outcomes": ["NO", "YES"],
+      "clobTokenIds": ["no-102", "yes-102"],
+      "negRisk": true
+    }
+  ],
+  "next_cursor": ""
+}

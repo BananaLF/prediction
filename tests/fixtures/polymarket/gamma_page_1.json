@@ -1,0 +1,22 @@
+{
+  "markets": [
+    {
+      "id": "101",
+      "slug": "example-market",
+      "question": "Will the example happen?",
+      "conditionId": "condition-101",
+      "eventId": "event-10",
+      "active": true,
+      "closed": false,
+      "archived": false,
+      "acceptingOrders": true,
+      "enableOrderBook": true,
+      "negRisk": false,
+      "outcomes": "[\"Yes\", \"No\"]",
+      "clobTokenIds": "[\"yes-101\", \"no-101\"]",
+      "endDate": "2027-01-01T00:00:00Z",
+      "feesEnabled": true
+    }
+  ],
+  "next_cursor": "next/+=="
+}
