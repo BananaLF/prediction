@@ -38,39 +38,66 @@ def _decimal_string(value: object, name: str, *, nonnegative: bool = False) -> D
     return parsed
 
 
-@dataclass
+@dataclass(init=False)
 class EpochBook:
     token_id: str
-    state: EpochState = EpochState.WARMING
-    snapshot_hash: str | None = None
-    exchange_ts: int | None = None
-    invalid_reason: str | None = None
+    _state: EpochState
+    _snapshot_hash: str | None
+    _exchange_ts_ms: int | None
+    _invalid_reason: str | None
 
-    def __post_init__(self) -> None:
-        _nonempty_string(self.token_id, "token_id")
-        if not isinstance(self.state, EpochState):
-            raise TypeError("state must be an EpochState")
-        if self.snapshot_hash is not None:
-            _nonempty_string(self.snapshot_hash, "snapshot_hash")
-        if self.exchange_ts is not None:
-            _timestamp(self.exchange_ts)
-        if self.invalid_reason is not None:
-            _nonempty_string(self.invalid_reason, "invalid_reason")
+    def __init__(
+        self,
+        token_id: str,
+        *,
+        snapshot_hash: str | None = None,
+        exchange_ts_ms: int | None = None,
+        invalid_reason: str | None = None,
+    ) -> None:
+        _nonempty_string(token_id, "token_id")
+        if snapshot_hash is not None:
+            _nonempty_string(snapshot_hash, "snapshot_hash")
+        if exchange_ts_ms is not None:
+            _timestamp(exchange_ts_ms, "exchange_ts_ms")
+        if invalid_reason is not None:
+            _nonempty_string(invalid_reason, "invalid_reason")
+
+        self.token_id = token_id
+        self._state = EpochState.WARMING
+        self._snapshot_hash = snapshot_hash
+        self._exchange_ts_ms = exchange_ts_ms
+        self._invalid_reason = invalid_reason
+
+    @property
+    def state(self) -> EpochState:
+        return self._state
+
+    @property
+    def snapshot_hash(self) -> str | None:
+        return self._snapshot_hash
+
+    @property
+    def exchange_ts_ms(self) -> int | None:
+        return self._exchange_ts_ms
+
+    @property
+    def invalid_reason(self) -> str | None:
+        return self._invalid_reason
 
     def invalidate(self, reason: str) -> None:
         _nonempty_string(reason, "reason")
-        self.state = EpochState.RESYNC
-        self.invalid_reason = reason
+        self._state = EpochState.RESYNC
+        self._invalid_reason = reason
 
     def mark_stale(self, reason: str) -> None:
         _nonempty_string(reason, "reason")
-        self.state = EpochState.STALE
-        self.invalid_reason = reason
+        self._state = EpochState.STALE
+        self._invalid_reason = reason
 
     def apply_delta(
         self, price: str, size: str, side: str, exchange_ts: int
     ) -> bool:
-        if self.state is not EpochState.LIVE:
+        if self._state is not EpochState.LIVE:
             return False
 
         _decimal_string(price, "price")
@@ -81,16 +108,24 @@ class EpochBook:
             raise ValueError("side must be BUY or SELL")
         _timestamp(exchange_ts)
 
-        if self.exchange_ts is not None and exchange_ts < self.exchange_ts:
+        if self._exchange_ts_ms is not None and exchange_ts < self._exchange_ts_ms:
             self.invalidate("timestamp_regression")
             return False
-        self.exchange_ts = exchange_ts
+        self._exchange_ts_ms = exchange_ts
         return True
 
-    def replace_snapshot(self, snapshot_hash: str, exchange_ts: int) -> None:
+    def replace_snapshot(self, snapshot_hash: str, exchange_ts_ms: int) -> bool:
         _nonempty_string(snapshot_hash, "snapshot_hash")
-        _timestamp(exchange_ts)
-        self.snapshot_hash = snapshot_hash
-        self.exchange_ts = exchange_ts
-        self.invalid_reason = None
-        self.state = EpochState.LIVE
+        _timestamp(exchange_ts_ms, "exchange_ts_ms")
+        if (
+            self._exchange_ts_ms is not None
+            and exchange_ts_ms < self._exchange_ts_ms
+        ):
+            self.invalidate("snapshot_timestamp_regression")
+            return False
+
+        self._snapshot_hash = snapshot_hash
+        self._exchange_ts_ms = exchange_ts_ms
+        self._invalid_reason = None
+        self._state = EpochState.LIVE
+        return True

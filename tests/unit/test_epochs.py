@@ -20,14 +20,14 @@ def test_lifecycle_warming_live_resync_live() -> None:
     assert book.apply_delta("0.4", "2", "BUY", 1) is False
 
     book.replace_snapshot("hash-1", 10)
-    assert (book.state, book.snapshot_hash, book.exchange_ts, book.invalid_reason) == (
+    assert (book.state, book.snapshot_hash, book.exchange_ts_ms, book.invalid_reason) == (
         EpochState.LIVE,
         "hash-1",
         10,
         None,
     )
     assert book.apply_delta("0.5", "0", "SELL", 11) is True
-    assert book.exchange_ts == 11
+    assert book.exchange_ts_ms == 11
 
     book.invalidate("gap")
     assert book.state is EpochState.RESYNC
@@ -35,7 +35,7 @@ def test_lifecycle_warming_live_resync_live() -> None:
     assert book.apply_delta("0.5", "1", "BUY", 12) is False
 
     book.replace_snapshot("hash-2", 20)
-    assert (book.state, book.snapshot_hash, book.exchange_ts, book.invalid_reason) == (
+    assert (book.state, book.snapshot_hash, book.exchange_ts_ms, book.invalid_reason) == (
         EpochState.LIVE,
         "hash-2",
         20,
@@ -47,7 +47,7 @@ def test_timestamp_regression_invalidates_live_epoch() -> None:
     book = EpochBook("token")
     book.replace_snapshot("hash", 10)
     assert book.apply_delta("0.5", "1", "BUY", 9) is False
-    assert (book.state, book.invalid_reason, book.exchange_ts) == (
+    assert (book.state, book.invalid_reason, book.exchange_ts_ms) == (
         EpochState.RESYNC,
         "timestamp_regression",
         10,
@@ -60,7 +60,7 @@ def test_mark_stale_records_reason_and_ignores_deltas() -> None:
     book.mark_stale("heartbeat_timeout")
     assert (book.state, book.invalid_reason) == (EpochState.STALE, "heartbeat_timeout")
     assert book.apply_delta("0.5", "1", "BUY", 11) is False
-    assert book.exchange_ts == 10
+    assert book.exchange_ts_ms == 10
 
 
 @pytest.mark.parametrize("method", ["invalidate", "mark_stale"])
@@ -80,8 +80,8 @@ def test_state_changes_require_nonempty_string_reason(method: str, reason: objec
         dict(token_id=1),
         dict(snapshot_hash=""),
         dict(snapshot_hash=1),
-        dict(exchange_ts=-1),
-        dict(exchange_ts=True),
+        dict(exchange_ts_ms=-1),
+        dict(exchange_ts_ms=True),
         dict(invalid_reason=""),
         dict(state="LIVE"),
     ],
@@ -138,3 +138,51 @@ def test_ignored_delta_does_not_need_validation_or_mutate() -> None:
     before = vars(book).copy()
     assert book.apply_delta(object(), object(), object(), object()) is False
     assert vars(book) == before
+
+
+def test_regressing_replacement_snapshot_fails_closed_without_replacing_book() -> None:
+    book = EpochBook("token")
+    book.replace_snapshot("current", 100)
+    book.invalidate("sequence_gap")
+
+    assert book.replace_snapshot("older", 90) is False
+    assert (
+        book.state,
+        book.snapshot_hash,
+        book.exchange_ts_ms,
+        book.invalid_reason,
+    ) == (
+        EpochState.RESYNC,
+        "current",
+        100,
+        "snapshot_timestamp_regression",
+    )
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("state", EpochState.LIVE),
+        ("exchange_ts_ms", -1),
+        ("invalid_reason", None),
+        ("snapshot_hash", "forged"),
+    ],
+)
+def test_transition_controlled_fields_are_externally_read_only(
+    attribute: str, value: object
+) -> None:
+    book = EpochBook("token")
+    before = (
+        book.state,
+        book.snapshot_hash,
+        book.exchange_ts_ms,
+        book.invalid_reason,
+    )
+    with pytest.raises(AttributeError):
+        setattr(book, attribute, value)
+    assert (
+        book.state,
+        book.snapshot_hash,
+        book.exchange_ts_ms,
+        book.invalid_reason,
+    ) == before
