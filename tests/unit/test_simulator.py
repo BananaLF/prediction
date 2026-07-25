@@ -132,12 +132,22 @@ def test_action_path_and_result_validation_and_immutability() -> None:
     with pytest.raises(TypeError):
         ActionPath("x", PathKind.IMMEDIATE_CONVERSION, [Action(ActionKind.MERGE)])  # type: ignore[arg-type]
     with pytest.raises(ValueError):
-        SimulationResult((), D("1"), D("2"), D("2"), D("2"))
+        SimulationResult((), D("1"), D("1"), D("2"), D("2"), D("2"))
     with pytest.raises(ValueError, match="minimum_received"):
-        SimulationResult((Action(ActionKind.MERGE),), D("1"), D("-1"), D("-2"), D("-2"))
+        SimulationResult(
+            (Action(ActionKind.MERGE),), D("1"), D("1"), D("-1"), D("-2"), D("-2")
+        )
+    with pytest.raises(ValueError, match="quantity"):
+        SimulationResult(
+            (Action(ActionKind.MERGE),), D("0"), D("1"), D("0"), D("-1"), D("-1")
+        )
+    with pytest.raises(TypeError, match="quantity"):
+        SimulationResult(
+            (Action(ActionKind.MERGE),), 1, D("1"), D("0"), D("-1"), D("-1")
+        )
 
     zero_received = SimulationResult(
-        (Action(ActionKind.MERGE),), D("1"), D("0"), D("-1"), D("-1")
+        (Action(ActionKind.MERGE),), D("1"), D("1"), D("0"), D("-1"), D("-1")
     )
     assert zero_received.minimum_received == D("0")
     with pytest.raises(FrozenInstanceError):
@@ -157,6 +167,59 @@ def test_binary_helpers_reject_empty_or_equal_tokens() -> None:
             helper("", "no")
         with pytest.raises(ValueError):
             helper("same", "same")
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        (Action(ActionKind.BUY, "yes", Side.BUY), Action(ActionKind.MERGE)),
+        (
+            Action(ActionKind.BUY, "yes", Side.BUY, D("1")),
+            Action(ActionKind.BUY, "no", Side.BUY, D("2")),
+            Action(ActionKind.MERGE),
+        ),
+        (
+            Action(ActionKind.MERGE),
+            Action(ActionKind.BUY, "yes", Side.BUY),
+            Action(ActionKind.BUY, "no", Side.BUY),
+        ),
+        (
+            Action(ActionKind.BUY, "yes", Side.BUY),
+            Action(ActionKind.BUY, "yes", Side.BUY),
+            Action(ActionKind.MERGE),
+        ),
+        (
+            Action(ActionKind.BUY, "yes", Side.BUY),
+            Action(ActionKind.SELL, "no", Side.SELL),
+            Action(ActionKind.MERGE),
+        ),
+        (
+            Action(ActionKind.BUY, "yes", Side.BUY),
+            Action(ActionKind.BUY, "no", Side.BUY),
+            Action(ActionKind.MERGE),
+            Action(ActionKind.MERGE),
+        ),
+        (
+            Action(ActionKind.SELL, "yes", Side.SELL),
+            Action(ActionKind.SELL, "no", Side.SELL),
+            Action(ActionKind.SPLIT),
+        ),
+    ],
+)
+def test_simulator_rejects_nonconserving_binary_paths(
+    actions: tuple[Action, ...], books: dict[str, OrderBook]
+) -> None:
+    path = ActionPath("malformed", PathKind.IMMEDIATE_CONVERSION, actions)
+    token_ids = {action.token_id for action in actions if action.token_id is not None}
+    selected_books = {token: books[token] for token in token_ids}
+    selected_fees = {token: fee() for token in token_ids}
+
+    with pytest.raises(ValueError, match="binary"):
+        simulate_path(path, D("10"), selected_books, selected_fees)
+    with pytest.raises(ValueError, match="binary"):
+        optimize_quantities(
+            path, selected_books, selected_fees, D("0"), D("0"), D("1000")
+        )
 
 
 def test_optimizer_uses_relevant_depth_breakpoints_and_bankroll(
@@ -179,6 +242,36 @@ def test_optimizer_uses_relevant_depth_breakpoints_and_bankroll(
     )
     assert max(r.maximum_capital_used for r in reduced_results) <= max(
         r.maximum_capital_used for r in results
+    )
+    assert max(r.quantity for r in reduced_results) <= max(r.quantity for r in results)
+
+
+def test_optimizer_reports_exact_scaled_relevant_side_breakpoints() -> None:
+    scaled_books = {
+        "yes": book(
+            "yes", ((".44", "1000"),), ((".45", "4"), (".46", "6")), minimum="2"
+        ),
+        "no": book(
+            "no", ((".47", "1000"),), ((".48", "6"), (".49", "4")), minimum="2"
+        ),
+    }
+    path = ActionPath(
+        "scaled-underpriced",
+        PathKind.IMMEDIATE_CONVERSION,
+        (
+            Action(ActionKind.BUY, "yes", Side.BUY, D("2")),
+            Action(ActionKind.BUY, "no", Side.BUY, D("2")),
+            Action(ActionKind.MERGE, units=D("2")),
+        ),
+    )
+
+    results = optimize_quantities(
+        path, scaled_books, {"yes": fee(), "no": fee()},
+        D("0"), D("0"), D("1000")
+    )
+
+    assert tuple(result.quantity for result in results) == (
+        D("1"), D("2"), D("3"), D("5")
     )
 
 

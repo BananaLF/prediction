@@ -34,6 +34,7 @@ def _decimal(
 @dataclass(frozen=True)
 class SimulationResult:
     actions: tuple[Action, ...]
+    quantity: Decimal
     maximum_capital_used: Decimal
     minimum_received: Decimal
     minimum_profit: Decimal
@@ -46,6 +47,7 @@ class SimulationResult:
             raise TypeError("actions must be a tuple of Action values")
         if not self.actions:
             raise ValueError("actions must be non-empty")
+        _decimal(self.quantity, "quantity", positive=True)
         capital = _decimal(self.maximum_capital_used, "maximum_capital_used", positive=True)
         received = _decimal(self.minimum_received, "minimum_received")
         profit = _decimal(self.minimum_profit, "minimum_profit", signed=True)
@@ -80,6 +82,28 @@ def _validate_supported_actions(path: ActionPath) -> None:
         raise ValueError(f"unsupported simulation action(s): {names}")
 
 
+def _validate_binary_conservation(path: ActionPath) -> None:
+    """Restrict Task 4 to its two inventory-conserving binary path families."""
+    kinds = tuple(action.kind for action in path.actions)
+    underpriced = (ActionKind.BUY, ActionKind.BUY, ActionKind.MERGE)
+    overpriced = (ActionKind.SPLIT, ActionKind.SELL, ActionKind.SELL)
+    if kinds == underpriced:
+        trading_actions = path.actions[:2]
+        conversion_action = path.actions[2]
+    elif kinds == overpriced:
+        conversion_action = path.actions[0]
+        trading_actions = path.actions[1:]
+    else:
+        raise ValueError("path must be a conserving binary BUY/BUY/MERGE or SPLIT/SELL/SELL")
+
+    token_ids = tuple(action.token_id for action in trading_actions)
+    if len(set(token_ids)) != 2:
+        raise ValueError("binary trading legs must use distinct tokens")
+    units = tuple(action.units for action in trading_actions)
+    if units[0] != units[1] or conversion_action.units != units[0]:
+        raise ValueError("binary trading and conversion legs must use matching units")
+
+
 def _validate_inputs(
     path: ActionPath,
     books: Mapping[str, OrderBook],
@@ -88,6 +112,7 @@ def _validate_inputs(
     if not isinstance(path, ActionPath):
         raise TypeError("path must be an ActionPath")
     _validate_supported_actions(path)
+    _validate_binary_conservation(path)
     required = _requirements(path)
     if set(books) != required:
         raise ValueError("books must cover trading tokens exactly")
@@ -158,6 +183,7 @@ def simulate_path(
     received = maximum_capital + cash
     return SimulationResult(
         path.actions,
+        quantity,
         maximum_capital,
         received,
         cash,
