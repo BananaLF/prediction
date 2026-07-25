@@ -1,5 +1,6 @@
 from decimal import Decimal
 import json
+import sqlite3
 
 import aiosqlite
 import pytest
@@ -159,6 +160,9 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
                 "token_id": "yes-1",
                 "quantity": Decimal("10"),
                 "amount": Decimal("4.5"),
+                "asset_in": "pUSD",
+                "asset_out": "yes-1",
+                "cash_flow": "OUTFLOW",
             }
         ],
         "risk": {
@@ -229,6 +233,30 @@ async def test_schema_wal_foreign_keys_and_all_required_tables(tmp_path):
         "snapshots", "levels", "opportunities", "legs", "actions",
         "risk_assessments", "runs", "latency_metrics", "notifications",
     } <= tables
+
+
+@pytest.mark.asyncio
+async def test_schema_v1_is_rejected_without_mutation(tmp_path):
+    path = tmp_path / "legacy-v1.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE legacy_payload(value TEXT)")
+    connection.execute("INSERT INTO legacy_payload VALUES ('untouched')")
+    connection.execute("PRAGMA user_version = 1")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="schema 1.*no supported migration"):
+        await OpportunityStore(path).open()
+
+    check = sqlite3.connect(path)
+    assert check.execute("PRAGMA user_version").fetchone() == (1,)
+    assert check.execute("SELECT value FROM legacy_payload").fetchall() == [
+        ("untouched",)
+    ]
+    assert check.execute(
+        "SELECT name FROM sqlite_master WHERE name = 'evidence_bundles'"
+    ).fetchall() == []
+    check.close()
 
 
 @pytest.mark.asyncio
@@ -315,6 +343,24 @@ async def test_serialized_concurrent_writes():
         )
         assert results == [True, True]
         assert len(await store.list_opportunities()) == 2
+
+
+@pytest.mark.asyncio
+async def test_notification_fingerprint_claim_is_atomic_under_concurrency():
+    import asyncio
+
+    first = bundle("bundle-a", "opp-a")
+    first["run"]["id"] = "run-a"
+    second = bundle("bundle-b", "opp-b")
+    second["run"]["id"] = "run-b"
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(first))
+        await store.save(EvidenceBundle.from_mapping(second))
+        results = await asyncio.gather(
+            store.claim_notification("nf:atomic", "bundle-a", 1000),
+            store.claim_notification("nf:atomic", "bundle-b", 1001),
+        )
+    assert sorted(results) == [False, True]
 
 
 @pytest.mark.parametrize(

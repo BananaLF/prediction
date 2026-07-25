@@ -40,8 +40,8 @@ def book(token, ask, bid="0.20", *, now=10_000, received=10_001, mono=10.0, size
 
 def copies(snapshots):
     return tuple(BookSnapshot(item.book, item.market_id, item.neg_risk,
-                              item.last_trade_price, item.received_at_ms,
-                              item.received_monotonic) for item in snapshots)
+                              item.last_trade_price, item.received_at_ms + 1,
+                              item.received_monotonic + 0.001) for item in snapshots)
 
 
 class Books:
@@ -69,6 +69,8 @@ class Store:
         self.fail = fail
         self.order = order
         self.save_result = save_result
+        self.claims = set()
+        self.attempts = []
 
     async def save(self, bundle):
         if self.order is not None:
@@ -77,6 +79,17 @@ class Store:
             raise RuntimeError("disk")
         self.items.append(bundle)
         return self.save_result
+
+    async def claim_notification(self, fingerprint, bundle_id, claimed_at_ms):
+        if fingerprint in self.claims:
+            return False
+        self.claims.add(fingerprint)
+        return True
+
+    async def record_notification_attempt(
+        self, fingerprint, bundle_id, status, attempted_at_ms, error
+    ):
+        self.attempts.append((fingerprint, bundle_id, status, attempted_at_ms, error))
 
 
 class Notice:
@@ -154,7 +167,22 @@ def fee_confirmation(authoritative=True, token_ids=("yes-1", "no-1"), rate="0"):
     )
 
 
-def engine(discovery, confirmation, fees=None, store=None, notice=None, **setting_changes):
+def test_fee_confirmation_defensively_freezes_schedule_mapping():
+    schedule = FeeSchedule(Decimal("0"), 2, True, 10)
+    supplied = {"yes-1": schedule, "no-1": schedule}
+    confirmation = FeeConfirmation(
+        "condition-1", ("yes-1", "no-1"), supplied, True, "CLOB"
+    )
+    supplied.clear()
+    assert set(confirmation.schedules) == {"yes-1", "no-1"}
+    with pytest.raises(TypeError):
+        confirmation.schedules["yes-1"] = schedule
+
+
+def engine(
+    discovery, confirmation, fees=None, store=None, notice=None,
+    run_id="run-deterministic", **setting_changes
+):
     store = store or Store()
     notice = notice or Notice()
     deps = EngineDependencies(
@@ -167,16 +195,24 @@ def engine(discovery, confirmation, fees=None, store=None, notice=None, **settin
         lambda: 10_010,
         lambda: 10.05,
         lambda m: "opp-deterministic",
-        lambda: "run-deterministic",
+        lambda: run_id,
         "0.2.0",
     )
     return StructuralArbitrageEngine(deps), store, notice
 
 
+class FailingBooks:
+    def __init__(self, error):
+        self.error = error
+
+    async def books(self, token_ids):
+        raise self.error
+
+
 def test_engine_result_rejects_non_boolean_lifecycle_markers():
     with pytest.raises(TypeError, match="notified"):
         EngineResult(
-            "opp", OpportunityStatus.REJECTED, "reason", "stage",
+            "opp", "evidence", OpportunityStatus.REJECTED, "reason", "stage",
             1, False, True, None, None, None, None, None, ("reason",),
         )
 
@@ -203,7 +239,7 @@ async def test_no_initial_candidate_persists_research_without_confirmation_or_no
 @pytest.mark.asyncio
 async def test_candidate_disappears_during_independent_confirmation():
     discovery = Books((book("yes-1", "0.45"), book("no-1", "0.45")))
-    confirmation = Books((book("yes-1", "0.60"), book("no-1", "0.45")))
+    confirmation = Books(copies((book("yes-1", "0.60"), book("no-1", "0.45"))))
     subject, store, notice = engine(discovery, confirmation)
     result = await subject.evaluate_binary(market())
     assert result.status is OpportunityStatus.REJECTED
@@ -215,15 +251,75 @@ async def test_candidate_disappears_during_independent_confirmation():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage,expected",
+    [
+        ("discovery", "discovery_provider_failure"),
+        ("confirmation", "confirmation_provider_failure"),
+    ],
+)
+async def test_operational_provider_failure_is_persisted_not_evaluated(stage, expected):
+    snapshots = (book("yes-1", "0.45"), book("no-1", "0.45"))
+    discovery = FailingBooks(RuntimeError("network")) if stage == "discovery" else Books(snapshots)
+    confirmation = (
+        Books(()) if stage == "discovery"
+        else FailingBooks(TimeoutError("timeout"))
+    )
+    subject, store, notice = engine(discovery, confirmation)
+    result = await subject.evaluate_binary(market())
+    assert result.reason == expected
+    assert result.stage == stage
+    assert store.items[0].data["producer"]["metadata"]["pipeline_stage"] == stage
+    assert store.items[0].data["economics"] == {
+        "status": "NOT_EVALUATED", "reason": expected,
+    }
+    expected_discovery = 0 if stage == "discovery" else 2
+    assert len(store.items[0].data["discovery_books"]) == expected_discovery
+    assert notice.calls == []
+
+
+@pytest.mark.asyncio
+async def test_confirmation_receipt_equality_and_exchange_regression_fail_closed():
+    discovery = (book("yes-1", "0.45"), book("no-1", "0.45"))
+    equal_new_objects = tuple(
+        BookSnapshot(item.book, item.market_id, False, None,
+                     item.received_at_ms, item.received_monotonic)
+        for item in discovery
+    )
+    subject, store, _ = engine(Books(discovery), Books(equal_new_objects))
+    result = await subject.evaluate_binary(market())
+    assert result.reason == "invalid_confirmation"
+    reasons = store.items[0].data["producer"]["metadata"]["temporal_reasons"]
+    assert any(reason.startswith("received_monotonic_not_newer") for reason in reasons)
+    assert any(reason.startswith("received_wall_not_newer") for reason in reasons)
+
+    regressed = list(copies(discovery))
+    old_book = regressed[0].book
+    regressed_book = OrderBook(
+        old_book.token_id, old_book.bids, old_book.asks, old_book.tick_size,
+        old_book.minimum_order_size, old_book.exchange_ts_ms - 1, "regressed-hash",
+    )
+    regressed[0] = BookSnapshot(
+        regressed_book, "market-1", False, None, 10_002, 10.001
+    )
+    subject2, store2, _ = engine(Books(discovery), Books(tuple(regressed)))
+    await subject2.evaluate_binary(market())
+    assert any(
+        reason.startswith("exchange_timestamp_regressed")
+        for reason in store2.items[0].data["producer"]["metadata"]["temporal_reasons"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_discovery_and_confirmation_stages_round_trip_replay(tmp_path):
     discovery = (book("yes-1", "0.45"), book("no-1", "0.45"))
-    confirmation = (book("yes-1", "0.60"), book("no-1", "0.45"))
+    confirmation = copies((book("yes-1", "0.60"), book("no-1", "0.45")))
     async with OpportunityStore(tmp_path / "engine.sqlite3") as real_store:
         subject, _, _ = engine(
             Books(discovery), Books(confirmation), store=real_store
         )
         result = await subject.evaluate_binary(market())
-        replayed = await real_store.replay(result.opportunity_id)
+        replayed = await real_store.replay(result.evidence_id)
     assert [row["snapshot"]["book_hash"] for row in replayed.data["discovery_books"]]
     assert [row["snapshot"]["book_hash"] for row in replayed.data["books"]]
     assert replayed.data["producer"]["metadata"]["pipeline_reason"] == "expired_before_confirmation"
@@ -237,12 +333,12 @@ async def test_full_depth_and_all_costs_can_reject_profitable_top_level():
         OrderBook("yes-1", yes_d.book.bids,
                   (BookLevel(Decimal("0.40"), Decimal("1")), BookLevel(Decimal("0.70"), Decimal("99"))),
                   Decimal("0.01"), Decimal("1"), 10_000, "yes-depth"),
-        "market-1", False, None, 10_001, 10.0)
+        "market-1", False, None, 10_002, 10.001)
     no = BookSnapshot(
         OrderBook("no-1", no_d.book.bids,
                   (BookLevel(Decimal("0.40"), Decimal("1")), BookLevel(Decimal("0.70"), Decimal("99"))),
                   Decimal("0.01"), Decimal("1"), 10_000, "no-depth"),
-        "market-1", False, None, 10_001, 10.0)
+        "market-1", False, None, 10_002, 10.001)
     subject, store, _ = engine(Books((yes_d, no_d)), Books((yes, no)), conversion_cost=Decimal("0.30"))
     result = await subject.evaluate_binary(market())
     assert result.status is OpportunityStatus.REJECTED
@@ -254,7 +350,7 @@ async def test_full_depth_and_all_costs_can_reject_profitable_top_level():
 async def test_exact_profitable_path_persists_before_notify_and_replays():
     snapshots = (book("yes-1", "0.45"), book("no-1", "0.45"))
     order = []
-    subject, store, notice = engine(Books(snapshots), Books(tuple(book(x.token_id, str(x.book.asks[0].price)) for x in snapshots)),
+    subject, store, notice = engine(Books(snapshots), Books(copies(tuple(book(x.token_id, str(x.book.asks[0].price)) for x in snapshots))),
                                     store=Store(order=order), notice=Notice(order=order))
     result = await subject.evaluate_binary(market())
     assert result.status is OpportunityStatus.SNAPSHOT_EXECUTABLE
@@ -265,6 +361,21 @@ async def test_exact_profitable_path_persists_before_notify_and_replays():
     assert {row["direction"] for row in evidence.data["fee_schedules"]} == {"BOTH"}
     assert evidence.data["economics"]["gross_investment"] + evidence.data["economics"]["fees"] == evidence.data["economics"]["total_costs"]
     assert evidence.canonical_json == type(evidence).from_mapping(evidence.data).canonical_json
+    actions = evidence.data["actions"]
+    buys = [row for row in actions if row["kind"] == "BUY"]
+    merge = [row for row in actions if row["kind"] == "MERGE"][0]
+    assert sum((row["amount"] for row in buys), Decimal("0")) == evidence.data["economics"]["gross_investment"]
+    assert merge["amount"] == merge["quantity"] == evidence.data["economics"]["gross_proceeds"]
+    assert merge["cash_flow"] == "INFLOW"
+    fee_total = sum(
+        (row["amount"] for row in evidence.data["economics"]["costs"]),
+        Decimal("0"),
+    )
+    investment = sum((row["amount"] for row in buys), Decimal("0")) + fee_total
+    profit = merge["amount"] - investment
+    assert investment == evidence.data["economics"]["total_costs"]
+    assert profit == evidence.data["economics"]["net_profit"]
+    assert profit / investment == evidence.data["economics"]["net_return"]
 
 
 @pytest.mark.asyncio
@@ -502,6 +613,76 @@ async def test_notifier_failure_retains_persisted_evidence():
     assert result.notified is False
     assert result.notification_failed is True
     assert len(store.items) == 1
+
+
+@pytest.mark.asyncio
+async def test_material_notification_dedupe_survives_restart_and_hash_change(tmp_path):
+    path = tmp_path / "dedupe.sqlite3"
+    snapshots = (book("yes-1", "0.45"), book("no-1", "0.45"))
+    notice = Notice()
+    async with OpportunityStore(path) as real_store:
+        first, _, _ = engine(
+            Books(snapshots), Books(copies(snapshots)),
+            store=real_store, notice=notice, run_id="run-1",
+        )
+        second, _, _ = engine(
+            Books(snapshots), Books(copies(snapshots)),
+            store=real_store, notice=notice, run_id="run-2",
+        )
+        assert (await first.evaluate_binary(market())).notified is True
+        assert (await second.evaluate_binary(market())).notified is False
+        assert len(await real_store.list_notification_attempts()) == 1
+
+    changed_book = book("yes-1", "0.45").book
+    changed = (
+        BookSnapshot(
+            OrderBook(
+                changed_book.token_id, changed_book.bids, changed_book.asks,
+                changed_book.tick_size, changed_book.minimum_order_size,
+                changed_book.exchange_ts_ms, "materially-new-hash",
+            ),
+            "market-1", False, None, 10_002, 10.001,
+        ),
+        copies((snapshots[1],))[0],
+    )
+    async with OpportunityStore(path) as reopened:
+        unchanged, _, _ = engine(
+            Books(snapshots), Books(copies(snapshots)),
+            store=reopened, notice=notice, run_id="run-3",
+        )
+        changed_engine, _, _ = engine(
+            Books(snapshots), Books(changed),
+            store=reopened, notice=notice, run_id="run-4",
+        )
+        assert (await unchanged.evaluate_binary(market())).notified is False
+        assert (await changed_engine.evaluate_binary(market())).notified is True
+        attempts = await reopened.list_notification_attempts()
+    assert [row[2] for row in attempts] == ["SUCCEEDED", "SUCCEEDED"]
+    assert len(notice.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_notification_attempt_is_durable_and_not_retried(tmp_path):
+    path = tmp_path / "failed-notice.sqlite3"
+    snapshots = (book("yes-1", "0.45"), book("no-1", "0.45"))
+    async with OpportunityStore(path) as store:
+        subject, _, _ = engine(
+            Books(snapshots), Books(copies(snapshots)), store=store,
+            notice=Notice(fail=True), run_id="failure-1",
+        )
+        result = await subject.evaluate_binary(market())
+        assert result.notification_failed is True
+    async with OpportunityStore(path) as reopened:
+        notice = Notice()
+        retry, _, _ = engine(
+            Books(snapshots), Books(copies(snapshots)), store=reopened,
+            notice=notice, run_id="failure-2",
+        )
+        assert (await retry.evaluate_binary(market())).notified is False
+        attempts = await reopened.list_notification_attempts()
+    assert len(attempts) == 1
+    assert attempts[0][2] == "FAILED"
+    assert notice.calls == []
 
 
 @pytest.mark.asyncio

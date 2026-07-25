@@ -599,7 +599,10 @@ def _validate_bundle_tail(
 
     for sequence, item in enumerate(_sequence("actions", raw["actions"])):
         action = _mapping("action", item)
-        _required(action, "id", "kind", "sequence", "quantity", "amount")
+        _required(
+            action, "id", "kind", "sequence", "quantity", "amount",
+            "asset_in", "asset_out", "cash_flow",
+        )
         if action["kind"] not in {
             "BUY", "SELL", "SPLIT", "MERGE", "NEG_RISK_CONVERT", "REDEEM",
         }:
@@ -611,6 +614,26 @@ def _validate_bundle_tail(
                 raise ValueError("action references an unknown token")
         _nonnegative_decimal("action.quantity", action["quantity"])
         _nonnegative_decimal("action.amount", action["amount"])
+        if any(
+            type(action[name]) is not str or not action[name]
+            for name in ("asset_in", "asset_out")
+        ):
+            raise ValueError("action asset semantics must be nonempty")
+        if action["cash_flow"] not in {"OUTFLOW", "INFLOW", "NONE"}:
+            raise ValueError("invalid action cash_flow")
+
+    if economics["status"] == "EVALUATED":
+        merges = [
+            action for action in raw["actions"] if action["kind"] == "MERGE"
+        ]
+        buys = [action for action in raw["actions"] if action["kind"] == "BUY"]
+        if merges:
+            if len(merges) != 1 or len(buys) != 2:
+                raise ValueError("binary merge evidence requires two buys and one merge")
+            if merges[0]["amount"] != economics["gross_proceeds"]:
+                raise ValueError("merge amount must equal converted proceeds")
+            if sum((action["amount"] for action in buys), Decimal("0")) != economics["gross_investment"]:
+                raise ValueError("buy action amounts must equal gross investment")
 
     risk = _mapping("risk", raw["risk"])
     _required(
@@ -958,6 +981,20 @@ CREATE TABLE IF NOT EXISTS notifications (
     status TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (bundle_id, id),
     FOREIGN KEY (bundle_id, opportunity_id) REFERENCES opportunities(bundle_id, id)
 );
+CREATE TABLE IF NOT EXISTS notification_claims (
+    fingerprint TEXT PRIMARY KEY,
+    bundle_id TEXT NOT NULL REFERENCES evidence_bundles(id),
+    state TEXT NOT NULL CHECK(state IN ('CLAIMED', 'SUCCEEDED', 'FAILED')),
+    claimed_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notification_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL REFERENCES notification_claims(fingerprint),
+    bundle_id TEXT NOT NULL REFERENCES evidence_bundles(id),
+    status TEXT NOT NULL CHECK(status IN ('SUCCEEDED', 'FAILED')),
+    attempted_at_ms INTEGER NOT NULL,
+    error TEXT
+);
 """
 
 
@@ -1000,6 +1037,10 @@ class OpportunityStore:
             await connection.execute("PRAGMA journal_mode = WAL")
             version_rows = await connection.execute_fetchall("PRAGMA user_version")
             existing_version = int(version_rows[0][0])
+            if existing_version == 1:
+                raise RuntimeError(
+                    "database schema 1 is incompatible and has no supported migration"
+                )
             if existing_version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"database schema {existing_version} is newer than supported "
@@ -1061,6 +1102,88 @@ class OpportunityStore:
             except BaseException:
                 await connection.rollback()
                 raise
+
+    async def claim_notification(
+        self, fingerprint: str, bundle_id: str, claimed_at_ms: int
+    ) -> bool:
+        _identifier("notification fingerprint", fingerprint)
+        _identifier("bundle_id", bundle_id)
+        _integer("claimed_at_ms", claimed_at_ms)
+        async with self._write_lock:
+            connection = self._require_connection()
+            await connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await connection.execute(
+                    """INSERT OR IGNORE INTO notification_claims
+                       (fingerprint, bundle_id, state, claimed_at_ms)
+                       VALUES (?, ?, 'CLAIMED', ?)""",
+                    (fingerprint, bundle_id, claimed_at_ms),
+                )
+                claimed = cursor.rowcount == 1
+                await connection.commit()
+                return claimed
+            except BaseException:
+                await connection.rollback()
+                raise
+
+    async def record_notification_attempt(
+        self, fingerprint: str, bundle_id: str, status: str,
+        attempted_at_ms: int, error: str | None,
+    ) -> None:
+        _identifier("notification fingerprint", fingerprint)
+        _identifier("bundle_id", bundle_id)
+        if status not in {"SUCCEEDED", "FAILED"}:
+            raise ValueError("invalid notification attempt status")
+        _integer("attempted_at_ms", attempted_at_ms)
+        if error is not None and type(error) is not str:
+            raise TypeError("error must be str or None")
+        async with self._write_lock:
+            connection = self._require_connection()
+            await connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = await connection.execute_fetchall(
+                    """SELECT state, bundle_id FROM notification_claims
+                       WHERE fingerprint = ?""",
+                    (fingerprint,),
+                )
+                if not rows or rows[0][0] != "CLAIMED" or rows[0][1] != bundle_id:
+                    raise ValueError("notification claim is missing or already finalized")
+                await connection.execute(
+                    """INSERT INTO notification_attempts
+                       (fingerprint, bundle_id, status, attempted_at_ms, error)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (fingerprint, bundle_id, status, attempted_at_ms, error),
+                )
+                await connection.execute(
+                    "UPDATE notification_claims SET state = ? WHERE fingerprint = ?",
+                    (status, fingerprint),
+                )
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
+
+    async def list_notification_attempts(
+        self, fingerprint: str | None = None
+    ) -> list[tuple[str, str, str, int, str | None]]:
+        connection = self._require_connection()
+        if fingerprint is None:
+            rows = await connection.execute_fetchall(
+                """SELECT fingerprint, bundle_id, status, attempted_at_ms, error
+                   FROM notification_attempts ORDER BY id"""
+            )
+        else:
+            _identifier("notification fingerprint", fingerprint)
+            rows = await connection.execute_fetchall(
+                """SELECT fingerprint, bundle_id, status, attempted_at_ms, error
+                   FROM notification_attempts WHERE fingerprint = ? ORDER BY id""",
+                (fingerprint,),
+            )
+        return [
+            (str(row[0]), str(row[1]), str(row[2]), int(row[3]),
+             None if row[4] is None else str(row[4]))
+            for row in rows
+        ]
 
     async def _insert_bundle(self, data: dict[str, Any], canonical: str) -> None:
         connection = self._require_connection()

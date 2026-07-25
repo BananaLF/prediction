@@ -6,6 +6,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_CEILING
 import math
+import hashlib
+import json
+from types import MappingProxyType
 from typing import Callable, Protocol
 
 from predmarket.actions import ActionKind, binary_underpriced_path
@@ -42,6 +45,13 @@ class FeeProvider(Protocol):
 
 class EvidenceSaver(Protocol):
     async def save(self, bundle: EvidenceBundle) -> bool: ...
+    async def claim_notification(
+        self, fingerprint: str, bundle_id: str, claimed_at_ms: int
+    ) -> bool: ...
+    async def record_notification_attempt(
+        self, fingerprint: str, bundle_id: str, status: str,
+        attempted_at_ms: int, error: str | None,
+    ) -> None: ...
 
 
 class Notifier(Protocol):
@@ -115,7 +125,7 @@ class FeeConfirmation:
             raise ValueError("schedules must cover token_ids exactly")
         if any(not isinstance(value, FeeSchedule) for value in copied.values()):
             raise TypeError("schedules must contain FeeSchedule values")
-        object.__setattr__(self, "schedules", copied)
+        object.__setattr__(self, "schedules", MappingProxyType(copied))
         if type(self.authoritative) is not bool:
             raise TypeError("authoritative must be bool")
         if type(self.source) is not str or not self.source:
@@ -139,7 +149,10 @@ class EngineDependencies:
     def __post_init__(self) -> None:
         for name, method in (
             ("discovery", "books"), ("confirmation", "books"),
-            ("fees", "confirm"), ("store", "save"), ("notifier", "notify"),
+            ("fees", "confirm"), ("store", "save"),
+            ("store", "claim_notification"),
+            ("store", "record_notification_attempt"),
+            ("notifier", "notify"),
         ):
             if not callable(getattr(getattr(self, name), method, None)):
                 raise TypeError(f"{name} must provide {method}()")
@@ -159,6 +172,7 @@ class EngineDependencies:
 @dataclass(frozen=True)
 class EngineResult:
     opportunity_id: str
+    evidence_id: str
     status: OpportunityStatus
     reason: str
     stage: str
@@ -174,6 +188,7 @@ class EngineResult:
 
     def __post_init__(self) -> None:
         _identifier("opportunity_id", self.opportunity_id)
+        _identifier("evidence_id", self.evidence_id)
         if not isinstance(self.status, OpportunityStatus):
             raise TypeError("status must be OpportunityStatus")
         for name in ("reason", "stage"):
@@ -320,7 +335,9 @@ class StructuralArbitrageEngine:
         now_ms, evaluated_mono = _clock(self._d)
         opportunity_id = _identifier("opportunity_id", self._d.opportunity_id_factory(market))
         run_id = _identifier("run_id", self._d.run_id_factory())
+        evidence_id = _identifier("evidence_id", f"{opportunity_id}:{run_id}")
         base_reason = self._catalog_reason(market)
+        base_stage = "catalog"
         discovery: dict[str, BookSnapshot] = {}
         confirmed: dict[str, BookSnapshot] = {}
         fee_confirmation: FeeConfirmation | None = None
@@ -332,17 +349,22 @@ class StructuralArbitrageEngine:
         unhedged = ZERO
         entry_costs: dict[str, Decimal] = {}
         unwind_values: dict[str, Decimal] = {}
+        temporal_reasons: tuple[str, ...] = ()
 
         if base_reason is None:
             try:
                 discovery = _snapshots(await self._d.discovery.books(market.token_ids), market)
             except (TypeError, ValueError):
                 base_reason = "invalid_discovery"
+                base_stage = "discovery"
+            except Exception:
+                base_reason = "discovery_provider_failure"
+                base_stage = "discovery"
         candidate = base_reason is None and _candidate(discovery, market, self._d.settings)
         if base_reason is None and not candidate:
             status, reason, stage = OpportunityStatus.REJECTED, "no_candidate", "discovery"
         elif base_reason is not None:
-            status, reason, stage = OpportunityStatus.REJECTED, base_reason, "catalog"
+            status, reason, stage = OpportunityStatus.REJECTED, base_reason, base_stage
         else:
             try:
                 confirmed = _snapshots(
@@ -350,8 +372,26 @@ class StructuralArbitrageEngine:
                 )
                 if any(confirmed[token] is discovery[token] for token in market.token_ids):
                     raise ValueError("confirmation reused discovery objects")
+                temporal = []
+                for token in market.token_ids:
+                    earlier, later = discovery[token], confirmed[token]
+                    if later.received_monotonic <= earlier.received_monotonic:
+                        temporal.append(f"received_monotonic_not_newer:{token}")
+                    if later.received_at_ms <= earlier.received_at_ms:
+                        temporal.append(f"received_wall_not_newer:{token}")
+                    if later.book.exchange_ts_ms < earlier.book.exchange_ts_ms:
+                        temporal.append(f"exchange_timestamp_regressed:{token}")
+                temporal_reasons = tuple(temporal)
+                if temporal_reasons:
+                    raise ValueError("confirmation is not temporally independent")
             except (TypeError, ValueError):
                 status, reason, stage = OpportunityStatus.REJECTED, "invalid_confirmation", "confirmation"
+            except Exception:
+                status, reason, stage = (
+                    OpportunityStatus.REJECTED,
+                    "confirmation_provider_failure",
+                    "confirmation",
+                )
             else:
                 if not _candidate(confirmed, market, self._d.settings):
                     status, reason, stage = OpportunityStatus.REJECTED, "expired_before_confirmation", "confirmation"
@@ -448,15 +488,16 @@ class StructuralArbitrageEngine:
         )
         bundle = self._bundle(
             market, opportunity_id, run_id, now_ms, evaluated_mono,
-            status, reason, candidate, discovery, confirmed, fee_confirmation,
+            status, reason, stage, candidate, discovery, confirmed, fee_confirmation,
             economics, risk_reasons, assessment_reasons, timing_reasons, partial_loss,
-            unhedged, entry_costs, unwind_values,
+            unhedged, entry_costs, unwind_values, evidence_id, temporal_reasons,
         )
         newly_persisted = await self._d.store.save(bundle)
         if type(newly_persisted) is not bool:
             raise TypeError("store.save() must return bool")
         result = EngineResult(
-            opportunity_id, status, reason, stage, False, False, newly_persisted,
+            opportunity_id, evidence_id, status, reason, stage,
+            False, False, newly_persisted,
             economics.quantity if economics else None,
             economics.total if economics else None,
             economics.proceeds if economics else None,
@@ -465,12 +506,63 @@ class StructuralArbitrageEngine:
             tuple(risk_reasons),
         )
         if status is OpportunityStatus.SNAPSHOT_EXECUTABLE and newly_persisted:
+            assert economics is not None and fee_confirmation is not None
+            fingerprint = self._notification_fingerprint(
+                market, economics, confirmed, fee_confirmation
+            )
+            claimed = await self._d.store.claim_notification(
+                fingerprint, evidence_id, now_ms
+            )
+            if type(claimed) is not bool:
+                raise TypeError("store.claim_notification() must return bool")
+            if not claimed:
+                return result
             try:
                 await self._d.notifier.notify(result)
-            except Exception:
+            except Exception as exc:
+                await self._d.store.record_notification_attempt(
+                    fingerprint, evidence_id, "FAILED", now_ms,
+                    f"{type(exc).__name__}: {exc}",
+                )
                 return EngineResult(**{**result.__dict__, "notification_failed": True})
+            await self._d.store.record_notification_attempt(
+                fingerprint, evidence_id, "SUCCEEDED", now_ms, None
+            )
             return EngineResult(**{**result.__dict__, "notified": True})
         return result
+
+    @staticmethod
+    def _notification_fingerprint(
+        market: BinaryMarket,
+        economics: _Economics,
+        confirmed: Mapping[str, BookSnapshot],
+        fees: FeeConfirmation,
+    ) -> str:
+        material = {
+            "condition_id": market.condition_id,
+            "path": "binary_underpriced",
+            "quantity": format(economics.quantity, "f"),
+            "net_return": format(economics.rate, "f"),
+            "books": [
+                [token, confirmed[token].book.book_hash]
+                for token in market.token_ids
+            ],
+            "fees": [
+                [
+                    token,
+                    format(fees.schedules[token].rate, "f"),
+                    fees.schedules[token].exponent,
+                    fees.schedules[token].taker_only,
+                    fees.schedules[token].captured_at_ms,
+                    fees.source,
+                ]
+                for token in market.token_ids
+            ],
+        }
+        encoded = json.dumps(
+            material, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        return f"nf:{hashlib.sha256(encoded).hexdigest()}"
 
     @staticmethod
     def _catalog_reason(market: BinaryMarket) -> str | None:
@@ -498,13 +590,16 @@ class StructuralArbitrageEngine:
     def _bundle(
         self, market: BinaryMarket, opportunity_id: str, run_id: str,
         now_ms: int, evaluated_mono: float, status: OpportunityStatus,
-        reason: str, candidate: bool, discovery: Mapping[str, BookSnapshot],
+        reason: str, stage: str, candidate: bool,
+        discovery: Mapping[str, BookSnapshot],
         confirmed: Mapping[str, BookSnapshot],
         fees: FeeConfirmation | None, economics: _Economics | None,
         risk_reasons: tuple[str, ...], assessment_reasons: tuple[str, ...],
         timing_reasons: tuple[str, ...], partial_loss: Decimal, unhedged: Decimal,
         entry_costs: Mapping[str, Decimal],
         unwind_values: Mapping[str, Decimal],
+        evidence_id: str,
+        temporal_reasons: tuple[str, ...],
     ) -> EvidenceBundle:
         econ = economics
         gross, proceeds, costs = (econ.gross, econ.proceeds, econ.fees) if econ else (None, None, None)
@@ -574,7 +669,10 @@ class StructuralArbitrageEngine:
             {"id": f"action-{index}", "kind": kind, "sequence": index,
              **({"token_id": token} if token else {}),
              "quantity": econ.quantity,
-             "amount": econ.gross_notionals[token] if token else self._d.settings.conversion_cost}
+             "amount": econ.gross_notionals[token] if token else econ.quantity,
+             "asset_in": "pUSD" if token else "YES+NO",
+             "asset_out": token if token else "pUSD",
+             "cash_flow": "OUTFLOW" if token else "INFLOW"}
             for index, (kind, token) in enumerate((
                 (ActionKind.BUY.value, market.yes_token_id),
                 (ActionKind.BUY.value, market.no_token_id),
@@ -603,13 +701,15 @@ class StructuralArbitrageEngine:
         review = relation.semantic_review
         state_ids = tuple(f"state-{index}" for index in range(len(relation.states)))
         value = {
-            "version": 2, "id": opportunity_id,
+            "version": 2, "id": evidence_id,
             "producer": {"engine": "predmarket", "version": self._d.engine_version,
                          "metadata": {"strategy": "binary_underpriced",
                                       "pipeline_reason": reason,
+                                      "pipeline_stage": stage,
                                       "discovery": {"candidate": candidate,
                                                     "book_hashes": [discovery[x].book.book_hash for x in market.token_ids if x in discovery]},
-                                      "confirmation": {"book_hashes": [confirmed[x].book.book_hash for x in market.token_ids if x in confirmed]}}},
+                                      "confirmation": {"book_hashes": [confirmed[x].book.book_hash for x in market.token_ids if x in confirmed]},
+                                      "temporal_reasons": list(temporal_reasons)}},
             "evaluation": {"evaluated_at_ms": now_ms,
                            "evaluated_monotonic": Decimal(str(evaluated_mono)),
                            "maximum_book_age_ms": self._d.settings.maximum_book_age_ms,
