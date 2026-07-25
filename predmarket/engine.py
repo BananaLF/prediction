@@ -46,7 +46,8 @@ class FeeProvider(Protocol):
 class EvidenceSaver(Protocol):
     async def save(self, bundle: EvidenceBundle) -> bool: ...
     async def claim_notification(
-        self, fingerprint: str, bundle_id: str, claimed_at_ms: int
+        self, fingerprint: str, bundle_id: str, claimed_at_ms: int,
+        lease_expires_at_ms: int,
     ) -> bool: ...
     async def record_notification_attempt(
         self, fingerprint: str, bundle_id: str, status: str,
@@ -145,6 +146,7 @@ class EngineDependencies:
     opportunity_id_factory: Callable[[BinaryMarket], str]
     run_id_factory: Callable[[], str]
     engine_version: str
+    notification_lease_ms: int = 30_000
 
     def __post_init__(self) -> None:
         for name, method in (
@@ -167,6 +169,11 @@ class EngineDependencies:
                 raise TypeError(f"{name} must be callable")
         if type(self.engine_version) is not str or not self.engine_version:
             raise ValueError("engine_version must be nonempty")
+        if (
+            type(self.notification_lease_ms) is not int
+            or self.notification_lease_ms <= 0
+        ):
+            raise ValueError("notification_lease_ms must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -178,7 +185,10 @@ class EngineResult:
     stage: str
     notified: bool
     notification_failed: bool
+    notification_audit_failed: bool
+    delivery_uncertain: bool
     newly_persisted: bool
+    notification_fingerprint: str | None
     quantity: Decimal | None
     total_investment: Decimal | None
     minimum_proceeds: Decimal | None
@@ -194,7 +204,10 @@ class EngineResult:
         for name in ("reason", "stage"):
             if type(getattr(self, name)) is not str or not getattr(self, name):
                 raise ValueError(f"{name} must be nonempty")
-        for name in ("notified", "notification_failed", "newly_persisted"):
+        for name in (
+            "notified", "notification_failed", "notification_audit_failed",
+            "delivery_uncertain", "newly_persisted",
+        ):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be bool")
         for name in (
@@ -206,6 +219,11 @@ class EngineResult:
                 raise TypeError(f"{name} must be Decimal or None")
         if type(self.risk_reasons) is not tuple:
             raise TypeError("risk_reasons must be tuple")
+        if (
+            self.notification_fingerprint is not None
+            and type(self.notification_fingerprint) is not str
+        ):
+            raise TypeError("notification_fingerprint must be str or None")
 
 
 @dataclass(frozen=True)
@@ -497,7 +515,7 @@ class StructuralArbitrageEngine:
             raise TypeError("store.save() must return bool")
         result = EngineResult(
             opportunity_id, evidence_id, status, reason, stage,
-            False, False, newly_persisted,
+            False, False, False, False, newly_persisted, None,
             economics.quantity if economics else None,
             economics.total if economics else None,
             economics.proceeds if economics else None,
@@ -508,27 +526,51 @@ class StructuralArbitrageEngine:
         if status is OpportunityStatus.SNAPSHOT_EXECUTABLE and newly_persisted:
             assert economics is not None and fee_confirmation is not None
             fingerprint = self._notification_fingerprint(
-                market, economics, confirmed, fee_confirmation
+                market, economics, confirmed
             )
             claimed = await self._d.store.claim_notification(
-                fingerprint, evidence_id, now_ms
+                fingerprint, evidence_id, now_ms,
+                now_ms + self._d.notification_lease_ms,
             )
             if type(claimed) is not bool:
                 raise TypeError("store.claim_notification() must return bool")
             if not claimed:
                 return result
-            try:
-                await self._d.notifier.notify(result)
-            except Exception as exc:
-                await self._d.store.record_notification_attempt(
-                    fingerprint, evidence_id, "FAILED", now_ms,
-                    f"{type(exc).__name__}: {exc}",
-                )
-                return EngineResult(**{**result.__dict__, "notification_failed": True})
-            await self._d.store.record_notification_attempt(
-                fingerprint, evidence_id, "SUCCEEDED", now_ms, None
+            delivery_result = EngineResult(
+                **{**result.__dict__, "notification_fingerprint": fingerprint}
             )
-            return EngineResult(**{**result.__dict__, "notified": True})
+            try:
+                await self._d.notifier.notify(delivery_result)
+            except Exception as exc:
+                try:
+                    await self._d.store.record_notification_attempt(
+                        fingerprint, evidence_id, "FAILED", now_ms,
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                except Exception:
+                    return EngineResult(**{
+                        **delivery_result.__dict__,
+                        "notification_failed": True,
+                        "notification_audit_failed": True,
+                        "delivery_uncertain": True,
+                    })
+                return EngineResult(**{
+                    **delivery_result.__dict__, "notification_failed": True
+                })
+            try:
+                await self._d.store.record_notification_attempt(
+                    fingerprint, evidence_id, "SUCCEEDED", now_ms, None
+                )
+            except Exception:
+                return EngineResult(**{
+                    **delivery_result.__dict__,
+                    "notified": True,
+                    "notification_audit_failed": True,
+                    "delivery_uncertain": True,
+                })
+            return EngineResult(**{
+                **delivery_result.__dict__, "notified": True
+            })
         return result
 
     @staticmethod
@@ -536,7 +578,6 @@ class StructuralArbitrageEngine:
         market: BinaryMarket,
         economics: _Economics,
         confirmed: Mapping[str, BookSnapshot],
-        fees: FeeConfirmation,
     ) -> str:
         material = {
             "condition_id": market.condition_id,
@@ -545,17 +586,6 @@ class StructuralArbitrageEngine:
             "net_return": format(economics.rate, "f"),
             "books": [
                 [token, confirmed[token].book.book_hash]
-                for token in market.token_ids
-            ],
-            "fees": [
-                [
-                    token,
-                    format(fees.schedules[token].rate, "f"),
-                    fees.schedules[token].exponent,
-                    fees.schedules[token].taker_only,
-                    fees.schedules[token].captured_at_ms,
-                    fees.source,
-                ]
                 for token in market.token_ids
             ],
         }

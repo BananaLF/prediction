@@ -94,7 +94,16 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
                 "direction": "BUY",
                 "retrieved_at_ms": 995,
                 "source": "CLOB",
-            }
+            },
+            {
+                "id": "fee-no",
+                "token_id": "no-1",
+                "rate": Decimal("0"),
+                "exponent": Decimal("2"),
+                "direction": "BOTH",
+                "retrieved_at_ms": 995,
+                "source": "CLOB",
+            },
         ],
         "relation": {
             "set": {
@@ -141,7 +150,31 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
                         "position": 0,
                     }
                 ],
-            }
+            },
+            {
+                "epoch": {
+                    "id": "epoch-no",
+                    "token_id": "no-1",
+                    "state": "LIVE",
+                    "started_at_ms": 900,
+                },
+                "snapshot": {
+                    "id": "snap-no",
+                    "exchange_ts_ms": 990,
+                    "received_ts_ms": 992,
+                    "received_monotonic": Decimal("1.25"),
+                    "tick_size": Decimal("0.01"),
+                    "book_hash": "hash-no",
+                },
+                "levels": [
+                    {
+                        "side": "SELL",
+                        "price": Decimal("0.349"),
+                        "size": Decimal("20"),
+                        "position": 0,
+                    }
+                ],
+            },
         ],
         "legs": [
             {
@@ -150,7 +183,14 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
                 "side": "BUY",
                 "quantity": Decimal("10"),
                 "notional": Decimal("4.5"),
-            }
+            },
+            {
+                "id": "leg-2",
+                "token_id": "no-1",
+                "side": "BUY",
+                "quantity": Decimal("10"),
+                "notional": Decimal("3.49"),
+            },
         ],
         "actions": [
             {
@@ -163,7 +203,28 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
                 "asset_in": "pUSD",
                 "asset_out": "yes-1",
                 "cash_flow": "OUTFLOW",
-            }
+            },
+            {
+                "id": "action-2",
+                "kind": "BUY",
+                "sequence": 1,
+                "token_id": "no-1",
+                "quantity": Decimal("10"),
+                "amount": Decimal("3.49"),
+                "asset_in": "pUSD",
+                "asset_out": "no-1",
+                "cash_flow": "OUTFLOW",
+            },
+            {
+                "id": "action-3",
+                "kind": "MERGE",
+                "sequence": 2,
+                "quantity": Decimal("10"),
+                "amount": Decimal("10"),
+                "asset_in": "YES+NO",
+                "asset_out": "pUSD",
+                "cash_flow": "INFLOW",
+            },
         ],
         "risk": {
             "status": "SNAPSHOT_EXECUTABLE",
@@ -172,8 +233,14 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
             "timing_reasons": [],
             "worst_leg_failure_loss": Decimal("1.25"),
             "max_unhedged_notional": Decimal("4.5"),
-            "entry_costs": {"yes-1": Decimal("4.5")},
-            "immediate_unwind_values": {"yes-1": Decimal("3.25")},
+            "entry_costs": {
+                "yes-1": Decimal("4.5"),
+                "no-1": Decimal("3.5"),
+            },
+            "immediate_unwind_values": {
+                "yes-1": Decimal("3.25"),
+                "no-1": Decimal("3.0"),
+            },
             "thresholds": {
                 "minimum_return": Decimal("0.0075"),
                 "max_leg_failure_loss": Decimal("5"),
@@ -357,10 +424,50 @@ async def test_notification_fingerprint_claim_is_atomic_under_concurrency():
         await store.save(EvidenceBundle.from_mapping(first))
         await store.save(EvidenceBundle.from_mapping(second))
         results = await asyncio.gather(
-            store.claim_notification("nf:atomic", "bundle-a", 1000),
-            store.claim_notification("nf:atomic", "bundle-b", 1001),
+            store.claim_notification("nf:atomic", "bundle-a", 1000, 2000),
+            store.claim_notification("nf:atomic", "bundle-b", 1001, 2001),
         )
     assert sorted(results) == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_stranded_notification_claim_reclaims_after_lease_and_replays_audit(
+    tmp_path,
+):
+    path = tmp_path / "leased.sqlite3"
+    first = bundle("bundle-lease-a", "opp-lease-a")
+    first["run"]["id"] = "run-lease-a"
+    second = bundle("bundle-lease-b", "opp-lease-b")
+    second["run"]["id"] = "run-lease-b"
+    async with OpportunityStore(path) as store:
+        await store.save(EvidenceBundle.from_mapping(first))
+        await store.save(EvidenceBundle.from_mapping(second))
+        assert await store.claim_notification(
+            "nf:leased", "bundle-lease-a", 1000, 1100
+        )
+        assert not await store.claim_notification(
+            "nf:leased", "bundle-lease-b", 1099, 1199
+        )
+    async with OpportunityStore(path) as reopened:
+        assert await reopened.claim_notification(
+            "nf:leased", "bundle-lease-b", 1100, 1200
+        )
+        claimed = await reopened.replay_with_notification_audit("bundle-lease-b")
+        assert claimed.claim_states[0][1:] == ("CLAIMED", 1100, 1200, 2)
+        assert [event[1] for event in claimed.events] == ["RECLAIMED"]
+        await reopened.record_notification_attempt(
+            "nf:leased", "bundle-lease-b", "SUCCEEDED", 1110, None
+        )
+    async with OpportunityStore(path) as final_store:
+        replay = await final_store.replay_with_notification_audit("bundle-lease-b")
+        assert replay.evidence.canonical_json == EvidenceBundle.from_mapping(
+            second
+        ).canonical_json
+        assert replay.claim_states[0][1] == "SUCCEEDED"
+        assert [event[1] for event in replay.events] == [
+            "RECLAIMED", "SUCCEEDED"
+        ]
+        assert replay.attempts[0][1] == "SUCCEEDED"
 
 
 @pytest.mark.parametrize(
@@ -591,10 +698,41 @@ def test_nonterminating_simulation_return_is_valid_storage_economics():
         costs=[],
     )
     value["risk"]["inputs"]["mathematical_return"] = result.minimum_return
+    value["actions"][1]["amount"] = Decimal("4.8")
+    value["legs"][1]["notional"] = Decimal("4.8")
     evidence = EvidenceBundle.from_mapping(value)
     assert evidence.data["opportunity"]["net_return"] == result.minimum_return
 
     value["economics"]["net_return"] += Decimal("0.0000000000000000000000000001")
     value["opportunity"]["net_return"] = value["economics"]["net_return"]
     with pytest.raises(ValueError, match="net return"):
+        EvidenceBundle.from_mapping(value)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["actions"].pop(),
+        lambda value: value["actions"].append(
+            dict(value["actions"][-1], id="extra", sequence=3)
+        ),
+        lambda value: value["actions"].reverse(),
+        lambda value: value["actions"][0].__setitem__("token_id", "no-1"),
+        lambda value: value["actions"][1].__setitem__(
+            "quantity", Decimal("9")
+        ),
+        lambda value: value["actions"][2].__setitem__(
+            "amount", Decimal("0.01")
+        ),
+        lambda value: value["actions"][2].__setitem__("asset_in", "pUSD"),
+        lambda value: value["actions"][2].__setitem__("asset_out", "NO"),
+        lambda value: value["actions"][2].__setitem__(
+            "cash_flow", "OUTFLOW"
+        ),
+    ],
+)
+def test_executable_binary_action_sequence_is_exact(mutate):
+    value = bundle()
+    mutate(value)
+    with pytest.raises(ValueError):
         EvidenceBundle.from_mapping(value)

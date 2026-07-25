@@ -634,6 +634,46 @@ def _validate_bundle_tail(
                 raise ValueError("merge amount must equal converted proceeds")
             if sum((action["amount"] for action in buys), Decimal("0")) != economics["gross_investment"]:
                 raise ValueError("buy action amounts must equal gross investment")
+    if opportunity["status"] == "SNAPSHOT_EXECUTABLE":
+        actions = list(raw["actions"])
+        outcomes = {
+            token["outcome"]: token["id"] for token in raw["tokens"]
+        }
+        expected_tokens = (outcomes.get("YES"), outcomes.get("NO"))
+        legs_by_token = {
+            leg["token_id"]: leg for leg in raw["legs"]
+        }
+        if (
+            len(actions) != 3
+            or tuple(action["kind"] for action in actions)
+            != ("BUY", "BUY", "MERGE")
+            or tuple(action.get("token_id") for action in actions[:2])
+            != expected_tokens
+            or any(
+                action["quantity"] != opportunity["quantity"]
+                for action in actions
+            )
+            or actions[0]["asset_in"] != "pUSD"
+            or actions[1]["asset_in"] != "pUSD"
+            or tuple(action["asset_out"] for action in actions[:2])
+            != expected_tokens
+            or any(action["cash_flow"] != "OUTFLOW" for action in actions[:2])
+            or actions[2]["asset_in"] != "YES+NO"
+            or actions[2]["asset_out"] != "pUSD"
+            or actions[2]["cash_flow"] != "INFLOW"
+            or set(legs_by_token) != set(expected_tokens)
+            or any(
+                legs_by_token[token]["side"] != "BUY"
+                or legs_by_token[token]["quantity"] != opportunity["quantity"]
+                for token in expected_tokens
+            )
+            or sum(
+                (legs_by_token[token]["notional"] for token in expected_tokens),
+                Decimal("0"),
+            )
+            != economics["gross_investment"]
+        ):
+            raise ValueError("executable actions must be BUY YES, BUY NO, MERGE")
 
     risk = _mapping("risk", raw["risk"])
     _required(
@@ -877,6 +917,16 @@ class EvidenceBundle:
         return self.data["id"]
 
 
+@dataclass(frozen=True)
+class NotificationAuditReplay:
+    """Immutable core evaluation plus append-only leased-outbox audit."""
+
+    evidence: EvidenceBundle
+    claim_states: tuple[tuple[str, str, int, int, int], ...]
+    attempts: tuple[tuple[str, str, int, str | None], ...]
+    events: tuple[tuple[str, str, int, str | None], ...]
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -985,7 +1035,9 @@ CREATE TABLE IF NOT EXISTS notification_claims (
     fingerprint TEXT PRIMARY KEY,
     bundle_id TEXT NOT NULL REFERENCES evidence_bundles(id),
     state TEXT NOT NULL CHECK(state IN ('CLAIMED', 'SUCCEEDED', 'FAILED')),
-    claimed_at_ms INTEGER NOT NULL
+    claimed_at_ms INTEGER NOT NULL,
+    lease_expires_at_ms INTEGER NOT NULL,
+    attempt_count INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS notification_attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -994,6 +1046,14 @@ CREATE TABLE IF NOT EXISTS notification_attempts (
     status TEXT NOT NULL CHECK(status IN ('SUCCEEDED', 'FAILED')),
     attempted_at_ms INTEGER NOT NULL,
     error TEXT
+);
+CREATE TABLE IF NOT EXISTS notification_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL REFERENCES notification_claims(fingerprint),
+    bundle_id TEXT NOT NULL REFERENCES evidence_bundles(id),
+    event TEXT NOT NULL CHECK(event IN ('CLAIMED', 'RECLAIMED', 'SUCCEEDED', 'FAILED')),
+    occurred_at_ms INTEGER NOT NULL,
+    detail TEXT
 );
 """
 
@@ -1104,22 +1164,64 @@ class OpportunityStore:
                 raise
 
     async def claim_notification(
-        self, fingerprint: str, bundle_id: str, claimed_at_ms: int
+        self, fingerprint: str, bundle_id: str, claimed_at_ms: int,
+        lease_expires_at_ms: int,
     ) -> bool:
+        """Claim a leased outbox item.
+
+        This provides at-least-once delivery: an expired CLAIMED row is
+        reclaimable after restart. SUCCEEDED and FAILED are terminal; FAILED
+        is intentionally not retried to avoid repeated desktop alerts.
+        """
         _identifier("notification fingerprint", fingerprint)
         _identifier("bundle_id", bundle_id)
         _integer("claimed_at_ms", claimed_at_ms)
+        _integer("lease_expires_at_ms", lease_expires_at_ms)
+        if lease_expires_at_ms <= claimed_at_ms:
+            raise ValueError("notification lease must expire after claim time")
         async with self._write_lock:
             connection = self._require_connection()
             await connection.execute("BEGIN IMMEDIATE")
             try:
-                cursor = await connection.execute(
-                    """INSERT OR IGNORE INTO notification_claims
-                       (fingerprint, bundle_id, state, claimed_at_ms)
-                       VALUES (?, ?, 'CLAIMED', ?)""",
-                    (fingerprint, bundle_id, claimed_at_ms),
+                rows = await connection.execute_fetchall(
+                    """SELECT state, lease_expires_at_ms, attempt_count
+                       FROM notification_claims WHERE fingerprint = ?""",
+                    (fingerprint,),
                 )
-                claimed = cursor.rowcount == 1
+                event = None
+                if not rows:
+                    await connection.execute(
+                        """INSERT INTO notification_claims
+                           (fingerprint, bundle_id, state, claimed_at_ms,
+                            lease_expires_at_ms, attempt_count)
+                           VALUES (?, ?, 'CLAIMED', ?, ?, 1)""",
+                        (
+                            fingerprint, bundle_id, claimed_at_ms,
+                            lease_expires_at_ms,
+                        ),
+                    )
+                    claimed, event = True, "CLAIMED"
+                elif rows[0][0] == "CLAIMED" and claimed_at_ms >= rows[0][1]:
+                    await connection.execute(
+                        """UPDATE notification_claims
+                           SET bundle_id = ?, claimed_at_ms = ?,
+                               lease_expires_at_ms = ?, attempt_count = ?
+                           WHERE fingerprint = ?""",
+                        (
+                            bundle_id, claimed_at_ms, lease_expires_at_ms,
+                            int(rows[0][2]) + 1, fingerprint,
+                        ),
+                    )
+                    claimed, event = True, "RECLAIMED"
+                else:
+                    claimed = False
+                if event is not None:
+                    await connection.execute(
+                        """INSERT INTO notification_events
+                           (fingerprint, bundle_id, event, occurred_at_ms, detail)
+                           VALUES (?, ?, ?, ?, NULL)""",
+                        (fingerprint, bundle_id, event, claimed_at_ms),
+                    )
                 await connection.commit()
                 return claimed
             except BaseException:
@@ -1158,6 +1260,12 @@ class OpportunityStore:
                     "UPDATE notification_claims SET state = ? WHERE fingerprint = ?",
                     (status, fingerprint),
                 )
+                await connection.execute(
+                    """INSERT INTO notification_events
+                       (fingerprint, bundle_id, event, occurred_at_ms, detail)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (fingerprint, bundle_id, status, attempted_at_ms, error),
+                )
                 await connection.commit()
             except BaseException:
                 await connection.rollback()
@@ -1184,6 +1292,56 @@ class OpportunityStore:
              None if row[4] is None else str(row[4]))
             for row in rows
         ]
+
+    async def replay_with_notification_audit(
+        self, bundle_id: str
+    ) -> NotificationAuditReplay:
+        evidence = await self.replay(bundle_id)
+        connection = self._require_connection()
+        fingerprints = [
+            str(row[0])
+            for row in await connection.execute_fetchall(
+                """SELECT DISTINCT fingerprint FROM notification_events
+                   WHERE bundle_id = ? ORDER BY fingerprint""",
+                (bundle_id,),
+            )
+        ]
+        claims: list[tuple[str, str, int, int, int]] = []
+        attempts: list[tuple[str, str, int, str | None]] = []
+        events: list[tuple[str, str, int, str | None]] = []
+        for fingerprint in fingerprints:
+            row = (
+                await connection.execute_fetchall(
+                    """SELECT state, claimed_at_ms, lease_expires_at_ms,
+                              attempt_count
+                       FROM notification_claims WHERE fingerprint = ?""",
+                    (fingerprint,),
+                )
+            )[0]
+            claims.append(
+                (fingerprint, str(row[0]), int(row[1]), int(row[2]), int(row[3]))
+            )
+        for row in await connection.execute_fetchall(
+            """SELECT fingerprint, status, attempted_at_ms, error
+               FROM notification_attempts WHERE bundle_id = ? ORDER BY id""",
+            (bundle_id,),
+        ):
+            attempts.append(
+                (str(row[0]), str(row[1]), int(row[2]),
+                 None if row[3] is None else str(row[3]))
+            )
+        for row in await connection.execute_fetchall(
+            """SELECT fingerprint, event, occurred_at_ms, detail
+               FROM notification_events WHERE bundle_id = ? ORDER BY id""",
+            (bundle_id,),
+        ):
+            events.append(
+                (str(row[0]), str(row[1]), int(row[2]),
+                 None if row[3] is None else str(row[3]))
+            )
+        return NotificationAuditReplay(
+            evidence, tuple(claims), tuple(attempts), tuple(events)
+        )
 
     async def _insert_bundle(self, data: dict[str, Any], canonical: str) -> None:
         connection = self._require_connection()

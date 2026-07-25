@@ -64,13 +64,14 @@ class Fees:
 
 
 class Store:
-    def __init__(self, fail=False, order=None, save_result=True):
+    def __init__(self, fail=False, order=None, save_result=True, fail_audit=False):
         self.items = []
         self.fail = fail
         self.order = order
         self.save_result = save_result
         self.claims = set()
         self.attempts = []
+        self.fail_audit = fail_audit
 
     async def save(self, bundle):
         if self.order is not None:
@@ -80,7 +81,9 @@ class Store:
         self.items.append(bundle)
         return self.save_result
 
-    async def claim_notification(self, fingerprint, bundle_id, claimed_at_ms):
+    async def claim_notification(
+        self, fingerprint, bundle_id, claimed_at_ms, lease_expires_at_ms
+    ):
         if fingerprint in self.claims:
             return False
         self.claims.add(fingerprint)
@@ -89,6 +92,8 @@ class Store:
     async def record_notification_attempt(
         self, fingerprint, bundle_id, status, attempted_at_ms, error
     ):
+        if self.fail_audit:
+            raise RuntimeError("audit disk failure")
         self.attempts.append((fingerprint, bundle_id, status, attempted_at_ms, error))
 
 
@@ -156,14 +161,17 @@ def market(**changes):
     return BinaryMarket(**values)
 
 
-def fee_confirmation(authoritative=True, token_ids=("yes-1", "no-1"), rate="0"):
-    schedule = FeeSchedule(Decimal(rate), 2, True, 9_999)
+def fee_confirmation(
+    authoritative=True, token_ids=("yes-1", "no-1"), rate="0",
+    captured_at=9_999, source="CLOB market-info",
+):
+    schedule = FeeSchedule(Decimal(rate), 2, True, captured_at)
     return FeeConfirmation(
         "condition-1",
         token_ids,
         {token: schedule for token in token_ids},
         authoritative,
-        "CLOB market-info",
+        source,
     )
 
 
@@ -213,7 +221,8 @@ def test_engine_result_rejects_non_boolean_lifecycle_markers():
     with pytest.raises(TypeError, match="notified"):
         EngineResult(
             "opp", "evidence", OpportunityStatus.REJECTED, "reason", "stage",
-            1, False, True, None, None, None, None, None, ("reason",),
+            1, False, False, False, True, None,
+            None, None, None, None, None, ("reason",),
         )
 
 
@@ -628,6 +637,7 @@ async def test_material_notification_dedupe_survives_restart_and_hash_change(tmp
         second, _, _ = engine(
             Books(snapshots), Books(copies(snapshots)),
             store=real_store, notice=notice, run_id="run-2",
+            fees=Fees(fee_confirmation(captured_at=10_500, source="new retrieval")),
         )
         assert (await first.evaluate_binary(market())).notified is True
         assert (await second.evaluate_binary(market())).notified is False
@@ -662,6 +672,45 @@ async def test_material_notification_dedupe_survives_restart_and_hash_change(tmp
 
 
 @pytest.mark.asyncio
+async def test_return_or_quantity_change_with_same_hash_notifies(tmp_path):
+    path = tmp_path / "material-economics.sqlite3"
+    discovery = (book("yes-1", "0.40"), book("no-1", "0.40"))
+
+    def confirmed(yes_ask, no_ask, size):
+        rows = []
+        for original, ask in zip(discovery, (yes_ask, no_ask)):
+            source = original.book
+            rebuilt = OrderBook(
+                source.token_id, source.bids,
+                (BookLevel(Decimal(ask), Decimal(size)),),
+                source.tick_size, source.minimum_order_size,
+                source.exchange_ts_ms, source.book_hash,
+            )
+            rows.append(
+                BookSnapshot(rebuilt, "market-1", False, None, 10_002, 10.001)
+            )
+        return tuple(rows)
+
+    notice = Notice()
+    async with OpportunityStore(path) as store:
+        variants = (
+            confirmed("0.40", "0.40", "100"),
+            confirmed("0.39", "0.40", "100"),
+            confirmed("0.40", "0.40", "50"),
+        )
+        results = []
+        for index, variant in enumerate(variants):
+            subject, _, _ = engine(
+                Books(discovery), Books(variant), store=store, notice=notice,
+                run_id=f"material-{index}",
+            )
+            results.append(await subject.evaluate_binary(market()))
+    assert all(result.notified for result in results)
+    assert results[0].minimum_return != results[1].minimum_return
+    assert results[0].quantity != results[2].quantity
+
+
+@pytest.mark.asyncio
 async def test_failed_notification_attempt_is_durable_and_not_retried(tmp_path):
     path = tmp_path / "failed-notice.sqlite3"
     snapshots = (book("yes-1", "0.45"), book("no-1", "0.45"))
@@ -680,9 +729,29 @@ async def test_failed_notification_attempt_is_durable_and_not_retried(tmp_path):
         )
         assert (await retry.evaluate_binary(market())).notified is False
         attempts = await reopened.list_notification_attempts()
+        audit = await reopened.replay_with_notification_audit(result.evidence_id)
     assert len(attempts) == 1
     assert attempts[0][2] == "FAILED"
+    assert [event[1] for event in audit.events] == ["CLAIMED", "FAILED"]
+    assert audit.attempts[0][1] == "FAILED"
     assert notice.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notifier_fails", [False, True])
+async def test_notification_audit_failure_never_terminates_scan(notifier_fails):
+    snapshots = (book("yes-1", "0.45"), book("no-1", "0.45"))
+    subject, _, _ = engine(
+        Books(snapshots), Books(copies(snapshots)),
+        store=Store(fail_audit=True),
+        notice=Notice(fail=notifier_fails),
+    )
+    result = await subject.evaluate_binary(market())
+    assert result.notification_audit_failed is True
+    assert result.delivery_uncertain is True
+    assert result.notified is (not notifier_fails)
+    assert result.notification_failed is notifier_fails
+    assert result.notification_fingerprint is not None
 
 
 @pytest.mark.asyncio
