@@ -141,3 +141,11 @@ def test_unsafe_yaml_tags_are_not_executed(tmp_path: Path) -> None:
     )
     with pytest.raises(RelationValidationError):
         load_relation(path)
+
+
+def test_invalid_utf8_is_reported_as_relation_validation_error(tmp_path: Path) -> None:
+    path = tmp_path / "invalid-utf8.yaml"
+    path.write_bytes(b"\xff\xfe")
+
+    with pytest.raises(RelationValidationError, match="load relation YAML"):
+        load_relation(path)

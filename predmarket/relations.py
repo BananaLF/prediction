@@ -103,7 +103,7 @@ def _parse_review(value: object) -> SemanticReview:
 def load_relation(path: Path) -> Relation:
     try:
         raw = yaml.safe_load(path.read_text())
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
         raise RelationValidationError(f"could not load relation YAML: {exc}") from exc
 
     root = _mapping(raw, "YAML root")
