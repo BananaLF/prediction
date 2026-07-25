@@ -14,6 +14,10 @@ from predmarket.risk import (
 )
 
 
+class DecimalSubclass(Decimal):
+    pass
+
+
 def executable_inputs(**overrides: object) -> RiskInputs:
     values: dict[str, object] = {
         "mathematical_return": Decimal("0.008"),
@@ -159,6 +163,11 @@ def test_risk_inputs_require_decimals(field: str, value: object) -> None:
         executable_inputs(**{field: value})
 
 
+def test_risk_inputs_reject_decimal_subclasses() -> None:
+    with pytest.raises(TypeError):
+        executable_inputs(mathematical_return=DecimalSubclass("0.008"))
+
+
 @pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")])
 @pytest.mark.parametrize(
     "field",
@@ -191,6 +200,16 @@ def test_assess_risk_validates_thresholds_strictly(
 ) -> None:
     with pytest.raises(error):
         assess_risk(executable_inputs(), *thresholds)  # type: ignore[arg-type]
+
+
+def test_assess_risk_rejects_decimal_subclass_thresholds() -> None:
+    with pytest.raises(TypeError):
+        assess_risk(
+            executable_inputs(),
+            DecimalSubclass("0.0075"),
+            Decimal("5"),
+            Decimal("10"),
+        )
 
 
 def test_risk_value_objects_are_strict_and_immutable() -> None:
@@ -235,6 +254,11 @@ def test_partial_fill_risk_validates_values(
         PartialFillRisk(**values)  # type: ignore[arg-type]
 
 
+def test_partial_fill_risk_rejects_decimal_subclasses() -> None:
+    with pytest.raises(TypeError):
+        PartialFillRisk(DecimalSubclass("1"), Decimal("2"))
+
+
 def test_worst_partial_fill_exact_example_and_does_not_mutate_inputs() -> None:
     entries = {"a": Decimal("38"), "b": Decimal("57")}
     unwinds = {"a": Decimal("35"), "b": Decimal("55")}
@@ -270,6 +294,14 @@ def test_worst_partial_fill_rejects_bad_mappings(
 ) -> None:
     with pytest.raises(error):
         worst_partial_fill(entries, unwinds)  # type: ignore[arg-type]
+
+
+def test_worst_partial_fill_rejects_decimal_subclass_mapping_values() -> None:
+    with pytest.raises(TypeError):
+        worst_partial_fill(
+            {"a": DecimalSubclass("1")},
+            {"a": Decimal("0")},
+        )
 
 
 money = st.decimals(

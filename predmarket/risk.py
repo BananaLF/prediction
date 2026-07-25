@@ -6,7 +6,7 @@ from predmarket.domain import OpportunityStatus
 
 
 def _validate_decimal(name: str, value: object, *, nonnegative: bool = False) -> None:
-    if not isinstance(value, Decimal):
+    if type(value) is not Decimal:
         raise TypeError(f"{name} must be Decimal")
     if not value.is_finite():
         raise ValueError(f"{name} must be finite")
