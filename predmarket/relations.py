@@ -56,6 +56,24 @@ class Relation:
         return minimum
 
 
+def require_audited_active_relation(relation: Relation) -> None:
+    if not isinstance(relation, Relation):
+        raise TypeError("relation must be a Relation")
+    if relation.status is not RelationStatus.ACTIVE:
+        raise RelationValidationError("relation must be active")
+    review = relation.semantic_review
+    if not isinstance(review, SemanticReview):
+        raise RelationValidationError(
+            "active relation must have a valid semantic review"
+        )
+    for field in ("reviewer", "reviewed_at", "conclusion"):
+        value = getattr(review, field)
+        if not isinstance(value, str) or not value.strip():
+            raise RelationValidationError(
+                f"semantic review {field} must be a non-empty string"
+            )
+
+
 def _mapping(value: object, field: str) -> dict[object, object]:
     if not isinstance(value, dict):
         raise RelationValidationError(f"{field} must be a mapping")

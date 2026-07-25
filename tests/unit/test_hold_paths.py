@@ -10,7 +10,7 @@ from predmarket.actions import (
     neg_risk_complete_set_path,
 )
 from predmarket.domain import PathKind, Side
-from predmarket.relations import RelationStatus, load_relation
+from predmarket.relations import RelationStatus, SemanticReview, load_relation
 from predmarket.simulator import (
     minimum_relation_received,
     optimize_quantities,
@@ -54,10 +54,27 @@ def test_relation_planning_requires_active_relation(planner: str) -> None:
             minimum_relation_received(candidate, D("1"))
 
 
-def test_implication_path_requires_semantic_review() -> None:
-    relation = replace(load_relation(EXAMPLE), semantic_review=None)
-    with pytest.raises(ValueError, match="review"):
-        implication_path(relation)
+@pytest.mark.parametrize("planner", ["path", "minimum"])
+@pytest.mark.parametrize(
+    "review",
+    [
+        None,
+        object(),
+        SemanticReview("", "2026-07-26", "approved"),
+        SemanticReview("auditor", "", "approved"),
+        SemanticReview("auditor", "2026-07-26", ""),
+        SemanticReview(" ", "2026-07-26", "approved"),
+    ],
+)
+def test_public_relation_apis_require_valid_semantic_review(
+    planner: str, review: object
+) -> None:
+    relation = replace(load_relation(EXAMPLE), semantic_review=review)
+    with pytest.raises((TypeError, ValueError), match="review"):
+        if planner == "path":
+            implication_path(relation)
+        else:
+            minimum_relation_received(relation, D("1"))
 
 
 @pytest.mark.parametrize("planner", ["path", "minimum"])

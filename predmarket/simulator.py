@@ -12,7 +12,7 @@ from predmarket.actions import Action, ActionKind, ActionPath
 from predmarket.domain import PathKind, Side
 from predmarket.fees import FeeSchedule
 from predmarket.orderbook import InsufficientDepth, OrderBook
-from predmarket.relations import Relation, RelationStatus
+from predmarket.relations import Relation, require_audited_active_relation
 
 
 ZERO = Decimal("0")
@@ -20,10 +20,7 @@ ONE = Decimal("1")
 
 
 def minimum_relation_received(relation: Relation, quantity: Decimal) -> Decimal:
-    if not isinstance(relation, Relation):
-        raise TypeError("relation must be a Relation")
-    if relation.status is not RelationStatus.ACTIVE:
-        raise ValueError("relation must be active")
+    require_audited_active_relation(relation)
     quantity = _decimal(quantity, "quantity", positive=True)
     minimum = relation.minimum_units_received()
     if minimum < 1:

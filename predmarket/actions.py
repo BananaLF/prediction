@@ -3,7 +3,7 @@ from decimal import Decimal
 from enum import Enum
 
 from predmarket.domain import PathKind, Side
-from predmarket.relations import Relation, RelationStatus
+from predmarket.relations import Relation, require_audited_active_relation
 
 
 class ActionKind(str, Enum):
@@ -101,19 +101,10 @@ def binary_overpriced_path(yes_token_id: str, no_token_id: str) -> ActionPath:
     )
 
 
-def _audited_active_relation(relation: Relation) -> None:
-    if not isinstance(relation, Relation):
-        raise TypeError("relation must be a Relation")
-    if relation.status is not RelationStatus.ACTIVE:
-        raise ValueError("relation must be active")
-    if relation.semantic_review is None:
-        raise ValueError("active relation must have a semantic review")
+def implication_path(relation: Relation) -> ActionPath:
+    require_audited_active_relation(relation)
     if relation.minimum_units_received() < 1:
         raise ValueError("relation must guarantee minimum coverage")
-
-
-def implication_path(relation: Relation) -> ActionPath:
-    _audited_active_relation(relation)
     buys = tuple(
         Action(
             ActionKind.BUY,
