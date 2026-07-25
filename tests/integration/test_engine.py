@@ -72,6 +72,7 @@ class Store:
         self.claims = set()
         self.attempts = []
         self.fail_audit = fail_audit
+        self.claim_arguments = []
 
     async def save(self, bundle):
         if self.order is not None:
@@ -84,6 +85,9 @@ class Store:
     async def claim_notification(
         self, fingerprint, bundle_id, claimed_at_ms, lease_expires_at_ms
     ):
+        self.claim_arguments.append(
+            (fingerprint, bundle_id, claimed_at_ms, lease_expires_at_ms)
+        )
         if fingerprint in self.claims:
             return False
         self.claims.add(fingerprint)
@@ -221,7 +225,7 @@ def test_engine_result_rejects_non_boolean_lifecycle_markers():
     with pytest.raises(TypeError, match="notified"):
         EngineResult(
             "opp", "evidence", OpportunityStatus.REJECTED, "reason", "stage",
-            1, False, False, False, True, None,
+            1, False, False, False, True, True, None,
             None, None, None, None, None, ("reason",),
         )
 
@@ -555,6 +559,32 @@ async def test_evidence_replays_complete_timing_and_risk_inputs():
 
 
 @pytest.mark.asyncio
+async def test_evaluation_and_notification_use_causally_fresh_clocks():
+    discovery = (book("yes-1", "0.45", received=10_001, mono=10.0),
+                 book("no-1", "0.45", received=10_001, mono=10.0))
+    confirmation = tuple(
+        BookSnapshot(item.book, item.market_id, False, None, 10_101, 10.1)
+        for item in discovery
+    )
+    wall_values = iter((10_120, 60_120, 60_130))
+    mono_values = iter((10.2, 60.2, 60.3))
+    store = Store()
+    notice = Notice()
+    deps = EngineDependencies(
+        Books(discovery), Books(confirmation), Fees(fee_confirmation()),
+        store, notice, settings(), lambda: next(wall_values),
+        lambda: next(mono_values), lambda m: "opp-clock", lambda: "run-clock",
+        "0.2.0", notification_lease_ms=30_000,
+    )
+    result = await StructuralArbitrageEngine(deps).evaluate_binary(market())
+    assert result.status is OpportunityStatus.SNAPSHOT_EXECUTABLE
+    assert store.items[0].data["evaluation"]["evaluated_at_ms"] == 10_120
+    assert store.items[0].data["evaluation"]["evaluated_monotonic"] == Decimal("10.2")
+    assert store.claim_arguments[0][2:] == (60_120, 90_120)
+    assert result.notified is True
+
+
+@pytest.mark.asyncio
 async def test_minimum_return_equality_at_point_zero_zero_seven_five_passes():
     snapshots = (
         book("yes-1", "0.44", bid="0.43", size="100.75"),
@@ -752,6 +782,27 @@ async def test_notification_audit_failure_never_terminates_scan(notifier_fails):
     assert result.notified is (not notifier_fails)
     assert result.notification_failed is notifier_fails
     assert result.notification_fingerprint is not None
+
+
+@pytest.mark.asyncio
+async def test_notification_claim_failure_preserves_core_and_does_not_send():
+    class ClaimFailureStore(Store):
+        async def claim_notification(self, *args):
+            raise RuntimeError("claim unavailable")
+
+    snapshots = (book("yes-1", "0.45"), book("no-1", "0.45"))
+    store, notice = ClaimFailureStore(), Notice()
+    subject, _, _ = engine(
+        Books(snapshots), Books(copies(snapshots)), store=store, notice=notice
+    )
+    result = await subject.evaluate_binary(market())
+    assert result.status is OpportunityStatus.SNAPSHOT_EXECUTABLE
+    assert len(store.items) == 1
+    assert result.notification_audit_failed is True
+    assert result.delivery_uncertain is True
+    assert result.notification_not_attempted is True
+    assert result.notified is False
+    assert notice.calls == []
 
 
 @pytest.mark.asyncio

@@ -453,8 +453,18 @@ async def test_stranded_notification_claim_reclaims_after_lease_and_replays_audi
             "nf:leased", "bundle-lease-b", 1100, 1200
         )
         claimed = await reopened.replay_with_notification_audit("bundle-lease-b")
-        assert claimed.claim_states[0][1:] == ("CLAIMED", 1100, 1200, 2)
+        claim = claimed.current_claims[0]
+        assert claim.owner_bundle_id == "bundle-lease-b"
+        assert (
+            claim.state, claim.claimed_at_ms, claim.lease_expires_at_ms,
+            claim.attempt_count,
+        ) == ("CLAIMED", 1100, 1200, 2)
         assert [event[1] for event in claimed.events] == ["RECLAIMED"]
+        original = await reopened.replay_with_notification_audit("bundle-lease-a")
+        assert (
+            original.current_claims[0].owner_bundle_id == "bundle-lease-b"
+        )
+        assert [event[1] for event in original.events] == ["CLAIMED"]
         await reopened.record_notification_attempt(
             "nf:leased", "bundle-lease-b", "SUCCEEDED", 1110, None
         )
@@ -463,7 +473,7 @@ async def test_stranded_notification_claim_reclaims_after_lease_and_replays_audi
         assert replay.evidence.canonical_json == EvidenceBundle.from_mapping(
             second
         ).canonical_json
-        assert replay.claim_states[0][1] == "SUCCEEDED"
+        assert replay.current_claims[0].state == "SUCCEEDED"
         assert [event[1] for event in replay.events] == [
             "RECLAIMED", "SUCCEEDED"
         ]

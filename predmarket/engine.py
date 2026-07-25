@@ -187,6 +187,7 @@ class EngineResult:
     notification_failed: bool
     notification_audit_failed: bool
     delivery_uncertain: bool
+    notification_not_attempted: bool
     newly_persisted: bool
     notification_fingerprint: str | None
     quantity: Decimal | None
@@ -206,7 +207,8 @@ class EngineResult:
                 raise ValueError(f"{name} must be nonempty")
         for name in (
             "notified", "notification_failed", "notification_audit_failed",
-            "delivery_uncertain", "newly_persisted",
+            "delivery_uncertain", "notification_not_attempted",
+            "newly_persisted",
         ):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be bool")
@@ -350,7 +352,6 @@ class StructuralArbitrageEngine:
     async def evaluate_binary(self, market: BinaryMarket) -> EngineResult:
         if not isinstance(market, BinaryMarket):
             raise TypeError("market must be BinaryMarket")
-        now_ms, evaluated_mono = _clock(self._d)
         opportunity_id = _identifier("opportunity_id", self._d.opportunity_id_factory(market))
         run_id = _identifier("run_id", self._d.run_id_factory())
         evidence_id = _identifier("evidence_id", f"{opportunity_id}:{run_id}")
@@ -368,6 +369,8 @@ class StructuralArbitrageEngine:
         entry_costs: dict[str, Decimal] = {}
         unwind_values: dict[str, Decimal] = {}
         temporal_reasons: tuple[str, ...] = ()
+        now_ms: int | None = None
+        evaluated_mono: float | None = None
 
         if base_reason is None:
             try:
@@ -424,6 +427,7 @@ class StructuralArbitrageEngine:
                         status, reason, stage = OpportunityStatus.REJECTED, "invalid_fee_binding", "fees"
                     else:
                         assert fee_confirmation is not None
+                        now_ms, evaluated_mono = _clock(self._d)
                         books = {token: confirmed[token].book for token in market.token_ids}
                         fees = dict(fee_confirmation.schedules)
                         timings = tuple(
@@ -504,6 +508,8 @@ class StructuralArbitrageEngine:
         risk_reasons = final_risk_reasons or (
             () if status is OpportunityStatus.SNAPSHOT_EXECUTABLE else (reason,)
         )
+        if now_ms is None or evaluated_mono is None:
+            now_ms, evaluated_mono = _clock(self._d)
         bundle = self._bundle(
             market, opportunity_id, run_id, now_ms, evaluated_mono,
             status, reason, stage, candidate, discovery, confirmed, fee_confirmation,
@@ -515,7 +521,7 @@ class StructuralArbitrageEngine:
             raise TypeError("store.save() must return bool")
         result = EngineResult(
             opportunity_id, evidence_id, status, reason, stage,
-            False, False, False, False, newly_persisted, None,
+            False, False, False, False, True, newly_persisted, None,
             economics.quantity if economics else None,
             economics.total if economics else None,
             economics.proceeds if economics else None,
@@ -528,23 +534,40 @@ class StructuralArbitrageEngine:
             fingerprint = self._notification_fingerprint(
                 market, economics, confirmed
             )
-            claimed = await self._d.store.claim_notification(
-                fingerprint, evidence_id, now_ms,
-                now_ms + self._d.notification_lease_ms,
-            )
+            claim_ms, _claim_mono = _clock(self._d)
+            try:
+                claimed = await self._d.store.claim_notification(
+                    fingerprint, evidence_id, claim_ms,
+                    claim_ms + self._d.notification_lease_ms,
+                )
+            except Exception:
+                return EngineResult(**{
+                    **result.__dict__,
+                    "notification_audit_failed": True,
+                    "delivery_uncertain": True,
+                })
             if type(claimed) is not bool:
-                raise TypeError("store.claim_notification() must return bool")
+                return EngineResult(**{
+                    **result.__dict__,
+                    "notification_audit_failed": True,
+                    "delivery_uncertain": True,
+                })
             if not claimed:
                 return result
             delivery_result = EngineResult(
-                **{**result.__dict__, "notification_fingerprint": fingerprint}
+                **{
+                    **result.__dict__,
+                    "notification_fingerprint": fingerprint,
+                    "notification_not_attempted": False,
+                }
             )
             try:
                 await self._d.notifier.notify(delivery_result)
             except Exception as exc:
+                outcome_ms, _outcome_mono = _clock(self._d)
                 try:
                     await self._d.store.record_notification_attempt(
-                        fingerprint, evidence_id, "FAILED", now_ms,
+                        fingerprint, evidence_id, "FAILED", outcome_ms,
                         f"{type(exc).__name__}: {exc}",
                     )
                 except Exception:
@@ -557,9 +580,10 @@ class StructuralArbitrageEngine:
                 return EngineResult(**{
                     **delivery_result.__dict__, "notification_failed": True
                 })
+            outcome_ms, _outcome_mono = _clock(self._d)
             try:
                 await self._d.store.record_notification_attempt(
-                    fingerprint, evidence_id, "SUCCEEDED", now_ms, None
+                    fingerprint, evidence_id, "SUCCEEDED", outcome_ms, None
                 )
             except Exception:
                 return EngineResult(**{

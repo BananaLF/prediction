@@ -918,11 +918,21 @@ class EvidenceBundle:
 
 
 @dataclass(frozen=True)
+class NotificationClaimState:
+    fingerprint: str
+    owner_bundle_id: str
+    state: str
+    claimed_at_ms: int
+    lease_expires_at_ms: int
+    attempt_count: int
+
+
+@dataclass(frozen=True)
 class NotificationAuditReplay:
     """Immutable core evaluation plus append-only leased-outbox audit."""
 
     evidence: EvidenceBundle
-    claim_states: tuple[tuple[str, str, int, int, int], ...]
+    current_claims: tuple[NotificationClaimState, ...]
     attempts: tuple[tuple[str, str, int, str | None], ...]
     events: tuple[tuple[str, str, int, str | None], ...]
 
@@ -1171,7 +1181,10 @@ class OpportunityStore:
 
         This provides at-least-once delivery: an expired CLAIMED row is
         reclaimable after restart. SUCCEEDED and FAILED are terminal; FAILED
-        is intentionally not retried to avoid repeated desktop alerts.
+        is intentionally not retried to avoid repeated desktop alerts. If a
+        notification send itself outlives the lease, another worker may send
+        the same fingerprint; notifiers must use that fingerprint for
+        downstream idempotency.
         """
         _identifier("notification fingerprint", fingerprint)
         _identifier("bundle_id", bundle_id)
@@ -1306,20 +1319,27 @@ class OpportunityStore:
                 (bundle_id,),
             )
         ]
-        claims: list[tuple[str, str, int, int, int]] = []
+        claims: list[NotificationClaimState] = []
         attempts: list[tuple[str, str, int, str | None]] = []
         events: list[tuple[str, str, int, str | None]] = []
         for fingerprint in fingerprints:
             row = (
                 await connection.execute_fetchall(
-                    """SELECT state, claimed_at_ms, lease_expires_at_ms,
-                              attempt_count
+                    """SELECT bundle_id, state, claimed_at_ms,
+                              lease_expires_at_ms, attempt_count
                        FROM notification_claims WHERE fingerprint = ?""",
                     (fingerprint,),
                 )
             )[0]
             claims.append(
-                (fingerprint, str(row[0]), int(row[1]), int(row[2]), int(row[3]))
+                NotificationClaimState(
+                    fingerprint=fingerprint,
+                    owner_bundle_id=str(row[0]),
+                    state=str(row[1]),
+                    claimed_at_ms=int(row[2]),
+                    lease_expires_at_ms=int(row[3]),
+                    attempt_count=int(row[4]),
+                )
             )
         for row in await connection.execute_fetchall(
             """SELECT fingerprint, status, attempted_at_ms, error
