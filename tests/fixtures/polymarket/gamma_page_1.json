@@ -23,8 +23,10 @@
       "endDate": "2027-01-01T00:00:00Z",
       "feesEnabled": true,
       "feeSchedule": {
-        "baseFee": 0,
-        "source": "gamma"
+        "exponent": 2,
+        "rate": 0.02,
+        "takerOnly": true,
+        "rebateRate": 0.2
       }
     }
   ],

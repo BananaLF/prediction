@@ -40,10 +40,19 @@ async def test_keyset_pagination_preserves_cursor_and_normalizes_binary_tokens()
     assert result[0].event.slug == "example-event"
     assert result[0].event.title == "Example Event"
     assert result[0].fee_schedule_source == "feeSchedule"
-    assert json.loads(result[0].fee_schedule_source_json) == {
-        "baseFee": 0,
-        "source": "gamma",
+    fee_schedule = json.loads(result[0].fee_schedule_source_json)
+    assert fee_schedule == {
+        "exponent": 2,
+        "rate": 0.02,
+        "takerOnly": True,
+        "rebateRate": 0.2,
     }
+    assert type(fee_schedule["exponent"]) is int
+    assert type(fee_schedule["rate"]) is float
+    assert type(fee_schedule["takerOnly"]) is bool
+    assert type(fee_schedule["rebateRate"]) is float
+    assert result[1].fee_schedule_source is None
+    assert result[1].fee_schedule_source_json is None
     assert result[1].yes_token_id == "yes-102"
     assert result[1].no_token_id == "no-102"
     assert result.diagnostics == ()
@@ -66,6 +75,12 @@ async def test_last_page_may_omit_cursor_and_preserves_nested_event_and_fee_evid
     assert result[0].event.event_id == "event-103"
     assert json.loads(result[0].event.source_metadata_json)["ticker"] == "EVENT103"
     assert result[0].fee_schedule_source == "feeSchedule"
+    assert set(json.loads(result[0].fee_schedule_source_json)) == {
+        "exponent",
+        "rate",
+        "takerOnly",
+        "rebateRate",
+    }
 
 
 @pytest.mark.asyncio
