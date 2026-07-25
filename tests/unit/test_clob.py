@@ -84,9 +84,9 @@ async def test_fee_zero_is_safe_but_nonzero_does_not_invent_exponent():
         client = ClobRestClient(http, "https://clob.test", wall_clock_ms=lambda: 99, monotonic=lambda: 1.5)
         zero = await client.fee_rate("yes-101")
         nonzero = await client.fee_rate("no-101")
-    assert zero.base_fee_bps == 0 and zero.schedule is not None
-    assert zero.schedule.rate == Decimal("0")
-    assert nonzero.base_fee_bps == 500 and nonzero.schedule is None
+    assert zero.base_fee_bps == 0 and zero.rate == Decimal("0")
+    assert nonzero.base_fee_bps == 500
+    assert not hasattr(zero, "schedule") and not hasattr(nonzero, "schedule")
     assert nonzero.rate == Decimal("0.05")
     assert nonzero.provenance == "GET /fee-rate"
 
@@ -122,3 +122,174 @@ async def test_owned_client_context_lifecycle():
         assert (await client.fee_rate("x")).base_fee_bps == 0
     with pytest.raises(RuntimeError, match="closed"):
         await client.fee_rate("x")
+
+
+@pytest.mark.asyncio
+async def test_market_info_binds_tokens_and_exact_complete_fee_schedule():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json=fixture("clob_market_info.json"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        info = await ClobRestClient(
+            http, "https://clob.test", wall_clock_ms=lambda: 100, monotonic=lambda: 2
+        ).market_info("condition/101")
+    assert info.condition_id == "condition/101"
+    assert [(token.token_id, token.outcome) for token in info.tokens] == [
+        ("yes-101", "Yes"),
+        ("no-101", "No"),
+    ]
+    assert info.fee_schedule.rate == Decimal("0.02")
+    assert info.fee_schedule.exponent == 2
+    assert info.fee_schedule.taker_only is True
+    assert info.minimum_order_size == Decimal("5")
+    assert info.tick_size == Decimal("0.01")
+    assert info.maker_base_fee_bps == 0 and info.taker_base_fee_bps == 500
+    assert b"condition%2F101" in seen[0].url.raw_path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "duplicate_token",
+        "duplicate_outcome",
+        "empty_token",
+        "float_exponent",
+        "bool_exponent",
+        "float_from_caller",
+        "bad_taker",
+        "negative_base_fee",
+        "bad_tick",
+    ],
+)
+async def test_market_info_malformed_evidence_fails_closed(mutation):
+    payload = fixture("clob_market_info.json")
+    if mutation == "duplicate_token":
+        payload["t"][1]["t"] = payload["t"][0]["t"]
+    elif mutation == "duplicate_outcome":
+        payload["t"][1]["o"] = payload["t"][0]["o"]
+    elif mutation == "empty_token":
+        payload["t"][0]["t"] = ""
+    elif mutation == "float_exponent":
+        payload["fd"]["e"] = 2.0
+    elif mutation == "bool_exponent":
+        payload["fd"]["e"] = True
+    elif mutation == "float_from_caller":
+        # A programmatic MockTransport payload becomes binary float JSON. The
+        # adapter must parse response text back into Decimal before domain use.
+        payload["fd"]["r"] = 0.1
+    elif mutation == "bad_taker":
+        payload["fd"]["to"] = 1
+    elif mutation == "negative_base_fee":
+        payload["tbf"] = -1
+    else:
+        payload["mts"] = 2
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
+    async with httpx.AsyncClient(transport=transport) as http:
+        if mutation == "float_from_caller":
+            info = await ClobRestClient(http, "https://clob.test").market_info("condition")
+            assert info.fee_schedule.rate == Decimal("0.1")
+        else:
+            with pytest.raises((AdapterPayloadError, AdapterInvariantError)):
+                await ClobRestClient(http, "https://clob.test").market_info("condition")
+
+
+@pytest.mark.asyncio
+async def test_market_info_fee_rate_cross_check_rejects_mismatch_and_coverage():
+    payload = fixture("clob_market_info.json")
+
+    def handler(request):
+        if request.url.path == "/fee-rate":
+            token = request.url.params["token_id"]
+            return httpx.Response(200, json={"base_fee": 500 if token == "yes-101" else 499})
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = ClobRestClient(http, "https://clob.test")
+        info = await client.market_info("condition-101")
+        yes = await client.fee_rate("yes-101")
+        no = await client.fee_rate("no-101")
+    with pytest.raises(AdapterInvariantError, match="mismatch"):
+        info.validated_fee_schedules((yes, no))
+    with pytest.raises(AdapterInvariantError, match="coverage"):
+        info.validated_fee_schedules((yes,))
+
+
+@pytest.mark.asyncio
+async def test_market_info_zero_fee_is_evidenced_without_special_inference():
+    payload = fixture("clob_market_info.json")
+    payload["fd"]["r"] = 0
+    payload["tbf"] = 0
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = ClobRestClient(http, "https://clob.test")
+        info = await client.market_info("condition-101")
+    assert info.fee_schedule.rate == Decimal("0")
+    assert info.fee_schedule.exponent == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["condition", "tokens", "fee_missing", "outcome_case"])
+async def test_market_info_binding_mismatches_fail_closed(mismatch):
+    payload = fixture("clob_market_info.json")
+    expected = None
+    if mismatch == "condition":
+        payload["condition_id"] = "different-condition"
+    elif mismatch == "tokens":
+        expected = ["yes-101", "different-token"]
+    elif mismatch == "fee_missing":
+        del payload["fd"]["e"]
+    else:
+        payload["t"][1]["o"] = "YES"
+        payload["t"][0]["o"] = "Yes"
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
+    async with httpx.AsyncClient(transport=transport) as http:
+        with pytest.raises((AdapterPayloadError, AdapterInvariantError)):
+            await ClobRestClient(http, "https://clob.test").market_info(
+                "condition-101", expected_token_ids=expected
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("condition_id", ["", " ", "..", "bad\nid"])
+async def test_market_info_rejects_unsafe_condition_id(condition_id):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: None)) as http:
+        with pytest.raises((TypeError, ValueError)):
+            await ClobRestClient(http, "https://clob.test").market_info(condition_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credential", ["authorization", "cookie", "poly", "auth"])
+@pytest.mark.parametrize("adapter_kind", ["gamma", "clob"])
+async def test_mutated_injected_credentials_are_rejected_before_send(credential, adapter_kind):
+    calls = 0
+
+    def handler(_):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"markets": [], "next_cursor": ""})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        if adapter_kind == "gamma":
+            from predmarket.polymarket.gamma import GammaClient
+
+            adapter = GammaClient(http, "https://gamma.test")
+        else:
+            adapter = ClobRestClient(http, "https://clob.test")
+        if credential == "authorization":
+            http.headers["Authorization"] = "secret"
+        elif credential == "cookie":
+            http.cookies.set("session", "secret")
+        elif credential == "poly":
+            http.headers["POLY_API_KEY"] = "secret"
+        else:
+            http._auth = httpx.BasicAuth("name", "secret")
+        with pytest.raises(AdapterInvariantError, match="credential|authentication"):
+            if adapter_kind == "gamma":
+                await adapter.active_markets()
+            else:
+                await adapter.fee_rate("token")
+    assert calls == 0

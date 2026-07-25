@@ -211,3 +211,25 @@ async def test_base_url_and_auth_defaults_are_rejected():
     async with httpx.AsyncClient() as http:
         with pytest.raises(ValueError):
             GammaClient(http, "https://user:pass@gamma.test/path")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("collision", ["market", "condition", "token"])
+async def test_identifiers_must_be_unique_across_keyset_pages(collision):
+    first = fixture("gamma_page_1.json")
+    second = fixture("gamma_page_2.json")
+    market = second["markets"][0]
+    if collision == "market":
+        market["id"] = first["markets"][0]["id"]
+    elif collision == "condition":
+        market["conditionId"] = first["markets"][0]["conditionId"]
+    else:
+        market["clobTokenIds"][0] = json.loads(first["markets"][0]["clobTokenIds"])[0]
+
+    def handler(request):
+        payload = first if request.url.params.get("after_cursor") is None else second
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(AdapterInvariantError, match="duplicate"):
+            await GammaClient(http, "https://gamma.test").active_markets()

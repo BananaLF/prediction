@@ -12,6 +12,7 @@ from predmarket.polymarket import (
     AdapterHTTPError,
     AdapterInvariantError,
     AdapterPayloadError,
+    AdapterSecurityError,
     AdapterTransportError,
 )
 
@@ -48,10 +49,20 @@ def _validate_base_url(value: str) -> str:
 
 def _reject_credential_headers(http: httpx.AsyncClient) -> None:
     names = {name.lower() for name in http.headers}
-    if names & _CREDENTIAL_HEADERS:
-        raise ValueError("credential headers are not allowed on public read-only clients")
+    if names & _CREDENTIAL_HEADERS or any(
+        name.startswith(("poly_", "poly-")) for name in names
+    ):
+        raise AdapterSecurityError(
+            "credential headers are not allowed on public read-only clients"
+        )
+    if len(http.cookies):
+        raise AdapterSecurityError(
+            "credential cookies are not allowed on public read-only clients"
+        )
     if getattr(http, "_auth", None) is not None:
-        raise ValueError("HTTP authentication is not allowed on public read-only clients")
+        raise AdapterSecurityError(
+            "HTTP authentication is not allowed on public read-only clients"
+        )
 
 
 def _required_string(raw: dict[str, Any], key: str) -> str:
@@ -286,7 +297,9 @@ class GammaClient:
         if http is not None and transport is not None:
             raise ValueError("transport may only be supplied for an owned HTTP client")
         self._owned = http is None
-        self.http = http or httpx.AsyncClient(transport=transport, timeout=timeout)
+        self.http = http or httpx.AsyncClient(
+            transport=transport, timeout=timeout, trust_env=False
+        )
         _reject_credential_headers(self.http)
         self.max_response_bytes = max_response_bytes
         self._closed = False
@@ -307,6 +320,7 @@ class GammaClient:
     async def _get_page(self, *, limit: int, cursor: str | None) -> dict[str, Any]:
         if self._closed:
             raise RuntimeError("client is closed")
+        _reject_credential_headers(self.http)
         params: dict[str, str | int] = {"limit": limit, "closed": "false"}
         if cursor is not None:
             params["after_cursor"] = cursor
@@ -351,6 +365,9 @@ class GammaClient:
         seen: set[str] = set()
         markets: list[MarketMetadata] = []
         diagnostics: list[MarketDiagnostic] = []
+        seen_market_ids: set[str] = set()
+        seen_condition_ids: set[str] = set()
+        seen_token_ids: set[str] = set()
         for _page_number in range(max_pages):
             payload = await self._get_page(limit=limit, cursor=cursor)
             page_markets = payload["markets"]
@@ -360,12 +377,32 @@ class GammaClient:
                 market_id = raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else None
                 try:
                     market = _normalize_market(raw)
-                    if not market.is_tradeable:
-                        diagnostics.append(MarketDiagnostic(market.market_id, "market is not tradeable"))
-                    else:
-                        markets.append(market)
                 except (AdapterPayloadError, AdapterInvariantError) as exc:
                     diagnostics.append(MarketDiagnostic(market_id, str(exc)))
+                    continue
+                token_ids = {token.token_id for token in market.tokens}
+                if market.market_id in seen_market_ids:
+                    raise AdapterInvariantError(
+                        f"duplicate market ID {market.market_id}"
+                    )
+                if market.condition_id in seen_condition_ids:
+                    raise AdapterInvariantError(
+                        f"duplicate condition ID {market.condition_id}"
+                    )
+                duplicate_tokens = token_ids & seen_token_ids
+                if duplicate_tokens:
+                    raise AdapterInvariantError(
+                        f"duplicate token ID {sorted(duplicate_tokens)[0]}"
+                    )
+                seen_market_ids.add(market.market_id)
+                seen_condition_ids.add(market.condition_id)
+                seen_token_ids.update(token_ids)
+                if not market.is_tradeable:
+                    diagnostics.append(
+                        MarketDiagnostic(market.market_id, "market is not tradeable")
+                    )
+                else:
+                    markets.append(market)
             next_cursor = payload["next_cursor"]
             if not next_cursor:
                 return GammaDiscovery(tuple(markets), tuple(diagnostics))

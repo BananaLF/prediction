@@ -21,10 +21,15 @@ class AdapterInvariantError(AdapterError):
     """The response violated a cross-record or market invariant."""
 
 
+class AdapterSecurityError(AdapterInvariantError, ValueError):
+    """A public-data client was configured with credentials."""
+
+
 __all__ = [
     "AdapterError",
     "AdapterTransportError",
     "AdapterHTTPError",
     "AdapterPayloadError",
     "AdapterInvariantError",
+    "AdapterSecurityError",
 ]
