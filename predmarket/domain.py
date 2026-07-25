@@ -27,6 +27,8 @@ class BookLevel:
     def __post_init__(self) -> None:
         if not isinstance(self.price, Decimal) or not isinstance(self.size, Decimal):
             raise TypeError("price and size must be Decimal")
+        if not self.price.is_finite() or not self.size.is_finite():
+            raise ValueError("price and size must be finite")
         if not Decimal("0") < self.price < Decimal("1"):
             raise ValueError("price must be strictly between 0 and 1")
         if self.size <= Decimal("0"):

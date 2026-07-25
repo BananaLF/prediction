@@ -48,6 +48,16 @@ def test_book_level_rejects_nonpositive_size(size: Decimal) -> None:
         BookLevel(price=Decimal("0.5"), size=size)
 
 
+@pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")])
+@pytest.mark.parametrize("field", ["price", "size"])
+def test_book_level_rejects_nonfinite_decimals(field: str, value: Decimal) -> None:
+    values = {"price": Decimal("0.5"), "size": Decimal("1")}
+    values[field] = value
+
+    with pytest.raises(ValueError):
+        BookLevel(**values)
+
+
 def test_book_level_is_immutable() -> None:
     level = BookLevel(price=Decimal("0.5"), size=Decimal("2"))
 
