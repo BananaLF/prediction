@@ -24,6 +24,9 @@ _OPPORTUNITY_STATUSES = {
 _DECIMAL_FIELDS = {
     "amount",
     "exponent",
+    "fees",
+    "gross_investment",
+    "gross_proceeds",
     "max_unhedged_notional",
     "minimum_proceeds",
     "net_profit",
@@ -34,6 +37,7 @@ _DECIMAL_FIELDS = {
     "rate",
     "size",
     "tick_size",
+    "total_costs",
     "total_investment",
     "worst_leg_failure_loss",
 }
@@ -67,6 +71,13 @@ def _decimal(name: str, value: object) -> Decimal:
     if not value.is_finite():
         raise ValueError(f"{name} must be finite")
     return value
+
+
+def _nonnegative_decimal(name: str, value: object) -> Decimal:
+    result = _decimal(name, value)
+    if result < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return result
 
 
 def _canonical_decimal(value: Decimal) -> str:
@@ -149,7 +160,8 @@ def _validate_unique_ids(name: str, records: object) -> None:
 def _validate_bundle(raw: Mapping[str, object]) -> None:
     _required(
         raw,
-        "version", "id", "run", "opportunity", "events", "markets",
+        "version", "id", "producer", "evaluation", "run", "opportunity",
+        "economics", "events", "markets",
         "tokens", "fee_schedules", "relation", "books", "legs", "actions",
         "risk", "latency_metrics", "notifications",
     )
@@ -158,6 +170,23 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
     if raw["version"] != SCHEMA_VERSION:
         raise ValueError(f"unsupported evidence version: {raw['version']!r}")
     _identifier("id", raw["id"])
+
+    producer = _mapping("producer", raw["producer"])
+    _required(producer, "engine", "version", "metadata")
+    for name in ("engine", "version"):
+        if type(producer[name]) is not str or not producer[name]:
+            raise ValueError(f"producer.{name} must be a nonempty string")
+    _mapping("producer.metadata", producer["metadata"])
+
+    evaluation = _mapping("evaluation", raw["evaluation"])
+    _required(
+        evaluation, "evaluated_at_ms", "maximum_book_age_ms",
+        "maximum_leg_skew_ms",
+    )
+    for name in (
+        "evaluated_at_ms", "maximum_book_age_ms", "maximum_leg_skew_ms",
+    ):
+        _integer(f"evaluation.{name}", evaluation[name])
 
     run = _mapping("run", raw["run"])
     _required(run, "id", "status", "started_at_ms")
@@ -180,6 +209,51 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         "net_return",
     ):
         _decimal(f"opportunity.{name}", opportunity[name])
+    _nonnegative_decimal("opportunity.quantity", opportunity["quantity"])
+    _nonnegative_decimal(
+        "opportunity.total_investment", opportunity["total_investment"]
+    )
+    _nonnegative_decimal(
+        "opportunity.minimum_proceeds", opportunity["minimum_proceeds"]
+    )
+
+    economics = _mapping("economics", raw["economics"])
+    _required(
+        economics, "gross_investment", "gross_proceeds", "fees", "total_costs",
+        "net_profit", "net_return", "costs",
+    )
+    for name in ("gross_investment", "gross_proceeds", "fees", "total_costs"):
+        _nonnegative_decimal(f"economics.{name}", economics[name])
+    _decimal("economics.net_profit", economics["net_profit"])
+    _decimal("economics.net_return", economics["net_return"])
+    if (
+        economics["total_costs"] != opportunity["total_investment"]
+        or economics["gross_proceeds"] != opportunity["minimum_proceeds"]
+        or economics["net_profit"] != opportunity["net_profit"]
+        or economics["net_return"] != opportunity["net_return"]
+    ):
+        raise ValueError("economics and opportunity totals must agree")
+    costs = _sequence("economics.costs", economics["costs"])
+    _validate_unique_ids("economics.costs", costs)
+    cost_total = Decimal("0")
+    for item in costs:
+        cost = _mapping("cost", item)
+        _required(cost, "id", "kind", "amount")
+        if type(cost["kind"]) is not str or not cost["kind"]:
+            raise ValueError("cost kind must be a nonempty string")
+        if ("leg_id" in cost) == ("component" in cost):
+            raise ValueError("cost requires exactly one of leg_id or component")
+        if "leg_id" in cost:
+            _identifier("cost.leg_id", cost["leg_id"])
+        elif type(cost["component"]) is not str or not cost["component"]:
+            raise ValueError("cost component must be a nonempty string")
+        cost_total += _nonnegative_decimal("cost.amount", cost["amount"])
+    if cost_total != economics["fees"]:
+        raise ValueError("cost breakdown must sum exactly to fees")
+    if economics["gross_investment"] + economics["fees"] != economics["total_costs"]:
+        raise ValueError("gross investment plus fees must equal total costs")
+    if economics["gross_proceeds"] - economics["total_costs"] != economics["net_profit"]:
+        raise ValueError("gross proceeds minus total costs must equal net profit")
 
     for name in (
         "events", "markets", "tokens", "fee_schedules", "legs", "actions",
@@ -222,8 +296,12 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         )
         if _identifier("fee.token_id", fee["token_id"]) not in token_ids:
             raise ValueError("fee schedule references an unknown token")
-        _decimal("fee.rate", fee["rate"])
-        _decimal("fee.exponent", fee["exponent"])
+        rate = _nonnegative_decimal("fee.rate", fee["rate"])
+        if rate > Decimal("1"):
+            raise ValueError("fee rate must not exceed one")
+        exponent = _nonnegative_decimal("fee.exponent", fee["exponent"])
+        if exponent != exponent.to_integral_value():
+            raise ValueError("fee exponent must be integral")
         if fee["direction"] not in {"BUY", "SELL", "BOTH"}:
             raise ValueError("invalid fee direction")
         _integer("fee.retrieved_at_ms", fee["retrieved_at_ms"])
@@ -233,12 +311,28 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
     relation = _mapping("relation", raw["relation"])
     _required(relation, "set", "relations", "states", "payoffs")
     relation_set = _mapping("relation.set", relation["set"])
-    _required(relation_set, "id", "version", "status", "metadata")
+    _required(
+        relation_set, "id", "version", "status", "metadata", "provenance",
+    )
     _identifier("relation.set.id", relation_set["id"])
     if type(relation_set["version"]) is not int or relation_set["version"] <= 0:
         raise ValueError("relation.set.version must be a positive integer")
     if relation_set["status"] != "active":
         raise ValueError("relation set must be active")
+    audit_metadata = _mapping("relation.set.metadata", relation_set["metadata"])
+    if audit_metadata.get("audited") is not True:
+        raise ValueError("active relation set must be explicitly audited")
+    if type(audit_metadata.get("auditor")) is not str or not audit_metadata["auditor"]:
+        raise ValueError("active relation set must identify its auditor")
+    provenance = _mapping("relation.set.provenance", relation_set["provenance"])
+    _required(provenance, "source", "content_hash")
+    if any(
+        type(provenance[name]) is not str or not provenance[name]
+        for name in ("source", "content_hash")
+    ):
+        raise ValueError("relation provenance values must be nonempty strings")
+    if not relation["relations"] or not relation["states"] or not relation["payoffs"]:
+        raise ValueError("active relation must have relations, states, and payoffs")
     _validate_unique_ids("relation.relations", relation["relations"])
     _validate_unique_ids("relation.states", relation["states"])
     relation_ids = {
@@ -247,10 +341,20 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
     }
     if opportunity["relation_id"] not in relation_ids:
         raise ValueError("opportunity references an unknown relation")
+    for item in relation["relations"]:
+        relation_item = _mapping("relation", item)
+        _required(relation_item, "id", "kind")
+        if type(relation_item["kind"]) is not str or not relation_item["kind"]:
+            raise ValueError("relation kind must be a nonempty string")
     state_ids = {
         _identifier("state.id", _mapping("state", item)["id"])
         for item in _sequence("relation.states", relation["states"])
     }
+    for item in relation["states"]:
+        state = _mapping("state", item)
+        _required(state, "id", "label")
+        if type(state["label"]) is not str or not state["label"]:
+            raise ValueError("state label must be a nonempty string")
     payoff_pairs: set[tuple[str, str]] = set()
     for item in _sequence("relation.payoffs", relation["payoffs"]):
         payoff = _mapping("payoff", item)
@@ -263,7 +367,12 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         if pair in payoff_pairs:
             raise ValueError("duplicate payoff state/token pair")
         payoff_pairs.add(pair)
-        _decimal("payoff.amount", payoff["amount"])
+        amount = _nonnegative_decimal("payoff.amount", payoff["amount"])
+        if amount > Decimal("1"):
+            raise ValueError("payoff amount must not exceed one")
+    expected_payoffs = {(state, token) for state in state_ids for token in token_ids}
+    if payoff_pairs != expected_payoffs:
+        raise ValueError("payoff matrix must cover every state/token pair exactly")
 
     book_ids: set[str] = set()
     snapshot_ids: set[str] = set()
@@ -289,14 +398,19 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         _integer("epoch.started_at_ms", epoch["started_at_ms"])
         _integer("snapshot.exchange_ts_ms", snapshot["exchange_ts_ms"])
         _integer("snapshot.received_ts_ms", snapshot["received_ts_ms"])
-        _decimal("snapshot.tick_size", snapshot["tick_size"])
+        tick_size = _nonnegative_decimal("snapshot.tick_size", snapshot["tick_size"])
+        if not Decimal("0") < tick_size <= Decimal("1"):
+            raise ValueError("snapshot tick size must be in (0, 1]")
         for position, raw_level in enumerate(_sequence("levels", book["levels"])):
             level = _mapping("level", raw_level)
             _required(level, "side", "price", "size", "position")
             if level["side"] not in {"BUY", "SELL"}:
                 raise ValueError("invalid level side")
-            _decimal("level.price", level["price"])
-            _decimal("level.size", level["size"])
+            price = _decimal("level.price", level["price"])
+            if not Decimal("0") < price < Decimal("1"):
+                raise ValueError("level price must be in (0, 1)")
+            if _nonnegative_decimal("level.size", level["size"]) == 0:
+                raise ValueError("level size must be positive")
             if _integer("level.position", level["position"]) != position:
                 raise ValueError("level positions must be contiguous and ordered")
 
@@ -307,8 +421,18 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
             raise ValueError("leg references an unknown token")
         if leg["side"] not in {"BUY", "SELL"}:
             raise ValueError("invalid leg side")
-        _decimal("leg.quantity", leg["quantity"])
-        _decimal("leg.notional", leg["notional"])
+        if _nonnegative_decimal("leg.quantity", leg["quantity"]) == 0:
+            raise ValueError("leg quantity must be positive")
+        _nonnegative_decimal("leg.notional", leg["notional"])
+    leg_ids = {
+        _mapping("leg", item)["id"] for item in _sequence("legs", raw["legs"])
+    }
+    if any(
+        cost.get("leg_id") not in leg_ids
+        for cost in costs
+        if "leg_id" in cost
+    ):
+        raise ValueError("cost references an unknown leg")
 
     for sequence, item in enumerate(_sequence("actions", raw["actions"])):
         action = _mapping("action", item)
@@ -322,8 +446,8 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         if "token_id" in action and action["token_id"] is not None:
             if _identifier("action.token_id", action["token_id"]) not in token_ids:
                 raise ValueError("action references an unknown token")
-        _decimal("action.quantity", action["quantity"])
-        _decimal("action.amount", action["amount"])
+        _nonnegative_decimal("action.quantity", action["quantity"])
+        _nonnegative_decimal("action.amount", action["amount"])
 
     risk = _mapping("risk", raw["risk"])
     _required(
@@ -337,8 +461,14 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
         raise ValueError("risk reasons must be nonempty strings")
     if len(set(reasons)) != len(reasons):
         raise ValueError("risk reasons must be unique")
-    _decimal("risk.worst_leg_failure_loss", risk["worst_leg_failure_loss"])
-    _decimal("risk.max_unhedged_notional", risk["max_unhedged_notional"])
+    _nonnegative_decimal(
+        "risk.worst_leg_failure_loss", risk["worst_leg_failure_loss"]
+    )
+    _nonnegative_decimal(
+        "risk.max_unhedged_notional", risk["max_unhedged_notional"]
+    )
+    if risk["status"] != opportunity["status"]:
+        raise ValueError("opportunity and risk status must match")
 
     for item in _sequence("latency_metrics", raw["latency_metrics"]):
         metric = _mapping("latency metric", item)
@@ -353,8 +483,8 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
     for item in _sequence("notifications", raw["notifications"]):
         notification = _mapping("notification", item)
         _required(notification, "id", "channel", "status", "sent_at_ms")
-        if type(notification["channel"]) is not str or not notification["channel"]:
-            raise ValueError("notification channel must be a nonempty string")
+        if notification["channel"] != "desktop":
+            raise ValueError("only desktop notification records are supported")
         if notification["status"] not in {"PENDING", "SENT", "FAILED"}:
             raise ValueError("invalid notification status")
         _integer(
@@ -362,6 +492,48 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
             notification["sent_at_ms"],
             nullable=True,
         )
+
+    if opportunity["status"] == "SNAPSHOT_EXECUTABLE":
+        if opportunity["quantity"] <= 0 or opportunity["total_investment"] <= 0:
+            raise ValueError("executable opportunity quantity and investment must be positive")
+        for section in (
+            "legs", "actions", "books", "fee_schedules", "latency_metrics",
+        ):
+            if not raw[section]:
+                raise ValueError(
+                    f"SNAPSHOT_EXECUTABLE evidence requires nonempty {section}"
+                )
+        leg_tokens = [
+            _mapping("leg", item)["token_id"]
+            for item in _sequence("legs", raw["legs"])
+        ]
+        if len(leg_tokens) != len(set(leg_tokens)):
+            raise ValueError("executable evidence permits one leg per token")
+        book_tokens = [
+            _mapping("book", item)["epoch"]["token_id"]
+            for item in _sequence("books", raw["books"])
+        ]
+        if sorted(book_tokens) != sorted(leg_tokens):
+            raise ValueError("each executable leg requires exactly one LIVE book")
+        if any(
+            not _mapping("book", item)["levels"]
+            for item in _sequence("books", raw["books"])
+        ):
+            raise ValueError("each executable book requires full depth levels")
+        for item in _sequence("legs", raw["legs"]):
+            leg = _mapping("leg", item)
+            applicable = [
+                fee
+                for fee in _sequence("fee_schedules", raw["fee_schedules"])
+                if _mapping("fee", fee)["token_id"] == leg["token_id"]
+                and _mapping("fee", fee)["direction"] in {leg["side"], "BOTH"}
+            ]
+            if len(applicable) != 1:
+                raise ValueError(
+                    "each executable leg requires exactly one applicable fee schedule"
+                )
+    elif raw["notifications"]:
+        raise ValueError("notifications are forbidden for non-executable evidence")
 
     # Validate every remaining value and every exact-decimal field recursively.
     _canonicalize(raw)
@@ -537,41 +709,60 @@ class OpportunityStore:
         if not rendered or "\x00" in rendered:
             raise ValueError("database path is invalid")
         self._path = rendered
-        self._connection: aiosqlite.Connection
+        self._connection: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
 
     async def __aenter__(self) -> "OpportunityStore":
+        return await self.open()
+
+    async def open(self) -> "OpportunityStore":
+        """Open and initialize the database; repeated calls are harmless."""
+        if self._connection is not None:
+            return self
         if self._path != ":memory:":
             path = Path(self._path).expanduser()
             if path.exists() and path.is_dir():
                 raise ValueError("database path points to a directory")
             path.parent.mkdir(parents=True, exist_ok=True)
             self._path = str(path)
-        self._connection = await aiosqlite.connect(self._path)
-        await self._connection.execute("PRAGMA foreign_keys = ON")
-        await self._connection.execute("PRAGMA journal_mode = WAL")
-        version_rows = await self._connection.execute_fetchall("PRAGMA user_version")
+        connection = await aiosqlite.connect(self._path)
+        self._connection = connection
+        await connection.execute("PRAGMA foreign_keys = ON")
+        await connection.execute("PRAGMA journal_mode = WAL")
+        version_rows = await connection.execute_fetchall("PRAGMA user_version")
         existing_version = int(version_rows[0][0])
         if existing_version > SCHEMA_VERSION:
-            await self._connection.close()
+            await connection.close()
+            self._connection = None
             raise RuntimeError(
                 f"database schema {existing_version} is newer than supported "
                 f"schema {SCHEMA_VERSION}"
             )
-        await self._connection.executescript(_SCHEMA)
-        await self._connection.execute(
+        await connection.executescript(_SCHEMA)
+        await connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
             (SCHEMA_VERSION,),
         )
-        await self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        await self._connection.commit()
+        await connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        await connection.commit()
         return self
+
+    async def initialize(self) -> "OpportunityStore":
+        """Public compatibility name for opening and migrating the store."""
+        return await self.open()
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
         await self.close()
 
     async def close(self) -> None:
-        await self._connection.close()
+        if self._connection is not None:
+            await self._connection.close()
+            self._connection = None
+
+    def _require_connection(self) -> aiosqlite.Connection:
+        if self._connection is None:
+            raise RuntimeError("opportunity store is not open")
+        return self._connection
 
     async def save(self, bundle: EvidenceBundle) -> bool:
         if not isinstance(bundle, EvidenceBundle):
@@ -579,9 +770,10 @@ class OpportunityStore:
         data = bundle.data
         bundle_id = data["id"]
         async with self._write_lock:
-            await self._connection.execute("BEGIN IMMEDIATE")
+            connection = self._require_connection()
+            await connection.execute("BEGIN IMMEDIATE")
             try:
-                row = await self._connection.execute_fetchall(
+                row = await connection.execute_fetchall(
                     "SELECT canonical_json FROM evidence_bundles WHERE id = ?",
                     (bundle_id,),
                 )
@@ -590,18 +782,19 @@ class OpportunityStore:
                         raise EvidenceConflictError(
                             f"conflicting evidence bundle: {bundle_id}"
                         )
-                    await self._connection.rollback()
+                    await connection.rollback()
                     return False
                 await self._insert_bundle(data, bundle.canonical_json)
-                await self._connection.commit()
+                await connection.commit()
                 return True
             except BaseException:
-                await self._connection.rollback()
+                await connection.rollback()
                 raise
 
     async def _insert_bundle(self, data: dict[str, Any], canonical: str) -> None:
+        connection = self._require_connection()
         bundle_id = data["id"]
-        await self._connection.execute(
+        await connection.execute(
             "INSERT INTO evidence_bundles VALUES (?, ?, ?)",
             (bundle_id, data["version"], canonical),
         )
@@ -712,7 +905,7 @@ class OpportunityStore:
 
     async def replay(self, bundle_id: str) -> EvidenceBundle:
         _identifier("bundle_id", bundle_id)
-        rows = await self._connection.execute_fetchall(
+        rows = await self._require_connection().execute_fetchall(
             "SELECT canonical_json FROM evidence_bundles WHERE id = ?",
             (bundle_id,),
         )
@@ -726,13 +919,13 @@ class OpportunityStore:
         return replayed
 
     async def list_opportunities(self) -> list[tuple[str, str, str]]:
-        rows = await self._connection.execute_fetchall(
+        rows = await self._require_connection().execute_fetchall(
             "SELECT id, status, bundle_id FROM opportunities ORDER BY bundle_id"
         )
         return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
 
     async def list_runs(self) -> list[tuple[str, str]]:
-        rows = await self._connection.execute_fetchall(
+        rows = await self._require_connection().execute_fetchall(
             "SELECT id, status FROM runs ORDER BY bundle_id"
         )
         return [(str(row[0]), str(row[1])) for row in rows]

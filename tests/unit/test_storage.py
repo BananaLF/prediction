@@ -11,6 +11,16 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
     return {
         "version": 1,
         "id": bundle_id,
+        "producer": {
+            "engine": "predmarket",
+            "version": "0.2.0",
+            "metadata": {"strategy": "structural"},
+        },
+        "evaluation": {
+            "evaluated_at_ms": 1000,
+            "maximum_book_age_ms": 1000,
+            "maximum_leg_skew_ms": 250,
+        },
         "run": {"id": "run-1", "status": "COMPLETED", "started_at_ms": 1000},
         "opportunity": {
             "id": opportunity_id,
@@ -21,6 +31,22 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
             "minimum_proceeds": Decimal("10"),
             "net_profit": Decimal("0.900"),
             "net_return": Decimal("0.098901098901098901"),
+        },
+        "economics": {
+            "gross_investment": Decimal("9.09"),
+            "gross_proceeds": Decimal("10"),
+            "fees": Decimal("0.01"),
+            "total_costs": Decimal("9.10"),
+            "net_profit": Decimal("0.900"),
+            "net_return": Decimal("0.098901098901098901"),
+            "costs": [
+                {
+                    "id": "cost-1",
+                    "kind": "TRADING_FEE",
+                    "leg_id": "leg-1",
+                    "amount": Decimal("0.01"),
+                }
+            ],
         },
         "events": [{"id": "event-1", "metadata": {"title": "天气 ☀"}}],
         "markets": [
@@ -56,7 +82,11 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
                 "id": "set-1",
                 "version": 3,
                 "status": "active",
-                "metadata": {"auditor": "alice"},
+                "metadata": {"auditor": "alice", "audited": True},
+                "provenance": {
+                    "source": "rules/example-implication.yaml",
+                    "content_hash": "sha256:abc123",
+                },
             },
             "relations": [{"id": "rel-1", "kind": "BINARY_COMPLETE"}],
             "states": [{"id": "yes", "label": "YES"}, {"id": "no", "label": "NO"}],
@@ -184,9 +214,22 @@ async def test_exact_duplicate_is_idempotent_but_conflict_fails():
         assert await store.save(evidence) is True
         assert await store.save(evidence) is False
         changed = bundle()
-        changed["opportunity"]["net_profit"] = Decimal("0.91")
+        changed["producer"]["metadata"]["build"] = "different"
         with pytest.raises(EvidenceConflictError):
             await store.save(EvidenceBundle.from_mapping(changed))
+
+
+@pytest.mark.asyncio
+async def test_explicit_lifecycle_is_idempotent_and_closed_operations_fail():
+    store = OpportunityStore(":memory:")
+    with pytest.raises(RuntimeError, match="not open"):
+        await store.list_runs()
+    assert await store.open() is store
+    assert await store.initialize() is store
+    await store.close()
+    await store.close()
+    with pytest.raises(RuntimeError, match="not open"):
+        await store.replay("bundle-1")
 
 
 @pytest.mark.asyncio
@@ -235,4 +278,79 @@ def test_malformed_evidence_is_rejected(mutate, expected):
     value = bundle()
     mutate(value)
     with pytest.raises(expected):
+        EvidenceBundle.from_mapping(value)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["legs"].clear(),
+        lambda value: value["actions"].clear(),
+        lambda value: value["books"].clear(),
+        lambda value: value["fee_schedules"].clear(),
+        lambda value: value["latency_metrics"].clear(),
+        lambda value: value["books"][0]["levels"].clear(),
+        lambda value: value["books"][0]["epoch"].__setitem__("token_id", "no-1"),
+        lambda value: value["fee_schedules"][0].__setitem__("token_id", "no-1"),
+    ],
+)
+def test_executable_evidence_requires_complete_per_leg_market_data(mutate):
+    value = bundle()
+    mutate(value)
+    with pytest.raises(ValueError):
+        EvidenceBundle.from_mapping(value)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["books"][0]["levels"][0].__setitem__(
+            "price", Decimal("-0.1")
+        ),
+        lambda value: value["books"][0]["levels"][0].__setitem__(
+            "size", Decimal("-1")
+        ),
+        lambda value: value["legs"][0].__setitem__("quantity", Decimal("-1")),
+        lambda value: value["economics"].__setitem__(
+            "gross_investment", Decimal("-1")
+        ),
+        lambda value: value["economics"]["costs"][0].__setitem__(
+            "amount", Decimal("-1")
+        ),
+        lambda value: value["fee_schedules"][0].__setitem__("rate", Decimal("1.1")),
+    ],
+)
+def test_invalid_numeric_domains_are_rejected(mutate):
+    value = bundle()
+    mutate(value)
+    with pytest.raises(ValueError):
+        EvidenceBundle.from_mapping(value)
+
+
+def test_scalar_audit_metadata_is_rejected():
+    value = bundle()
+    value["relation"]["set"]["metadata"] = "audited"
+    with pytest.raises(TypeError):
+        EvidenceBundle.from_mapping(value)
+
+
+def test_missing_audit_provenance_is_rejected():
+    value = bundle()
+    value["relation"]["set"].pop("provenance")
+    with pytest.raises(KeyError):
+        EvidenceBundle.from_mapping(value)
+
+
+def test_opportunity_and_risk_status_must_match():
+    value = bundle()
+    value["risk"]["status"] = "REJECTED"
+    with pytest.raises(ValueError, match="status"):
+        EvidenceBundle.from_mapping(value)
+
+
+def test_non_executable_status_must_not_contain_notifications():
+    value = bundle()
+    value["opportunity"]["status"] = "RESEARCH_CANDIDATE"
+    value["risk"]["status"] = "RESEARCH_CANDIDATE"
+    with pytest.raises(ValueError, match="notification"):
         EvidenceBundle.from_mapping(value)
