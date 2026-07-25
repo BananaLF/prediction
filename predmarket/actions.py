@@ -3,6 +3,7 @@ from decimal import Decimal
 from enum import Enum
 
 from predmarket.domain import PathKind, Side
+from predmarket.relations import Relation, RelationStatus
 
 
 class ActionKind(str, Enum):
@@ -97,4 +98,59 @@ def binary_overpriced_path(yes_token_id: str, no_token_id: str) -> ActionPath:
             Action(ActionKind.SELL, yes_token_id, Side.SELL),
             Action(ActionKind.SELL, no_token_id, Side.SELL),
         ),
+    )
+
+
+def _audited_active_relation(relation: Relation) -> None:
+    if not isinstance(relation, Relation):
+        raise TypeError("relation must be a Relation")
+    if relation.status is not RelationStatus.ACTIVE:
+        raise ValueError("relation must be active")
+    if relation.semantic_review is None:
+        raise ValueError("active relation must have a semantic review")
+    if relation.minimum_units_received() < 1:
+        raise ValueError("relation must guarantee minimum coverage")
+
+
+def implication_path(relation: Relation) -> ActionPath:
+    _audited_active_relation(relation)
+    buys = tuple(
+        Action(
+            ActionKind.BUY,
+            leg.token_id,
+            Side.BUY,
+            Decimal(leg.weight),
+        )
+        for leg in relation.legs
+    )
+    return ActionPath(
+        relation.relation_id,
+        PathKind.HOLD_TO_RESOLUTION,
+        buys + (Action(ActionKind.REDEEM),),
+    )
+
+
+def neg_risk_complete_set_path(
+    tokens: tuple[str, ...], conversion_enabled: bool
+) -> ActionPath:
+    if conversion_enabled is not True:
+        raise ValueError("conversion_enabled must be exactly True")
+    if not isinstance(tokens, tuple):
+        raise TypeError("tokens must be a tuple")
+    if len(tokens) < 2:
+        raise ValueError("at least two token IDs are required")
+    if any(not isinstance(token, str) for token in tokens):
+        raise TypeError("token IDs must be strings")
+    if any(not token for token in tokens):
+        raise ValueError("token IDs must be non-empty")
+    if len(set(tokens)) != len(tokens):
+        raise ValueError("token IDs must be unique")
+    buys = tuple(
+        Action(ActionKind.BUY, token, Side.BUY)
+        for token in tokens
+    )
+    return ActionPath(
+        "neg-risk-complete-set",
+        PathKind.IMMEDIATE_CONVERSION,
+        buys + (Action(ActionKind.NEG_RISK_CONVERT),),
     )
