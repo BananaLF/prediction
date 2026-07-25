@@ -200,6 +200,19 @@ def test_optimizer_propagates_unsupported_action_errors(
         )
 
 
+@pytest.mark.parametrize(
+    "kind", [ActionKind.REDEEM, ActionKind.NEG_RISK_CONVERT]
+)
+def test_optimizer_rejects_action_only_unsupported_paths(kind: ActionKind) -> None:
+    path = ActionPath(
+        f"unsupported-{kind.value}",
+        PathKind.IMMEDIATE_CONVERSION,
+        (Action(kind),),
+    )
+    with pytest.raises(ValueError, match="unsupported"):
+        optimize_quantities(path, {}, {}, D("0"), D("0"), D("1000"))
+
+
 @pytest.mark.parametrize("bankroll", [D("0"), D("-1"), D("NaN"), D("Infinity")])
 def test_optimizer_rejects_invalid_bankroll(
     bankroll: Decimal, books: dict[str, OrderBook]

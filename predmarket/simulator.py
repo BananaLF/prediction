@@ -65,6 +65,21 @@ def _requirements(path: ActionPath) -> set[str]:
     }
 
 
+def _validate_supported_actions(path: ActionPath) -> None:
+    supported = {
+        ActionKind.BUY,
+        ActionKind.SELL,
+        ActionKind.SPLIT,
+        ActionKind.MERGE,
+    }
+    unsupported = tuple(
+        action.kind for action in path.actions if action.kind not in supported
+    )
+    if unsupported:
+        names = ", ".join(kind.value for kind in unsupported)
+        raise ValueError(f"unsupported simulation action(s): {names}")
+
+
 def _validate_inputs(
     path: ActionPath,
     books: Mapping[str, OrderBook],
@@ -72,6 +87,7 @@ def _validate_inputs(
 ) -> None:
     if not isinstance(path, ActionPath):
         raise TypeError("path must be an ActionPath")
+    _validate_supported_actions(path)
     required = _requirements(path)
     if set(books) != required:
         raise ValueError("books must cover trading tokens exactly")
@@ -132,8 +148,6 @@ def simulate_path(
             cash -= action_quantity + conversion_cost
         elif action.kind is ActionKind.MERGE:
             cash += action_quantity - conversion_cost
-        else:
-            raise ValueError(f"unsupported simulation action: {action.kind.value}")
         maximum_deficit = max(maximum_deficit, -cash)
 
     buffer_cost = trading_notional * safety_buffer
