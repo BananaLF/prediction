@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -31,7 +32,7 @@ class Clock:
         return self.mono
 
 
-def scanner(*, capacity: int = 4, callback=None) -> MarketWebSocket:
+def scanner(*, capacity: int = 4, callback=None, **kwargs) -> MarketWebSocket:
     clock = Clock()
     return MarketWebSocket(
         {"yes": "condition", "no": "condition"},
@@ -39,6 +40,7 @@ def scanner(*, capacity: int = 4, callback=None) -> MarketWebSocket:
         wall_clock_ms=clock.wall_ms,
         monotonic=clock.monotonic,
         candidate_callback=callback,
+        **kwargs,
     )
 
 
@@ -80,7 +82,7 @@ async def test_delta_before_snapshot_is_ignored() -> None:
 
 
 @pytest.mark.asyncio
-async def test_malformed_known_token_invalidates_atomically_and_unknown_is_dropped() -> None:
+async def test_malformed_known_token_invalidates_atomically_and_unknown_fails_closed() -> None:
     ws = scanner()
     await ws.ingest(fixture("ws_book_yes.json"))
     await ws.process_one()
@@ -99,6 +101,7 @@ async def test_malformed_known_token_invalidates_atomically_and_unknown_is_dropp
     await ws.process_one()
     assert "stranger" not in ws.epochs
     assert ws.metrics().unknown == 1
+    assert all(epoch.state is EpochState.RESYNC for epoch in ws.epochs.values())
 
 
 @pytest.mark.asyncio
@@ -165,6 +168,16 @@ async def test_callback_failure_isolated_and_batch_messages_supported() -> None:
 
 
 @pytest.mark.asyncio
+async def test_received_payload_is_recursively_immutable() -> None:
+    ws = scanner()
+    await ws.ingest(fixture("ws_book_yes.json"))
+    received = await ws.process_one()
+    assert isinstance(received.payload, MappingProxyType)
+    with pytest.raises(TypeError):
+        received.payload["bids"][0]["size"] = "999"
+
+
+@pytest.mark.asyncio
 async def test_timestamp_regression_and_resolution_fail_closed() -> None:
     ws = scanner()
     await ws.ingest(fixture("ws_book_yes.json"))
@@ -199,13 +212,23 @@ class Connection:
         self.closed = True
 
 
+class ControlledSleeper:
+    def __init__(self) -> None:
+        self.calls = asyncio.Queue()
+        self.releases = asyncio.Queue()
+
+    async def __call__(self, delay):
+        await self.calls.put(delay)
+        await self.releases.get()
+
+
 @pytest.mark.asyncio
 async def test_connection_sends_public_subscription_and_literal_heartbeat() -> None:
     ws = scanner()
     connection = Connection(["PONG", fixture("ws_book_yes.json")])
-    await ws.serve_connection(connection, max_messages=2, heartbeat_every=1)
+    await ws.serve_connection(connection, max_messages=2)
     assert json.loads(connection.sent[0]) == ws.subscription_payload()
-    assert connection.sent[1:] == ["PING", "PING"]
+    assert connection.sent[1:] == []
     assert connection.closed is True
     assert ws.metrics().heartbeats == 1
     assert ws.epochs["yes"].state is EpochState.RESYNC
@@ -245,6 +268,77 @@ async def test_bounded_reconnect_backoff_is_deterministic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_idle_time_based_heartbeat_timeout_closes_and_invalidates() -> None:
+    sleeper = ControlledSleeper()
+    ws = scanner(
+        sleeper=sleeper,
+        heartbeat_interval_seconds=10,
+        heartbeat_timeout_seconds=3,
+    )
+    connection = Connection()
+    connection.recv = lambda: asyncio.Future()
+    task = asyncio.create_task(ws.serve_connection(connection))
+    assert await sleeper.calls.get() == 10
+    await sleeper.releases.put(None)
+    await asyncio.sleep(0)
+    assert connection.sent[-1] == "PING"
+    assert await sleeper.calls.get() == 3
+    await sleeper.releases.put(None)
+    await asyncio.wait_for(task, timeout=1)
+    assert connection.closed is True
+    assert all(epoch.state is EpochState.RESYNC for epoch in ws.epochs.values())
+
+
+@pytest.mark.asyncio
+async def test_slow_callback_does_not_block_receiver_and_overflow_forces_resync() -> None:
+    callback_started = asyncio.Event()
+    callback_release = asyncio.Event()
+
+    async def callback(*_):
+        callback_started.set()
+        await callback_release.wait()
+
+    class QueuedConnection(Connection):
+        def __init__(self):
+            super().__init__()
+            self.incoming = asyncio.Queue()
+
+        async def recv(self):
+            value = await self.incoming.get()
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    async def never_sleep(_):
+        await asyncio.Future()
+
+    ws = scanner(
+        capacity=1,
+        callback=callback,
+        sleeper=never_sleep,
+        heartbeat_interval_seconds=10,
+        heartbeat_timeout_seconds=3,
+    )
+    connection = QueuedConnection()
+    task = asyncio.create_task(ws.serve_connection(connection))
+    await connection.incoming.put(fixture("ws_book_yes.json"))
+    while ws.epochs["yes"].state is not EpochState.LIVE:
+        await asyncio.sleep(0)
+    await connection.incoming.put(fixture("ws_book_no.json"))
+    await callback_started.wait()
+    await connection.incoming.put(fixture("ws_delta.json"))
+    await connection.incoming.put(fixture("ws_delta.json"))
+    while ws.metrics().dropped == 0:
+        await asyncio.sleep(0)
+    assert all(epoch.state is EpochState.RESYNC for epoch in ws.epochs.values())
+    callback_release.set()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert connection.closed is True
+
+
+@pytest.mark.asyncio
 async def test_unscoped_parse_corruption_invalidates_every_epoch() -> None:
     ws = scanner()
     for name in ("ws_book_yes.json", "ws_book_no.json"):
@@ -276,6 +370,64 @@ async def test_multi_change_event_is_atomic_for_condition_on_bad_second_change()
     with pytest.raises(WsProtocolError):
         await ws.process_one()
     assert {token: ws.depth(token) for token in ("yes", "no")} == before
+    assert all(epoch.state is EpochState.RESYNC for epoch in ws.epochs.values())
+
+
+@pytest.mark.asyncio
+async def test_multi_token_commit_triggers_once_and_never_exposes_mixed_version() -> None:
+    observations = []
+    ws = None
+
+    async def callback(*_):
+        observations.append((ws.epochs["yes"].snapshot_hash, ws.epochs["no"].snapshot_hash))
+
+    ws = scanner(callback=callback)
+    for name in ("ws_book_yes.json", "ws_book_no.json"):
+        await ws.ingest(fixture(name))
+        await ws.process_one()
+    observations.clear()
+    event = {
+        "event_type": "price_change",
+        "market": "condition",
+        "timestamp": "1002",
+        "hash": "event",
+        "price_changes": [
+            {"asset_id": "yes", "price": "0.47", "size": "2", "side": "SELL", "hash": "pair-h2"},
+            {"asset_id": "no", "price": "0.48", "size": "2", "side": "SELL", "hash": "pair-h2"},
+        ],
+    }
+    await ws.ingest(json.dumps(event))
+    await ws.process_one()
+    assert observations == [(("pair-h2"), ("pair-h2"))]
+
+
+@pytest.mark.asyncio
+async def test_delta_rejects_off_tick_or_crossed_book_without_mutation() -> None:
+    ws = scanner()
+    await ws.ingest(fixture("ws_book_yes.json"))
+    await ws.process_one()
+    before = ws.depth("yes")
+    event = json.loads(fixture("ws_delta.json"))
+    event["price_changes"] = [
+        {"asset_id": "yes", "price": "0.475", "size": "2", "side": "SELL", "hash": "h2"}
+    ]
+    await ws.ingest(json.dumps(event))
+    with pytest.raises(WsProtocolError):
+        await ws.process_one()
+    assert ws.depth("yes") == before
+    assert ws.epochs["yes"].state is EpochState.RESYNC
+
+
+@pytest.mark.asyncio
+async def test_unknown_event_type_invalidates_all_live_epochs() -> None:
+    ws = scanner()
+    for name in ("ws_book_yes.json", "ws_book_no.json"):
+        await ws.ingest(fixture(name))
+        await ws.process_one()
+    await ws.ingest(json.dumps({
+        "event_type": "mystery", "market": "condition", "timestamp": "1001"
+    }))
+    await ws.process_one()
     assert all(epoch.state is EpochState.RESYNC for epoch in ws.epochs.values())
 
 

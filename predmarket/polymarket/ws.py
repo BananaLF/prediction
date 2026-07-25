@@ -91,6 +91,14 @@ def _decimal(value: object, name: str, *, allow_zero: bool) -> Decimal:
     return number
 
 
+def _freeze(value: object) -> object:
+    if type(value) is dict:
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if type(value) is list:
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
 class MarketWebSocket:
     """Owns bounded ingestion and per-token epoch state for discovery."""
 
@@ -105,6 +113,9 @@ class MarketWebSocket:
             [tuple[str, ...], str], Awaitable[None] | None
         ]
         | None = None,
+        sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        heartbeat_interval_seconds: int | float = 10,
+        heartbeat_timeout_seconds: int | float = 3,
     ) -> None:
         if not isinstance(token_conditions, Mapping) or not token_conditions:
             raise ValueError("token_conditions must be a nonempty mapping")
@@ -123,6 +134,19 @@ class MarketWebSocket:
             raise TypeError("clocks must be callable")
         if candidate_callback is not None and not callable(candidate_callback):
             raise TypeError("candidate_callback must be callable")
+        if not callable(sleeper):
+            raise TypeError("sleeper must be callable")
+        for name, value in (
+            ("heartbeat_interval_seconds", heartbeat_interval_seconds),
+            ("heartbeat_timeout_seconds", heartbeat_timeout_seconds),
+        ):
+            if (
+                isinstance(value, bool)
+                or type(value) not in (int, float)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
 
         self._conditions = MappingProxyType(copied)
         self.epochs = {token: EpochBook(token) for token in copied}
@@ -131,8 +155,12 @@ class MarketWebSocket:
         self._wall_clock_ms = wall_clock_ms
         self._monotonic = monotonic
         self._callback = candidate_callback
+        self._sleeper = sleeper
+        self._heartbeat_interval_seconds = float(heartbeat_interval_seconds)
+        self._heartbeat_timeout_seconds = float(heartbeat_timeout_seconds)
         self._metrics = WsMetrics()
         self._trigger_keys: set[tuple[tuple[str, str | None], ...]] = set()
+        self._tick_sizes: dict[str, Decimal] = {}
 
     @property
     def queue_size(self) -> int:
@@ -209,7 +237,13 @@ class MarketWebSocket:
             try:
                 timestamp = _timestamp(payload.get("timestamp"))
             except WsProtocolError:
-                self._fail_scope(token_id, "malformed_timestamp")
+                self._metrics = replace(
+                    self._metrics, malformed=self._metrics.malformed + 1
+                )
+                if token_id in self.epochs:
+                    self._fail_scope(token_id, "malformed_timestamp")
+                else:
+                    self._invalidate_all("malformed_timestamp")
                 return False
             book_hash = payload.get("hash")
             if book_hash is not None and (type(book_hash) is not str or not book_hash):
@@ -218,7 +252,7 @@ class MarketWebSocket:
             messages.append(
                 ReceivedMessage(
                     raw=canonical,
-                    payload=MappingProxyType(dict(payload)),
+                    payload=_freeze(payload),
                     event_type=event_type,
                     token_id=token_id,
                     condition_id=condition_id,
@@ -282,11 +316,21 @@ class MarketWebSocket:
         elif message.event_type == "price_change":
             await self._changes(message)
         elif message.event_type == "tick_size_change":
-            self._fail_scope(message.token_id, "tick_size_change")
+            token = self._validate_scope(
+                message.payload.get("asset_id"), message.payload.get("market")
+            )
+            if token is not None:
+                self._fail_scope(token, "tick_size_change")
         elif message.event_type == "market_resolved":
             self._invalidate_condition(message.condition_id, "market_resolved")
         elif message.event_type in {"last_trade_price", "best_bid_ask", "new_market"}:
+            if "asset_id" in message.payload:
+                self._validate_scope(
+                    message.payload.get("asset_id"), message.payload.get("market")
+                )
             return
+        else:
+            self._invalidate_all("unknown_event_type")
 
     def _validate_scope(self, token: object, condition: object) -> str | None:
         if type(token) is not str or not token:
@@ -295,6 +339,7 @@ class MarketWebSocket:
             self._metrics = replace(
                 self._metrics, unknown=self._metrics.unknown + 1
             )
+            self._invalidate_all("unknown_token")
             return None
         if type(condition) is not str or condition != self._conditions[token]:
             raise WsProtocolError("condition_mismatch", token)
@@ -302,11 +347,11 @@ class MarketWebSocket:
 
     @staticmethod
     def _levels(value: object, side: str) -> tuple[tuple[str, str], ...]:
-        if type(value) is not list:
+        if type(value) not in (list, tuple):
             raise WsProtocolError(f"{side} levels must be a list")
         parsed: dict[Decimal, tuple[str, str]] = {}
         for level in value:
-            if type(level) is not dict:
+            if not isinstance(level, Mapping):
                 raise WsProtocolError("level must be an object")
             price = _decimal(level.get("price"), "price", allow_zero=False)
             size = _decimal(level.get("size"), "size", allow_zero=False)
@@ -334,6 +379,7 @@ class MarketWebSocket:
             raise WsProtocolError("crossed_book", token)
         if not self.epochs[token].replace_snapshot(message.book_hash, message.exchange_ts_ms):
             return
+        self._tick_sizes[token] = tick
         self._depth[token] = BookDepth(bids=bids, asks=asks)
         await self._maybe_trigger(self._conditions[token])
 
@@ -341,13 +387,13 @@ class MarketWebSocket:
         if type(message.condition_id) is not str:
             raise WsProtocolError("missing_condition")
         changes = message.payload.get("price_changes")
-        if type(changes) is not list or not changes:
+        if type(changes) not in (list, tuple) or not changes:
             raise WsProtocolError("price_changes must be a nonempty list")
         validated: list[tuple[str, str, str, str, str]] = []
         affected: set[str] = set()
         try:
             for change in changes:
-                if type(change) is not dict:
+                if not isinstance(change, Mapping):
                     raise WsProtocolError("change must be an object")
                 token = self._validate_scope(change.get("asset_id"), message.condition_id)
                 if token is None:
@@ -355,8 +401,16 @@ class MarketWebSocket:
                 affected.add(token)
                 price = change.get("price")
                 size = change.get("size")
-                _decimal(price, "price", allow_zero=False)
+                decimal_price = _decimal(price, "price", allow_zero=False)
                 _decimal(size, "size", allow_zero=True)
+                if decimal_price >= 1:
+                    raise WsProtocolError("price is out of range", token)
+                tick = self._tick_sizes.get(token)
+                if (
+                    self.epochs[token].state is EpochState.LIVE
+                    and (tick is None or decimal_price % tick)
+                ):
+                    raise WsProtocolError("price_not_tick_aligned", token)
                 side = change.get("side")
                 if side not in {"BUY", "SELL"} or type(side) is not str:
                     raise WsProtocolError("side must be BUY or SELL", token)
@@ -365,9 +419,22 @@ class MarketWebSocket:
                     raise WsProtocolError("missing_hash", token)
                 validated.append((token, str(price), str(size), side, change_hash))
         except WsProtocolError as error:
-            for token in affected:
-                self._fail_scope(token, error.reason)
+            self._invalidate_condition(message.condition_id, error.reason)
             raise
+
+        for token in affected:
+            hashes = {item[4] for item in validated if item[0] == token}
+            if len(hashes) != 1:
+                self._invalidate_condition(message.condition_id, "inconsistent_hash")
+                raise WsProtocolError("inconsistent_hash", token)
+            epoch_ts = self.epochs[token].exchange_ts_ms
+            if (
+                self.epochs[token].state is EpochState.LIVE
+                and epoch_ts is not None
+                and message.exchange_ts_ms < epoch_ts
+            ):
+                self._invalidate_condition(message.condition_id, "timestamp_regression")
+                return
 
         staged = {token: self._depth[token] for token in affected}
         for token, price, size, side, _ in validated:
@@ -388,6 +455,16 @@ class MarketWebSocket:
             )
 
         for token in affected:
+            depth = staged[token]
+            if (
+                depth.bids
+                and depth.asks
+                and Decimal(depth.bids[0][0]) >= Decimal(depth.asks[0][0])
+            ):
+                self._invalidate_condition(message.condition_id, "crossed_book")
+                raise WsProtocolError("crossed_book", token)
+
+        for token in affected:
             if self.epochs[token].state is not EpochState.LIVE:
                 continue
             token_changes = [item for item in validated if item[0] == token]
@@ -399,7 +476,12 @@ class MarketWebSocket:
                 continue
             self.epochs[token].replace_snapshot(new_hash, message.exchange_ts_ms)
             self._depth[token] = staged[token]
-            await self._maybe_trigger(self._conditions[token])
+        for condition in {
+            self._conditions[token]
+            for token in affected
+            if self.epochs[token].state is EpochState.LIVE
+        }:
+            await self._maybe_trigger(condition)
 
     async def _maybe_trigger(self, condition: str) -> None:
         tokens = tuple(sorted(token for token, value in self._conditions.items() if value == condition))
@@ -436,9 +518,14 @@ class MarketWebSocket:
         if type(condition) is not str:
             self._invalidate_all(reason)
             return
+        matched = False
         for token, expected in self._conditions.items():
             if expected == condition:
+                matched = True
                 self.epochs[token].invalidate(reason)
+        if not matched:
+            self._invalidate_all(reason)
+            return
         self._trigger_keys.clear()
 
     def _invalidate_all(self, reason: str) -> None:
@@ -470,20 +557,12 @@ class MarketWebSocket:
         connection: object,
         *,
         max_messages: int | None = None,
-        heartbeat_every: int = 10,
     ) -> None:
-        """Serve one already-open connection.
-
-        ``heartbeat_every`` is expressed in receive cycles so deterministic unit
-        tests need no real sleeps. Runtime wiring may schedule this once per ten
-        seconds. A connection is never allowed to retain LIVE epochs on exit.
-        """
+        """Serve one connection with independent receiver, processor and timer."""
         if max_messages is not None and (
             type(max_messages) is not int or max_messages <= 0
         ):
             raise ValueError("max_messages must be a positive integer or None")
-        if type(heartbeat_every) is not int or heartbeat_every <= 0:
-            raise ValueError("heartbeat_every must be positive")
         send = getattr(connection, "send", None)
         recv = getattr(connection, "recv", None)
         close = getattr(connection, "close", None)
@@ -493,22 +572,58 @@ class MarketWebSocket:
         subscription = json.dumps(
             self.subscription_payload(), separators=(",", ":"), sort_keys=True
         )
-        count = 0
-        try:
-            await send(subscription)
+        stop = asyncio.Event()
+
+        async def receive_messages() -> None:
+            count = 0
             while max_messages is None or count < max_messages:
-                if count % heartbeat_every == 0:
-                    await send("PING")
                 raw = await recv()
                 count += 1
-                if await self.ingest(raw):
-                    while self.queue_size:
-                        await self.process_one()
+                await self.ingest(raw)
+
+        async def process_messages() -> None:
+            while True:
+                await self.process_one()
+
+        async def heartbeat() -> None:
+            while not stop.is_set():
+                await self._sleeper(self._heartbeat_interval_seconds)
+                if stop.is_set():
+                    return
+                pong_count = self._metrics.heartbeats
+                await send("PING")
+                await self._sleeper(self._heartbeat_timeout_seconds)
+                if self._metrics.heartbeats == pong_count:
+                    raise TimeoutError("heartbeat_timeout")
+
+        tasks: set[asyncio.Task[None]] = set()
+        try:
+            await send(subscription)
+            receiver_task = asyncio.create_task(receive_messages())
+            processor_task = asyncio.create_task(process_messages())
+            heartbeat_task = asyncio.create_task(heartbeat())
+            tasks = {receiver_task, processor_task, heartbeat_task}
+            completed, _ = await asyncio.wait(
+                {receiver_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in completed:
+                error = task.exception()
+                if error is not None:
+                    raise error
+            if receiver_task.done():
+                await self._queue.join()
         except asyncio.CancelledError:
             raise
         except (EOFError, ConnectionError, TimeoutError):
             pass
         finally:
+            stop.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             try:
                 await close()
             finally:
