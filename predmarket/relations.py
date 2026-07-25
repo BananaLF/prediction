@@ -46,6 +46,15 @@ class Relation:
     states: tuple[RelationState, ...]
     semantic_review: SemanticReview | None
 
+    def minimum_units_received(self) -> int:
+        minimum = min(
+            sum(state.proceeds[leg.token_id] * leg.weight for leg in self.legs)
+            for state in self.states
+        )
+        if minimum < 0:
+            raise RelationValidationError("minimum units received cannot be negative")
+        return minimum
+
 
 def _mapping(value: object, field: str) -> dict[object, object]:
     if not isinstance(value, dict):
@@ -195,13 +204,3 @@ def load_relation(path: Path) -> Relation:
         states=tuple(states),
         semantic_review=semantic_review,
     )
-
-
-def minimum_units_received(relation: Relation) -> int:
-    minimum = min(
-        sum(state.proceeds[leg.token_id] * leg.weight for leg in relation.legs)
-        for state in relation.states
-    )
-    if minimum < 0:
-        raise RelationValidationError("minimum units received cannot be negative")
-    return minimum

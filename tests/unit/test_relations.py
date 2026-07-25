@@ -7,7 +7,6 @@ from predmarket.relations import (
     RelationStatus,
     RelationValidationError,
     load_relation,
-    minimum_units_received,
 )
 
 
@@ -54,7 +53,7 @@ def test_loads_audited_example_and_computes_minimum() -> None:
     assert relation.status is RelationStatus.ACTIVE
     assert len(relation.states) == 3
     assert [leg.weight for leg in relation.legs] == [1, 1]
-    assert minimum_units_received(relation) == 1
+    assert relation.minimum_units_received() == 1
     assert relation.semantic_review is not None
     assert relation.semantic_review.reviewer
 
