@@ -222,6 +222,25 @@ def test_simulator_rejects_nonconserving_binary_paths(
         )
 
 
+@pytest.mark.parametrize("entry_point", ["simulate", "optimize"])
+def test_binary_paths_require_immediate_conversion_kind(
+    entry_point: str, books: dict[str, OrderBook]
+) -> None:
+    immediate = binary_underpriced_path("yes", "no")
+    mislabeled = ActionPath(
+        "mislabeled", PathKind.HOLD_TO_RESOLUTION, immediate.actions
+    )
+    schedules = {"yes": fee(), "no": fee()}
+
+    with pytest.raises(ValueError, match="IMMEDIATE_CONVERSION"):
+        if entry_point == "simulate":
+            simulate_path(mislabeled, D("10"), books, schedules)
+        else:
+            optimize_quantities(
+                mislabeled, books, schedules, D("0"), D("0"), D("1000")
+            )
+
+
 def test_optimizer_uses_relevant_depth_breakpoints_and_bankroll(
     books: dict[str, OrderBook],
 ) -> None:

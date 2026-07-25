@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import Mapping
 
 from predmarket.actions import Action, ActionKind, ActionPath
-from predmarket.domain import Side
+from predmarket.domain import PathKind, Side
 from predmarket.fees import FeeSchedule
 from predmarket.orderbook import InsufficientDepth, OrderBook
 
@@ -84,6 +84,8 @@ def _validate_supported_actions(path: ActionPath) -> None:
 
 def _validate_binary_conservation(path: ActionPath) -> None:
     """Restrict Task 4 to its two inventory-conserving binary path families."""
+    if path.kind is not PathKind.IMMEDIATE_CONVERSION:
+        raise ValueError("binary paths must have kind IMMEDIATE_CONVERSION")
     kinds = tuple(action.kind for action in path.actions)
     underpriced = (ActionKind.BUY, ActionKind.BUY, ActionKind.MERGE)
     overpriced = (ActionKind.SPLIT, ActionKind.SELL, ActionKind.SELL)
