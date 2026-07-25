@@ -15,6 +15,10 @@ class DesktopNotificationError(RuntimeError):
     """A desktop notification was unsupported or failed."""
 
 
+class NotificationDeliveryError(RuntimeError):
+    """A notification sink failed without exposing its implementation error."""
+
+
 class NotificationSink(Protocol):
     async def notify(self, result: EngineResult) -> None: ...
 
@@ -41,7 +45,26 @@ class TerminalNotifier:
             "status": result.status.value,
             "opportunity": result.opportunity_id,
             "condition": _text(self._condition(result)),
+            "path": _text(result.path),
+            "stage": _text(result.stage),
+            "reason": _text(result.reason),
             "quantity": "" if result.quantity is None else format(result.quantity, "f"),
+            "gross_investment": (
+                "" if result.gross_investment is None
+                else format(result.gross_investment, "f")
+            ),
+            "minimum_proceeds": (
+                "" if result.minimum_proceeds is None
+                else format(result.minimum_proceeds, "f")
+            ),
+            "gross_proceeds": (
+                "" if result.gross_proceeds is None
+                else format(result.gross_proceeds, "f")
+            ),
+            "net_profit": (
+                "" if result.minimum_profit is None
+                else format(result.minimum_profit, "f")
+            ),
             "net_return": (
                 "" if result.minimum_return is None
                 else format(result.minimum_return, "f")
@@ -106,4 +129,9 @@ class NotificationRouter:
         if result.status is not OpportunityStatus.SNAPSHOT_EXECUTABLE:
             return
         if self.desktop is not None:
-            await self.desktop.notify(result)
+            try:
+                await self.desktop.notify(result)
+            except Exception as exc:
+                raise NotificationDeliveryError(
+                    f"desktop delivery failed: {type(exc).__name__}"
+                ) from exc

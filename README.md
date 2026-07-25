@@ -19,6 +19,11 @@ python -m venv .venv
 .venv/bin/predmarket --json report --limit 100
 ```
 
+`sync-markets` stores a versioned, content-hashed catalog snapshot in SQLite:
+normalized markets/events/tokens, lifecycle flags, fee provenance, diagnostics,
+and explicitly unaudited relation candidates. Repeated identical snapshots are
+idempotent; changed lifecycle data appends a new snapshot.
+
 A deterministic targeted confirmation can be requested when the exact
 condition and token IDs are already known:
 
@@ -44,6 +49,12 @@ ID/version:
 .venv/bin/predmarket relations list
 ```
 
+Imported rules are loaded by `scan-once` and `watch` using exact token IDs
+(`--relation-id` resolves ambiguity). Only a strict audited binary complete-set
+definition can enter the binary simulator. Logical, same-event, and NegRisk
+rules are retained and reported as `RESEARCH_ONLY`; the program does not
+silently reinterpret them as executable binary arbitrage.
+
 ## Architecture and evidence
 
 The pipeline is:
@@ -61,7 +72,9 @@ mathematics may be interesting but unresolved risk prevents an executable
 classification. `SNAPSHOT_EXECUTABLE` means all modeled gates passed for the
 captured REST snapshots; it is not a promise that a real trade can be filled.
 
-`replay OPPORTUNITY_ID` returns immutable core evidence separately from the
+`replay OPPORTUNITY_ID` returns the latest opportunity by evaluation time and
+insertion order; `replay --bundle-id BUNDLE_ID` selects exact evidence. Both
+return immutable core evidence separately from the
 notification audit. `report` produces bounded status/reason/path counts,
 executable economics, nearest-rank p50/p95/p99 latency, and delivery outcomes.
 For empty latency samples all quantiles are `null`; for one sample all three
@@ -81,6 +94,8 @@ equal that sample.
 - Desktop delivery can fail or be uncertain; SQLite evidence remains the source
   of truth.
 - No 24-hour soak test or seven-day observation is claimed by this repository.
+- One composition root owns a single credential-free HTTP client shared by all
+  public adapters and closes it once; no credential environment is trusted.
 
 The program is a measurement and evidence tool, not financial advice and not a
 guaranteed-profit system.

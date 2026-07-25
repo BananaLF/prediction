@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from contextlib import AsyncExitStack
 import hashlib
 import os
@@ -23,6 +23,7 @@ from predmarket.engine import (
 from predmarket.notifier import MacOSNotifier, NotificationRouter, TerminalNotifier
 from predmarket.polymarket.clob import ClobRestClient
 from predmarket.polymarket.gamma import GammaClient, GammaDiscovery, MarketMetadata
+from predmarket.runtime import Runtime
 from predmarket.relations import (
     Relation,
     RelationLeg,
@@ -86,6 +87,25 @@ class RelationRegistry:
             return []
         return [relation_payload(path) for path in sorted(self.path.glob("*.yaml"))]
 
+    def match(
+        self, token_ids: tuple[str, ...], *, relation_id: str | None = None
+    ) -> Relation | None:
+        if type(token_ids) is not tuple or not token_ids:
+            raise TypeError("token_ids must be a nonempty tuple")
+        matches: list[Relation] = []
+        if self.path.exists():
+            for path in sorted(self.path.glob("*.yaml")):
+                relation = load_relation(path)
+                if relation_id is not None and relation.relation_id != relation_id:
+                    continue
+                if {leg.token_id for leg in relation.legs} == set(token_ids):
+                    matches.append(relation)
+        if len(matches) > 1:
+            raise RelationValidationError(
+                "multiple audited relation versions match; select --relation-id"
+            )
+        return matches[0] if matches else None
+
 
 def binary_market_from_metadata(market: MarketMetadata) -> BinaryMarket:
     if not isinstance(market, MarketMetadata):
@@ -97,7 +117,7 @@ def binary_market_from_metadata(market: MarketMetadata) -> BinaryMarket:
         relation_id=f"binary:{market.condition_id}",
         version=1,
         status=RelationStatus.ACTIVE,
-        source_rules_hash=f"gamma:{market.condition_id}",
+        source_rules_hash="builtin:binary-complete:v1",
         legs=(RelationLeg(yes, 1), RelationLeg(no, 1)),
         states=(
             RelationState("YES", MappingProxyType({yes: 1, no: 0})),
@@ -124,10 +144,70 @@ def binary_market_from_metadata(market: MarketMetadata) -> BinaryMarket:
     )
 
 
+def catalog_snapshot(discovery: GammaDiscovery, fetched_at_ms: int) -> dict[str, object]:
+    markets = []
+    relation_candidates = []
+    for item in discovery.markets:
+        event_ids = [event.event_id for event in item.events]
+        markets.append({
+            "id": item.market_id,
+            "condition_id": item.condition_id,
+            "event_ids": event_ids,
+            "question": item.question,
+            "tokens": [
+                {"id": token.token_id, "outcome": token.outcome}
+                for token in item.tokens
+            ],
+            "active": item.active,
+            "closed": item.closed,
+            "archived": item.archived,
+            "tradeable": item.is_tradeable,
+            "neg_risk": item.neg_risk,
+            "fee_provenance": {
+                "field": item.fee_schedule_source,
+                "raw_json": item.fee_schedule_source_json,
+            },
+            "raw_json": item.source_metadata_json,
+        })
+        relation_candidates.append({
+            "id": f"candidate:binary:{item.condition_id}",
+            "kind": "BINARY_COMPLETE_SET",
+            "status": "RESEARCH_UNAUDITED",
+            "condition_ids": [item.condition_id],
+            "event_ids": event_ids,
+        })
+        if item.neg_risk:
+            relation_candidates.append({
+                "id": f"candidate:neg-risk:{item.condition_id}",
+                "kind": "NEG_RISK",
+                "status": "RESEARCH_UNAUDITED",
+                "condition_ids": [item.condition_id],
+                "event_ids": event_ids,
+            })
+    by_event: dict[str, list[str]] = {}
+    for item in discovery.markets:
+        for event in item.events:
+            by_event.setdefault(event.event_id, []).append(item.condition_id)
+    for event_id, conditions in sorted(by_event.items()):
+        if len(conditions) > 1:
+            relation_candidates.append({
+                "id": f"candidate:same-event:{event_id}",
+                "kind": "SAME_EVENT_LOGICAL",
+                "status": "RESEARCH_UNAUDITED",
+                "condition_ids": sorted(conditions),
+                "event_ids": [event_id],
+            })
+    return {
+        "fetched_at_ms": fetched_at_ms,
+        "markets": markets,
+        "diagnostics": [asdict(item) for item in discovery.diagnostics],
+        "relation_candidates": relation_candidates,
+    }
 async def scan_catalog(
     discovery: GammaDiscovery,
     *,
     engine_factory,
+    relation_resolver=None,
 ) -> dict[str, object]:
     if not isinstance(discovery, GammaDiscovery):
         raise TypeError("discovery must be GammaDiscovery")
@@ -139,6 +219,8 @@ async def scan_catalog(
             continue
         try:
             market = binary_market_from_metadata(metadata)
+            if relation_resolver is not None:
+                market = relation_resolver(market)
             results.append(await engine_factory(market).scan_binary(market))
         except asyncio.CancelledError:
             raise
@@ -207,14 +289,33 @@ async def _scan_runtime(args: Any, settings: Any) -> dict[str, object]:
     from predmarket.storage import OpportunityStore
 
     async with AsyncExitStack() as stack:
-        gamma = await stack.enter_async_context(GammaClient())
-        discovery_clob = await stack.enter_async_context(ClobRestClient())
-        confirmation_clob = await stack.enter_async_context(ClobRestClient())
-        fee_clob = await stack.enter_async_context(ClobRestClient())
+        runtime = await stack.enter_async_context(Runtime())
+        gamma = runtime.gamma
+        discovery_clob = runtime.discovery_clob
+        confirmation_clob = runtime.confirmation_clob
+        fee_clob = runtime.fee_clob
         store = await stack.enter_async_context(OpportunityStore(settings.database_path))
         terminal = TerminalNotifier()
         desktop = MacOSNotifier(platform=sys.platform)
         notifier = NotificationRouter(terminal, desktop)
+        registry = RelationRegistry(args.rules_dir)
+
+        def resolve_relation(market: BinaryMarket) -> BinaryMarket:
+            matched = registry.match(
+                market.token_ids, relation_id=args.relation_id
+            )
+            if matched is None:
+                if args.relation_id is not None:
+                    raise RelationValidationError(
+                        "selected relation does not match this market"
+                    )
+                return market
+            # Generic logical/NegRisk execution is intentionally unsupported.
+            # Only a strict two-state binary complete-set relation may replace
+            # the audited built-in binary definition.
+            if len(matched.states) != 2:
+                return market
+            return replace(market, relation=matched)
 
         def engine_for(_market: BinaryMarket) -> StructuralArbitrageEngine:
             return StructuralArbitrageEngine(
@@ -240,6 +341,7 @@ async def _scan_runtime(args: Any, settings: Any) -> dict[str, object]:
                     "--condition, --yes-token, and --no-token must be supplied together"
                 )
             market = targeted_binary_market(*explicit)
+            market = resolve_relation(market)
             result = await engine_for(market).scan_binary(market)
             return {"evaluated": 1, "skipped": 0, "failed": 0,
                     "results": [_result_payload(result)], "diagnostics": []}
@@ -248,7 +350,15 @@ async def _scan_runtime(args: Any, settings: Any) -> dict[str, object]:
             max_pages=max(1, (args.limit + 99) // 100),
             max_markets=args.limit,
         )
-        summary = await scan_catalog(discovery, engine_factory=engine_for)
+        summary = await scan_catalog(
+            discovery, engine_factory=engine_for,
+            relation_resolver=resolve_relation,
+        )
+        summary["research_relations"] = [
+            item for item in registry.list()
+            if item["relation_id"] == args.relation_id
+            or args.relation_id is None
+        ]
         summary["results"] = [_result_payload(item) for item in summary["results"]]
         return summary
 
@@ -256,29 +366,67 @@ async def _scan_runtime(args: Any, settings: Any) -> dict[str, object]:
 async def _watch_runtime(args: Any, settings: Any) -> dict[str, object]:
     """Bounded public-WS discovery whose callback always reconfirms by REST."""
     import websockets
-    from predmarket.polymarket.ws import MARKET_CHANNEL_URL, MarketWebSocket
+    from predmarket.polymarket.ws import (
+        MARKET_CHANNEL_URL, BookMetadata, MarketWebSocket,
+    )
     from predmarket.storage import OpportunityStore
 
     async with AsyncExitStack() as stack:
-        gamma = await stack.enter_async_context(GammaClient())
-        discovery_clob = await stack.enter_async_context(ClobRestClient())
-        confirmation_clob = await stack.enter_async_context(ClobRestClient())
-        fee_clob = await stack.enter_async_context(ClobRestClient())
+        runtime = await stack.enter_async_context(Runtime())
+        gamma = runtime.gamma
+        discovery_clob = runtime.discovery_clob
+        confirmation_clob = runtime.confirmation_clob
+        fee_clob = runtime.fee_clob
         store = await stack.enter_async_context(OpportunityStore(settings.database_path))
         catalog = await gamma.active_markets(
             limit=100, max_pages=5, max_markets=500
         )
+        registry = RelationRegistry(args.rules_dir)
         markets = {
             item.condition_id: binary_market_from_metadata(item)
             for item in catalog.markets
             if item.is_tradeable and item.event is not None
         }
+        for condition, market in tuple(markets.items()):
+            matched = registry.match(
+                market.token_ids, relation_id=args.relation_id
+            )
+            if matched is not None and len(matched.states) == 2:
+                markets[condition] = replace(market, relation=matched)
         if not markets:
             return {"evaluated": 0, "markets": 0, "ws_metrics": None}
+        book_metadata: dict[str, BookMetadata] = {}
+        invalid_conditions: set[str] = set()
+        for condition, market in markets.items():
+            try:
+                info = await fee_clob.market_info(
+                    condition, expected_token_ids=market.token_ids
+                )
+                if info.tick_size is None or info.minimum_order_size is None:
+                    raise ValueError("market info lacks WS book metadata")
+                for token in market.token_ids:
+                    book_metadata[token] = BookMetadata(
+                        condition, info.tick_size, info.minimum_order_size
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                invalid_conditions.add(condition)
+        for condition in invalid_conditions:
+            markets.pop(condition)
+        if not markets:
+            return {
+                "evaluated": 0, "markets": 0, "ws_metrics": None,
+                "diagnostics": ["no markets with authoritative book metadata"],
+            }
         token_conditions = {
             token: condition
             for condition, market in markets.items()
             for token in market.token_ids
+        }
+        book_metadata = {
+            token: metadata for token, metadata in book_metadata.items()
+            if token in token_conditions
         }
         results: list[object] = []
         terminal = TerminalNotifier()
@@ -308,6 +456,7 @@ async def _watch_runtime(args: Any, settings: Any) -> dict[str, object]:
             wall_clock_ms=lambda: time.time_ns() // 1_000_000,
             monotonic=time.monotonic,
             candidate_callback=candidate,
+            book_metadata=book_metadata,
         )
         remaining = args.max_events
         for attempt in range(args.max_connections):
@@ -324,11 +473,26 @@ async def _watch_runtime(args: Any, settings: Any) -> dict[str, object]:
                 break
             if attempt + 1 < args.max_connections:
                 await asyncio.sleep(min(30, 2**attempt))
+        metrics = asdict(watcher.metrics())
+        metrics["processing_latencies_ms"] = [
+            str(value) for value in metrics["processing_latencies_ms"]
+        ]
+        watch_run_id = f"watch:{uuid.uuid4().hex}"
+        await store.save_watch_metrics(
+            watch_run_id, time.time_ns() // 1_000_000,
+            {
+                **metrics,
+                "epoch_states": {
+                    token: epoch.state.value
+                    for token, epoch in watcher.epochs.items()
+                },
+            },
+        )
         return {
             "evaluated": len(results),
             "markets": len(markets),
             "results": results,
-            "ws_metrics": asdict(watcher.metrics()),
+            "ws_metrics": metrics,
         }
 
 
@@ -349,12 +513,22 @@ async def dispatch(args: Any) -> object:
             return relation_payload(args.path)
         return {"imported": str(registry.import_file(args.path))}
     if args.command == "sync-markets":
-        async with GammaClient() as gamma:
-            discovery = await gamma.active_markets(
+        async with Runtime() as runtime:
+            discovery = await runtime.gamma.active_markets(
                 limit=args.limit, max_pages=args.max_pages,
                 max_markets=args.max_markets,
             )
+        snapshot = catalog_snapshot(
+            discovery, time.time_ns() // 1_000_000
+        )
+        snapshot["audited_relation_registry"] = [
+            {**item, "execution_support": "RESEARCH_ONLY"}
+            for item in RelationRegistry(args.rules_dir).list()
+        ]
+        async with OpportunityStore(settings.database_path) as store:
+            snapshot_id = await store.save_catalog_snapshot(snapshot)
         return {
+            "snapshot_id": snapshot_id,
             "markets": len(discovery.markets),
             "tradeable": sum(market.is_tradeable for market in discovery.markets),
             "diagnostics": [asdict(item) for item in discovery.diagnostics],
@@ -366,7 +540,15 @@ async def dispatch(args: Any) -> object:
     if args.command in {"replay", "report"}:
         async with OpportunityStore(settings.database_path) as store:
             if args.command == "replay":
-                audit = await store.replay_opportunity(args.opportunity_id)
+                if bool(args.opportunity_id) == bool(args.bundle_id):
+                    raise ValueError(
+                        "provide exactly one opportunity ID or --bundle-id"
+                    )
+                audit = (
+                    await store.replay_with_notification_audit(args.bundle_id)
+                    if args.bundle_id
+                    else await store.replay_opportunity(args.opportunity_id)
+                )
                 return {
                     "core_evidence": audit.evidence.data,
                     "notification_audit": {

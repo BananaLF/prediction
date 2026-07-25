@@ -198,6 +198,9 @@ class EngineResult:
     risk_reasons: tuple[str, ...]
     condition_id: str = "unknown"
     book_hashes: tuple[str, ...] = ()
+    path: str = "unknown"
+    gross_investment: Decimal | None = None
+    gross_proceeds: Decimal | None = None
 
     def __post_init__(self) -> None:
         _identifier("opportunity_id", self.opportunity_id)
@@ -216,7 +219,8 @@ class EngineResult:
                 raise TypeError(f"{name} must be bool")
         for name in (
             "quantity", "total_investment", "minimum_proceeds",
-            "minimum_profit", "minimum_return",
+            "minimum_profit", "minimum_return", "gross_investment",
+            "gross_proceeds",
         ):
             value = getattr(self, name)
             if value is not None and type(value) is not Decimal:
@@ -541,6 +545,9 @@ class StructuralArbitrageEngine:
                 confirmed[token].book.book_hash
                 for token in market.token_ids if token in confirmed
             ),
+            "IMMEDIATE_CONVERSION",
+            economics.gross if economics else None,
+            economics.proceeds if economics else None,
         )
         if status is OpportunityStatus.SNAPSHOT_EXECUTABLE and newly_persisted:
             assert economics is not None and fee_confirmation is not None

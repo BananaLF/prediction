@@ -38,16 +38,21 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--limit", type=_positive, default=100)
     sync.add_argument("--max-pages", type=_positive, default=10)
     sync.add_argument("--max-markets", type=_positive, default=1000)
+    sync.add_argument("--rules-dir", default="rules")
 
     scan = commands.add_parser("scan-once", help="confirm candidates with REST")
     scan.add_argument("--limit", type=_positive, default=100)
     scan.add_argument("--condition")
     scan.add_argument("--yes-token")
     scan.add_argument("--no-token")
+    scan.add_argument("--rules-dir", default="rules")
+    scan.add_argument("--relation-id")
 
     watch = commands.add_parser("watch", help="discover via public WebSocket")
     watch.add_argument("--max-connections", type=_positive, default=10)
     watch.add_argument("--max-events", type=_positive)
+    watch.add_argument("--rules-dir", default="rules")
+    watch.add_argument("--relation-id")
 
     relations = commands.add_parser("relations", help="manage audited rule files")
     relations.add_argument("--rules-dir", default="rules")
@@ -61,7 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     import_command.add_argument("path")
 
     replay = commands.add_parser("replay", help="replay immutable evidence")
-    replay.add_argument("opportunity_id")
+    replay.add_argument("opportunity_id", nargs="?")
+    replay.add_argument("--bundle-id")
     report = commands.add_parser("report", help="bounded evidence summary")
     report.add_argument("--limit", type=_positive, default=100)
     return parser

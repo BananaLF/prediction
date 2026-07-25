@@ -8,6 +8,7 @@ from predmarket.engine import EngineResult
 from predmarket.notifier import (
     DesktopNotificationError,
     MacOSNotifier,
+    NotificationDeliveryError,
     NotificationRouter,
     TerminalNotifier,
 )
@@ -66,3 +67,15 @@ async def test_router_always_audits_but_refuses_desktop_for_non_executable(capsy
     await router.notify(result(OpportunityStatus.REJECTED))
     assert desktop_calls == []
     assert "REJECTED" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_router_wraps_desktop_failure_after_terminal_audit(capsys):
+    class Desktop:
+        async def notify(self, value):
+            raise RuntimeError("secret subprocess detail")
+
+    with pytest.raises(NotificationDeliveryError) as error:
+        await NotificationRouter(TerminalNotifier(), Desktop()).notify(result())
+    assert "secret subprocess detail" not in str(error.value)
+    assert "SNAPSHOT_EXECUTABLE" in capsys.readouterr().out

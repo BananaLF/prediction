@@ -17,6 +17,8 @@ from predmarket.polymarket.gamma import (
 )
 from predmarket.relations import RelationValidationError
 from predmarket.storage import OpportunityStore
+from predmarket.runtime import Runtime
+import httpx
 
 
 def test_help_states_read_only_and_return_semantics(capsys):
@@ -104,6 +106,17 @@ def test_relation_payload_retains_audited_identity(tmp_path):
     assert payload["audited"] is True
 
 
+def test_registry_matching_relation_is_loaded_by_exact_tokens(tmp_path):
+    source = tmp_path / "source.yaml"
+    _relation(source)
+    registry = RelationRegistry(tmp_path / "rules")
+    registry.import_file(source)
+    matched = registry.match(("NO_A", "YES_B"), relation_id="implication-a-b")
+    assert matched is not None
+    assert matched.relation_id == "implication-a-b"
+    assert registry.match(("wrong", "tokens")) is None
+
+
 def market(*, tradeable=True):
     return MarketMetadata(
         market_id="market", condition_id="condition", question="Question?",
@@ -152,3 +165,47 @@ async def test_empty_report_has_defined_quantiles_and_bounds(tmp_path):
     with pytest.raises(ValueError):
         async with OpportunityStore(tmp_path / "evidence.sqlite3") as store:
             await store.report(limit=0)
+
+
+@pytest.mark.asyncio
+async def test_catalog_snapshot_is_idempotent_and_survives_reopen(tmp_path):
+    path = tmp_path / "catalog.sqlite3"
+    snapshot = {
+        "fetched_at_ms": 10,
+        "markets": [{"id": "m", "condition_id": "c", "event_ids": ["e"],
+                     "tokens": [{"id": "yes", "outcome": "YES"},
+                                {"id": "no", "outcome": "NO"}],
+                     "active": True, "tradeable": True, "neg_risk": False,
+                     "fee_provenance": {"source": "gamma"}, "raw_json": "{}"}],
+        "diagnostics": [],
+    }
+    async with OpportunityStore(path) as store:
+        first = await store.save_catalog_snapshot(snapshot)
+        assert await store.save_catalog_snapshot(snapshot) == first
+        later = {**snapshot, "fetched_at_ms": 99}
+        assert await store.save_catalog_snapshot(later) == first
+    async with OpportunityStore(path) as store:
+        records = await store.list_catalog_snapshots(limit=10)
+    assert records[0]["id"] == first
+    assert records[0]["markets"][0]["condition_id"] == "c"
+
+
+@pytest.mark.asyncio
+async def test_runtime_shares_one_public_http_client_and_closes_once(tmp_path):
+    transport = httpx.MockTransport(lambda request: httpx.Response(500))
+    runtime = Runtime(http_transport=transport)
+    async with runtime:
+        assert runtime.gamma.http is runtime.discovery_clob.http
+        assert runtime.discovery_clob.http is runtime.confirmation_clob.http
+        assert "authorization" not in runtime.http.headers
+    assert runtime.http.is_closed
+
+
+@pytest.mark.asyncio
+async def test_store_query_limits_reject_bool_and_cap(tmp_path):
+    async with OpportunityStore(tmp_path / "bounded.sqlite3") as store:
+        assert await store.list_opportunities(limit=1) == []
+        assert await store.list_runs(limit=1) == []
+        for value in (True, 0, 10_001):
+            with pytest.raises(ValueError):
+                await store.list_opportunities(limit=value)

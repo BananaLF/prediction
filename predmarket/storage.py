@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -18,13 +19,20 @@ from predmarket.exact_math import decimal_ratio
 from predmarket.risk import RiskInputs, assess_risk, worst_partial_fill
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+EVIDENCE_SCHEMA_VERSION = 2
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OPPORTUNITY_STATUSES = {
     "REJECTED",
     "RESEARCH_CANDIDATE",
     "SNAPSHOT_EXECUTABLE",
 }
+
+
+def _query_limit(value: object) -> int:
+    if type(value) is not int or not 1 <= value <= 10_000:
+        raise ValueError("limit must be an integer in 1..10000")
+    return value
 class EvidenceConflictError(ValueError):
     """An immutable evidence identifier already exists with different content."""
 
@@ -262,7 +270,7 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
     )
     if type(raw["version"]) is not int:
         raise TypeError("version must be an integer")
-    if raw["version"] != SCHEMA_VERSION:
+    if raw["version"] != EVIDENCE_SCHEMA_VERSION:
         raise ValueError(f"unsupported evidence version: {raw['version']!r}")
     _identifier("id", raw["id"])
 
@@ -1066,6 +1074,53 @@ CREATE TABLE IF NOT EXISTS notification_events (
     occurred_at_ms INTEGER NOT NULL,
     detail TEXT
 );
+CREATE TABLE IF NOT EXISTS catalog_snapshots (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    content_hash TEXT NOT NULL UNIQUE,
+    fetched_at_ms INTEGER NOT NULL,
+    canonical_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS catalog_markets (
+    snapshot_id TEXT NOT NULL REFERENCES catalog_snapshots(id),
+    market_id TEXT NOT NULL,
+    condition_id TEXT NOT NULL,
+    canonical_json TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id, market_id)
+);
+CREATE TABLE IF NOT EXISTS catalog_events (
+    snapshot_id TEXT NOT NULL REFERENCES catalog_snapshots(id),
+    event_id TEXT NOT NULL,
+    canonical_json TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id, event_id)
+);
+CREATE TABLE IF NOT EXISTS catalog_tokens (
+    snapshot_id TEXT NOT NULL REFERENCES catalog_snapshots(id),
+    token_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    canonical_json TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id, token_id)
+);
+CREATE TABLE IF NOT EXISTS catalog_diagnostics (
+    snapshot_id TEXT NOT NULL REFERENCES catalog_snapshots(id),
+    position INTEGER NOT NULL,
+    canonical_json TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id, position)
+);
+CREATE TABLE IF NOT EXISTS catalog_relation_candidates (
+    snapshot_id TEXT NOT NULL REFERENCES catalog_snapshots(id),
+    relation_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('RESEARCH_UNAUDITED', 'RESEARCH_ONLY')),
+    canonical_json TEXT NOT NULL,
+    PRIMARY KEY(snapshot_id, relation_id)
+);
+CREATE TABLE IF NOT EXISTS watch_runs (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    started_at_ms INTEGER NOT NULL,
+    canonical_json TEXT NOT NULL
+);
 """
 
 
@@ -1286,20 +1341,23 @@ class OpportunityStore:
                 raise
 
     async def list_notification_attempts(
-        self, fingerprint: str | None = None
+        self, fingerprint: str | None = None, *, limit: int = 100
     ) -> list[tuple[str, str, str, int, str | None]]:
+        _query_limit(limit)
         connection = self._require_connection()
         if fingerprint is None:
             rows = await connection.execute_fetchall(
                 """SELECT fingerprint, bundle_id, status, attempted_at_ms, error
-                   FROM notification_attempts ORDER BY id"""
+                   FROM notification_attempts ORDER BY id DESC LIMIT ?""",
+                (limit,),
             )
         else:
             _identifier("notification fingerprint", fingerprint)
             rows = await connection.execute_fetchall(
                 """SELECT fingerprint, bundle_id, status, attempted_at_ms, error
-                   FROM notification_attempts WHERE fingerprint = ? ORDER BY id""",
-                (fingerprint,),
+                   FROM notification_attempts WHERE fingerprint = ?
+                   ORDER BY id DESC LIMIT ?""",
+                (fingerprint, limit),
             )
         return [
             (str(row[0]), str(row[1]), str(row[2]), int(row[3]),
@@ -1503,17 +1561,159 @@ class OpportunityStore:
     ) -> NotificationAuditReplay:
         _identifier("opportunity_id", opportunity_id)
         rows = await self._require_connection().execute_fetchall(
-            """SELECT bundle_id FROM opportunities WHERE id = ?
-               ORDER BY bundle_id DESC LIMIT 2""",
+            """SELECT o.bundle_id FROM opportunities o
+               JOIN runs r ON r.bundle_id = o.bundle_id AND r.id = o.run_id
+               WHERE o.id = ?
+               ORDER BY r.started_at_ms DESC, o.rowid DESC LIMIT 1""",
             (opportunity_id,),
         )
         if not rows:
             raise KeyError(opportunity_id)
         return await self.replay_with_notification_audit(str(rows[0][0]))
 
-    async def list_opportunities(self) -> list[tuple[str, str, str]]:
+    async def save_catalog_snapshot(self, snapshot: Mapping[str, object]) -> str:
+        if not isinstance(snapshot, Mapping):
+            raise TypeError("snapshot must be a mapping")
+        data = dict(snapshot)
+        _required(data, "fetched_at_ms", "markets", "diagnostics")
+        _integer("fetched_at_ms", data["fetched_at_ms"])
+        _sequence("markets", data["markets"])
+        _sequence("diagnostics", data["diagnostics"])
+        canonical = _json(data)
+        content = {key: value for key, value in data.items() if key != "fetched_at_ms"}
+        digest = hashlib.sha256(_json(content).encode("utf-8")).hexdigest()
+        snapshot_id = f"catalog:{digest}"
+        connection = self._require_connection()
+        async with self._write_lock:
+            cursor = await connection.execute(
+                """INSERT OR IGNORE INTO catalog_snapshots
+                   (id, content_hash, fetched_at_ms, canonical_json)
+                   VALUES (?, ?, ?, ?)""",
+                (snapshot_id, digest, data["fetched_at_ms"], canonical),
+            )
+            if cursor.rowcount:
+                for market in data["markets"]:
+                    record = _mapping("catalog market", market)
+                    market_id = _identifier("market_id", record["id"])
+                    condition_id = _identifier(
+                        "condition_id", record["condition_id"]
+                    )
+                    await connection.execute(
+                        "INSERT INTO catalog_markets VALUES (?, ?, ?, ?)",
+                        (snapshot_id, market_id, condition_id, _json(record)),
+                    )
+                    for event_id in _sequence(
+                        "event_ids", record.get("event_ids", [])
+                    ):
+                        event = _identifier("event_id", event_id)
+                        await connection.execute(
+                            """INSERT OR IGNORE INTO catalog_events
+                               VALUES (?, ?, ?)""",
+                            (snapshot_id, event, _json({"id": event})),
+                        )
+                    for token in _sequence("tokens", record["tokens"]):
+                        token_record = _mapping("catalog token", token)
+                        await connection.execute(
+                            "INSERT INTO catalog_tokens VALUES (?, ?, ?, ?, ?)",
+                            (
+                                snapshot_id,
+                                _identifier("token_id", token_record["id"]),
+                                market_id,
+                                str(token_record["outcome"]),
+                                _json(token_record),
+                            ),
+                        )
+                for position, diagnostic in enumerate(data["diagnostics"]):
+                    await connection.execute(
+                        "INSERT INTO catalog_diagnostics VALUES (?, ?, ?)",
+                        (snapshot_id, position, _json(diagnostic)),
+                    )
+                for relation in data.get("relation_candidates", []):
+                    relation_record = _mapping("relation candidate", relation)
+                    await connection.execute(
+                        """INSERT INTO catalog_relation_candidates
+                           VALUES (?, ?, ?, ?)""",
+                        (
+                            snapshot_id,
+                            _identifier("relation_id", relation_record["id"]),
+                            relation_record["status"],
+                            _json(relation_record),
+                        ),
+                    )
+                for relation in data.get("audited_relation_registry", []):
+                    relation_record = _mapping("audited relation", relation)
+                    await connection.execute(
+                        """INSERT OR IGNORE INTO catalog_relation_candidates
+                           VALUES (?, ?, 'RESEARCH_ONLY', ?)""",
+                        (
+                            snapshot_id,
+                            _identifier(
+                                "relation_id", relation_record["relation_id"]
+                            ),
+                            _json(relation_record),
+                        ),
+                    )
+            await connection.commit()
+        return snapshot_id
+
+    async def list_catalog_snapshots(
+        self, *, limit: int = 100, after_sequence: int | None = None
+    ) -> list[dict[str, object]]:
+        _query_limit(limit)
+        if after_sequence is not None:
+            _integer("after_sequence", after_sequence)
         rows = await self._require_connection().execute_fetchall(
-            "SELECT id, status, bundle_id FROM opportunities ORDER BY bundle_id"
+            """SELECT sequence, id, canonical_json FROM catalog_snapshots
+               WHERE (? IS NULL OR sequence > ?)
+               ORDER BY sequence LIMIT ?""",
+            (after_sequence, after_sequence, limit),
+        )
+        return [
+            {"sequence": int(sequence), "id": str(snapshot_id),
+             **json.loads(canonical)}
+            for sequence, snapshot_id, canonical in rows
+        ]
+
+    async def save_watch_metrics(
+        self, run_id: str, started_at_ms: int, metrics: Mapping[str, object]
+    ) -> None:
+        _identifier("run_id", run_id)
+        _integer("started_at_ms", started_at_ms)
+        canonical = _json(dict(metrics))
+        connection = self._require_connection()
+        async with self._write_lock:
+            await connection.execute(
+                """INSERT INTO watch_runs(id, started_at_ms, canonical_json)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET canonical_json=excluded.canonical_json""",
+                (run_id, started_at_ms, canonical),
+            )
+            await connection.commit()
+
+    async def list_watch_metrics(self, *, limit: int = 100) -> list[dict[str, object]]:
+        _query_limit(limit)
+        rows = await self._require_connection().execute_fetchall(
+            """SELECT id, started_at_ms, canonical_json FROM watch_runs
+               ORDER BY sequence DESC LIMIT ?""",
+            (limit,),
+        )
+        return [
+            {"id": str(run_id), "started_at_ms": int(started),
+             **json.loads(canonical)}
+            for run_id, started, canonical in rows
+        ]
+
+    async def list_opportunities(
+        self, *, limit: int = 100, after_bundle_id: str | None = None
+    ) -> list[tuple[str, str, str]]:
+        _query_limit(limit)
+        if after_bundle_id is not None:
+            _identifier("after_bundle_id", after_bundle_id)
+        rows = await self._require_connection().execute_fetchall(
+            """SELECT id, status, bundle_id FROM opportunities
+               WHERE (? IS NULL OR bundle_id > ?)
+               ORDER BY bundle_id LIMIT ?""",
+            (after_bundle_id, after_bundle_id, limit),
         )
         return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
 
@@ -1527,7 +1727,7 @@ class OpportunityStore:
             raise ValueError("limit must be an integer in 1..10000")
         connection = self._require_connection()
         rows = await connection.execute_fetchall(
-            """SELECT o.status, o.payload, r.payload, b.canonical_json
+            """SELECT o.bundle_id, o.status, o.payload, r.payload, b.canonical_json
                FROM opportunities o
                JOIN risk_assessments r
                  ON r.bundle_id = o.bundle_id AND r.opportunity_id = o.id
@@ -1539,22 +1739,38 @@ class OpportunityStore:
         rows = rows[:limit]
         statuses: dict[str, int] = {}
         reasons: dict[str, int] = {}
+        pipeline_reasons: dict[str, int] = {}
         paths: dict[str, int] = {}
         economics: list[dict[str, str]] = []
         latencies: list[int] = []
-        for status, opportunity_json, risk_json, canonical_json in rows:
+        selected_bundle_ids: list[str] = []
+        for bundle_id, status, opportunity_json, risk_json, canonical_json in rows:
+            selected_bundle_ids.append(str(bundle_id))
             status_text = str(status)
             statuses[status_text] = statuses.get(status_text, 0) + 1
             opportunity = json.loads(opportunity_json)
             risk = json.loads(risk_json)
             bundle = json.loads(canonical_json)
+            pipeline_reason = str(
+                bundle.get("producer", {}).get("metadata", {}).get(
+                    "pipeline_reason", "unknown"
+                )
+            )
+            pipeline_reasons[pipeline_reason] = (
+                pipeline_reasons.get(pipeline_reason, 0) + 1
+            )
             for reason in risk.get("reasons", ()):
                 reasons[str(reason)] = reasons.get(str(reason), 0) + 1
             actions = bundle.get("actions", [])
-            kinds = {str(action.get("kind", "unknown")) for action in actions}
+            kind_list = [str(action.get("kind", "unknown")) for action in actions]
+            kinds = set(kind_list)
             path = (
                 "IMMEDIATE_CONVERSION"
-                if "MERGE" in kinds or "NEG_RISK_CONVERT" in kinds
+                if (
+                    "MERGE" in kinds
+                    or "NEG_RISK_CONVERT" in kinds
+                    or ("SPLIT" in kinds and kind_list.count("SELL") >= 2)
+                )
                 else ("HOLD_TO_RESOLUTION" if "REDEEM" in kinds else "unknown")
             )
             paths[path] = paths.get(path, 0) + 1
@@ -1578,19 +1794,30 @@ class OpportunityStore:
             rank = max(1, math.ceil(percentile * len(latencies) / 100))
             return latencies[rank - 1]
 
-        notification_rows = await connection.execute_fetchall(
-            """SELECT status, COUNT(*) FROM notification_attempts
-               GROUP BY status ORDER BY status"""
-        )
-        claims = await connection.execute_fetchall(
-            """SELECT state, COUNT(*) FROM notification_claims
-               GROUP BY state ORDER BY state"""
-        )
+        if selected_bundle_ids:
+            placeholders = ",".join("?" for _ in selected_bundle_ids)
+            notification_rows = await connection.execute_fetchall(
+                f"""SELECT status, COUNT(*) FROM notification_attempts
+                    WHERE bundle_id IN ({placeholders})
+                    GROUP BY status ORDER BY status""",
+                selected_bundle_ids,
+            )
+            claims = await connection.execute_fetchall(
+                f"""SELECT state, COUNT(*) FROM notification_claims
+                    WHERE bundle_id IN ({placeholders})
+                    GROUP BY state ORDER BY state""",
+                selected_bundle_ids,
+            )
+        else:
+            notification_rows, claims = [], []
+        watch_rows = await self.list_watch_metrics(limit=1)
+        catalog_rows = await self.list_catalog_snapshots(limit=1)
         return {
             "total": len(rows),
             "truncated": truncated,
             "by_status": dict(sorted(statuses.items())),
             "by_reason": dict(sorted(reasons.items())),
+            "by_pipeline_reason": dict(sorted(pipeline_reasons.items())),
             "by_path": dict(sorted(paths.items())),
             "executable_economics": economics,
             "latency_ms": {
@@ -1607,11 +1834,16 @@ class OpportunityStore:
             "delivery_uncertain": sum(
                 int(count) for state, count in claims if state == "CLAIMED"
             ),
-            "ws_metrics": None,
+            "ws_metrics": watch_rows[0] if watch_rows else None,
+            "research_relations": (
+                catalog_rows[0].get("audited_relation_registry", [])
+                if catalog_rows else []
+            ),
         }
 
-    async def list_runs(self) -> list[tuple[str, str]]:
+    async def list_runs(self, *, limit: int = 100) -> list[tuple[str, str]]:
+        _query_limit(limit)
         rows = await self._require_connection().execute_fetchall(
-            "SELECT id, status FROM runs ORDER BY bundle_id"
+            "SELECT id, status FROM runs ORDER BY bundle_id LIMIT ?", (limit,)
         )
         return [(str(row[0]), str(row[1])) for row in rows]
