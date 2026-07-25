@@ -247,7 +247,13 @@ class MarketWebSocket:
                 return False
             book_hash = payload.get("hash")
             if book_hash is not None and (type(book_hash) is not str or not book_hash):
-                self._fail_scope(token_id, "malformed_hash")
+                self._metrics = replace(
+                    self._metrics, malformed=self._metrics.malformed + 1
+                )
+                if token_id in self.epochs:
+                    self._fail_scope(token_id, "malformed_hash")
+                else:
+                    self._invalidate_all("malformed_hash")
                 return False
             messages.append(
                 ReceivedMessage(
@@ -604,7 +610,7 @@ class MarketWebSocket:
             heartbeat_task = asyncio.create_task(heartbeat())
             tasks = {receiver_task, processor_task, heartbeat_task}
             completed, _ = await asyncio.wait(
-                {receiver_task, heartbeat_task},
+                tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in completed:
@@ -624,6 +630,9 @@ class MarketWebSocket:
                     task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            while not self._queue.empty():
+                self._queue.get_nowait()
+                self._queue.task_done()
             try:
                 await close()
             finally:

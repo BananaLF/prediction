@@ -450,3 +450,69 @@ def test_constructor_rejects_unsafe_subscriptions(mapping, capacity) -> None:
             wall_clock_ms=clock.wall_ms,
             monotonic=clock.monotonic,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token", [None, "stranger"])
+async def test_malformed_hash_with_unknown_scope_invalidates_all(token) -> None:
+    ws = scanner()
+    for name in ("ws_book_yes.json", "ws_book_no.json"):
+        await ws.ingest(fixture(name))
+        await ws.process_one()
+    event = json.loads(fixture("ws_book_yes.json"))
+    if token is None:
+        event.pop("asset_id")
+    else:
+        event["asset_id"] = token
+    event["hash"] = 123
+    assert await ws.ingest(json.dumps(event)) is False
+    assert all(epoch.state is EpochState.RESYNC for epoch in ws.epochs.values())
+    assert ws.metrics().malformed >= 1
+
+
+@pytest.mark.asyncio
+async def test_processor_failure_closes_connection_and_reconnects_without_dead_consumer() -> None:
+    class ScriptedConnection(Connection):
+        def __init__(self, messages):
+            super().__init__(messages)
+            self.block = asyncio.Event()
+
+        async def recv(self):
+            if self.messages:
+                return self.messages.pop(0)
+            await self.block.wait()
+            raise EOFError
+
+    malformed = json.loads(fixture("ws_delta.json"))
+    malformed["price_changes"][0]["side"] = "WRONG"
+    first = ScriptedConnection([
+        fixture("ws_book_yes.json"),
+        fixture("ws_book_no.json"),
+        json.dumps(malformed),
+    ])
+    second = Connection()
+    connections = [first, second]
+    delays = []
+
+    async def connector(_):
+        return connections.pop(0)
+
+    async def backoff(delay):
+        delays.append(delay)
+
+    ws = scanner()
+    await asyncio.wait_for(
+        ws.run(
+            connector,
+            max_attempts=2,
+            sleeper=backoff,
+            base_backoff=0.1,
+            max_backoff=1,
+        ),
+        timeout=1,
+    )
+    assert first.closed and second.closed
+    assert delays == [0.1]
+    assert ws.metrics().reconnects == 1
+    assert ws.queue_size == 0
+    assert all(epoch.state is EpochState.RESYNC for epoch in ws.epochs.values())
