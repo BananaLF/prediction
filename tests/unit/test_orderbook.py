@@ -95,6 +95,26 @@ def test_fill_rejects_non_decimal_and_nonfinite_values(
 
 
 @pytest.mark.parametrize(
+    "values",
+    [
+        (D("0"), D("1"), D(".5")),
+        (D("-1"), D("1"), D(".5")),
+        (D("1"), D("0"), D(".5")),
+        (D("1"), D("-1"), D(".5")),
+        (D("1"), D("1"), D("0")),
+        (D("1"), D("1"), D("1")),
+        (D("1"), D("1"), D("-.1")),
+        (D("1"), D("1"), D("1.1")),
+    ],
+)
+def test_fill_rejects_semantically_impossible_values(
+    values: tuple[Decimal, Decimal, Decimal],
+) -> None:
+    with pytest.raises(ValueError):
+        Fill(*values)
+
+
+@pytest.mark.parametrize(
     "changes, error",
     [
         ({"token_id": ""}, ValueError),
@@ -104,6 +124,7 @@ def test_fill_rejects_non_decimal_and_nonfinite_values(
         ({"tick_size": ".01"}, TypeError),
         ({"minimum_order_size": 1}, TypeError),
         ({"tick_size": D("0")}, ValueError),
+        ({"tick_size": D("1")}, ValueError),
         ({"minimum_order_size": D("-1")}, ValueError),
         ({"tick_size": D("NaN")}, ValueError),
         ({"minimum_order_size": D("Infinity")}, ValueError),
@@ -130,6 +151,11 @@ def test_constructor_rejects_invalid_metadata(
         OrderBook(**values)  # type: ignore[arg-type]
 
 
+def test_constructor_rejects_prices_not_aligned_to_tick_size() -> None:
+    with pytest.raises(ValueError, match="tick_size"):
+        book(asks=(level(".505", "1"),))
+
+
 @pytest.mark.parametrize(
     ("bids", "asks"),
     [
@@ -152,7 +178,7 @@ def test_constructor_rejects_malformed_level_order_duplicates_and_crosses(
     first_size=st.decimals(min_value="1", max_value="100", places=2),
     second_size=st.decimals(min_value="1", max_value="100", places=2),
     quantity=st.decimals(min_value="1", max_value="100", places=2),
-    increase=st.decimals(min_value=".001", max_value=".10", places=3),
+    increase=st.decimals(min_value=".01", max_value=".10", places=2),
 )
 def test_raising_every_ask_cannot_reduce_buy_cost(
     first_size: Decimal, second_size: Decimal, quantity: Decimal, increase: Decimal
@@ -176,7 +202,7 @@ def test_raising_every_ask_cannot_reduce_buy_cost(
     first_size=st.decimals(min_value="1", max_value="100", places=2),
     second_size=st.decimals(min_value="1", max_value="100", places=2),
     quantity=st.decimals(min_value="1", max_value="100", places=2),
-    decrease=st.decimals(min_value=".001", max_value=".10", places=3),
+    decrease=st.decimals(min_value=".01", max_value=".10", places=2),
 )
 def test_lowering_every_bid_cannot_increase_sell_proceeds(
     first_size: Decimal, second_size: Decimal, quantity: Decimal, decrease: Decimal

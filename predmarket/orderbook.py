@@ -20,6 +20,10 @@ class Fill:
             raise TypeError("quantity, gross, and worst_price must be Decimal")
         if not all(value.is_finite() for value in values):
             raise ValueError("quantity, gross, and worst_price must be finite")
+        if self.quantity <= 0 or self.gross <= 0:
+            raise ValueError("quantity and gross must be positive")
+        if not Decimal("0") < self.worst_price < Decimal("1"):
+            raise ValueError("worst_price must be strictly between 0 and 1")
 
 
 @dataclass(frozen=True)
@@ -43,8 +47,10 @@ class OrderBook:
             raise TypeError("tick_size and minimum_order_size must be Decimal")
         if not self.tick_size.is_finite() or not self.minimum_order_size.is_finite():
             raise ValueError("tick_size and minimum_order_size must be finite")
-        if self.tick_size <= 0 or self.minimum_order_size <= 0:
-            raise ValueError("tick_size and minimum_order_size must be positive")
+        if not Decimal("0") < self.tick_size < Decimal("1"):
+            raise ValueError("tick_size must be strictly between 0 and 1")
+        if self.minimum_order_size <= 0:
+            raise ValueError("minimum_order_size must be positive")
         if isinstance(self.exchange_ts_ms, bool) or not isinstance(self.exchange_ts_ms, int):
             raise TypeError("exchange_ts_ms must be an integer")
         if self.exchange_ts_ms < 0:
@@ -53,6 +59,8 @@ class OrderBook:
             raise TypeError("bids and asks must be tuples")
         if not all(isinstance(item, BookLevel) for item in self.bids + self.asks):
             raise TypeError("bids and asks must contain only BookLevel values")
+        if any(level.price % self.tick_size != 0 for level in self.bids + self.asks):
+            raise ValueError("all level prices must be aligned to tick_size")
 
         bid_prices = tuple(item.price for item in self.bids)
         ask_prices = tuple(item.price for item in self.asks)
