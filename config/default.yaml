@@ -1,0 +1,13 @@
+bankroll: "1000"
+minimum_return: "0.0075"
+safety_buffer_rate: "0.0025"
+max_leg_failure_loss: "5"
+max_unhedged_notional: "20"
+default_simulation_quantity: "10"
+conversion_cost: "0"
+maximum_book_age_ms: 1000
+maximum_leg_skew_ms: 250
+maximum_processing_latency_ms: 100
+reconcile_interval_seconds: 30
+queue_capacity: 10000
+database_path: data/predmarket.sqlite3
