@@ -146,7 +146,11 @@ async def test_market_info_binds_tokens_and_exact_complete_fee_schedule():
     assert info.fee_schedule.taker_only is True
     assert info.minimum_order_size == Decimal("5")
     assert info.tick_size == Decimal("0.01")
-    assert info.maker_base_fee_bps == 0 and info.taker_base_fee_bps == 500
+    assert info.maker_base_fee_bps == 0 and info.taker_base_fee_bps == 0
+    assert dict(info.bound_fee_schedules()) == {
+        "yes-101": info.fee_schedule,
+        "no-101": info.fee_schedule,
+    }
     assert b"condition%2F101" in seen[0].url.raw_path
 
 
@@ -198,24 +202,23 @@ async def test_market_info_malformed_evidence_fails_closed(mutation):
 
 
 @pytest.mark.asyncio
-async def test_market_info_fee_rate_cross_check_rejects_mismatch_and_coverage():
+async def test_market_fee_curve_and_token_fee_rate_are_independent_evidence():
     payload = fixture("clob_market_info.json")
 
     def handler(request):
         if request.url.path == "/fee-rate":
-            token = request.url.params["token_id"]
-            return httpx.Response(200, json={"base_fee": 500 if token == "yes-101" else 499})
+            return httpx.Response(200, json={"base_fee": 500})
         return httpx.Response(200, json=payload)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = ClobRestClient(http, "https://clob.test")
         info = await client.market_info("condition-101")
         yes = await client.fee_rate("yes-101")
-        no = await client.fee_rate("no-101")
-    with pytest.raises(AdapterInvariantError, match="mismatch"):
-        info.validated_fee_schedules((yes, no))
-    with pytest.raises(AdapterInvariantError, match="coverage"):
-        info.validated_fee_schedules((yes,))
+    assert info.taker_base_fee_bps == 0
+    assert info.fee_schedule.rate == Decimal("0.02")
+    assert yes.base_fee_bps == 500 and yes.rate == Decimal("0.05")
+    assert yes.provenance == "GET /fee-rate"
+    assert dict(info.bound_fee_schedules())["yes-101"].rate == Decimal("0.02")
 
 
 @pytest.mark.asyncio

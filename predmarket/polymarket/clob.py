@@ -144,24 +144,8 @@ class ClobMarketInfo:
     received_monotonic: float
     raw_json: str
 
-    def validated_fee_schedules(
-        self, evidence: tuple[FeeRateEvidence, ...] | list[FeeRateEvidence]
-    ) -> tuple[tuple[str, FeeSchedule], ...]:
-        if not isinstance(evidence, (tuple, list)) or any(
-            not isinstance(item, FeeRateEvidence) for item in evidence
-        ):
-            raise TypeError("evidence must contain FeeRateEvidence values")
-        expected = {token.token_id for token in self.tokens}
-        actual = [item.token_id for item in evidence]
-        if len(actual) != len(set(actual)) or set(actual) != expected:
-            raise AdapterInvariantError("fee evidence token coverage mismatch")
-        if self.taker_base_fee_bps is None:
-            raise AdapterInvariantError("market info lacks taker base fee evidence")
-        for item in evidence:
-            if item.base_fee_bps != self.taker_base_fee_bps:
-                raise AdapterInvariantError(
-                    f"fee-rate mismatch for token {item.token_id}"
-                )
+    def bound_fee_schedules(self) -> tuple[tuple[str, FeeSchedule], ...]:
+        """Bind the authoritative market fee curve to every market token."""
         return tuple((token.token_id, self.fee_schedule) for token in self.tokens)
 
 

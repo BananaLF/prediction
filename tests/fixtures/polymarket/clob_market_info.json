@@ -14,7 +14,7 @@
   "mos": 5,
   "mts": 0.01,
   "mbf": 0,
-  "tbf": 500,
+  "tbf": 0,
   "rfqe": true,
   "itode": false,
   "ibce": true,
