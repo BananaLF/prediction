@@ -8,6 +8,7 @@ from predmarket.domain import BookLevel, OpportunityStatus
 from predmarket.engine import (
     BinaryMarket,
     EngineDependencies,
+    EngineResult,
     FeeConfirmation,
     StructuralArbitrageEngine,
 )
@@ -170,6 +171,14 @@ def engine(discovery, confirmation, fees=None, store=None, notice=None, **settin
         "0.2.0",
     )
     return StructuralArbitrageEngine(deps), store, notice
+
+
+def test_engine_result_rejects_non_boolean_lifecycle_markers():
+    with pytest.raises(TypeError, match="notified"):
+        EngineResult(
+            "opp", OpportunityStatus.REJECTED, "reason", "stage",
+            1, False, True, None, None, None, None, None, ("reason",),
+        )
 
 
 @pytest.mark.asyncio
@@ -359,12 +368,70 @@ async def test_audited_but_non_binary_payoff_relation_is_not_rewritten():
     assert result.reason == "invalid_relation"
     data = store.items[0].data
     assert data["relation"]["relations"][0]["id"] == "wrong-rel"
+    assert data["relation"]["relations"][0]["kind"] == "INVALID_BINARY"
     assert {
         (row["token_id"], row["amount"]) for row in data["relation"]["payoffs"]
     } == {
         ("yes-1", Decimal("1")), ("no-1", Decimal("1")),
         ("yes-1", Decimal("0")), ("no-1", Decimal("0")),
     }
+
+
+@pytest.mark.asyncio
+async def test_evidence_replays_complete_timing_and_risk_inputs():
+    snapshots = (book("yes-1", "0.45"), book("no-1", "0.45"))
+    subject, store, _ = engine(Books(snapshots), Books(copies(snapshots)))
+    result = await subject.evaluate_binary(market())
+    data = store.items[0].data
+    assert data["evaluation"]["maximum_processing_latency_ms"] == 100
+    assert data["evaluation"]["evaluated_monotonic"] == Decimal("10.05")
+    assert data["markets"][0]["metadata"]["immediate_conversion_evidenced"] is True
+    assert data["markets"][0]["metadata"]["settlement_evidenced"] is True
+    assert data["markets"][0]["metadata"]["release_date_known"] is True
+
+    from predmarket.latency import Timing, validate_timings
+    from predmarket.risk import RiskInputs, assess_risk, worst_partial_fill
+
+    timings = tuple(
+        Timing(
+            row["snapshot"]["exchange_ts_ms"],
+            row["snapshot"]["received_ts_ms"],
+            float(row["snapshot"]["received_monotonic"]),
+            float(data["evaluation"]["evaluated_monotonic"]),
+        )
+        for row in data["books"]
+    )
+    timing = validate_timings(
+        timings,
+        now_ms=data["evaluation"]["evaluated_at_ms"],
+        max_age_ms=data["evaluation"]["maximum_book_age_ms"],
+        max_skew_ms=data["evaluation"]["maximum_leg_skew_ms"],
+        max_processing_ms=data["evaluation"]["maximum_processing_latency_ms"],
+    )
+    risk = data["risk"]
+    partial = worst_partial_fill(risk["entry_costs"], risk["immediate_unwind_values"])
+    assert partial.worst_leg_failure_loss == risk["worst_leg_failure_loss"]
+    assert partial.max_unhedged_notional == risk["max_unhedged_notional"]
+    inputs = RiskInputs(
+        risk["inputs"]["mathematical_return"],
+        timing.valid,
+        partial.worst_leg_failure_loss,
+        partial.max_unhedged_notional,
+        risk["inputs"]["immediate_unwind_known"],
+        risk["inputs"]["unresolved_rule_risk"],
+        risk["inputs"]["unresolved_conversion_risk"],
+        risk["inputs"]["unresolved_settlement_risk"],
+        risk["inputs"]["release_date_known"],
+    )
+    replayed = assess_risk(
+        inputs,
+        risk["thresholds"]["minimum_return"],
+        risk["thresholds"]["max_leg_failure_loss"],
+        risk["thresholds"]["max_unhedged_notional"],
+    )
+    assert replayed.status.value == risk["status"]
+    assert replayed.reasons == tuple(risk["assessment_reasons"])
+    assert tuple(timing.reasons) == tuple(risk["timing_reasons"])
 
 
 @pytest.mark.asyncio
@@ -410,6 +477,19 @@ async def test_idempotent_duplicate_save_does_not_notify_again():
     assert result.notification_failed is False
     assert result.newly_persisted is False
     assert order == ["save"]
+    assert notice.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_return", [None, 1])
+async def test_non_boolean_store_return_fails_closed_without_notification(bad_return):
+    snapshots = (book("yes-1", "0.45"), book("no-1", "0.45"))
+    subject, _, notice = engine(
+        Books(snapshots), Books(copies(snapshots)),
+        store=Store(save_result=bad_return),
+    )
+    with pytest.raises(TypeError, match="bool"):
+        await subject.evaluate_binary(market())
     assert notice.calls == []
 
 

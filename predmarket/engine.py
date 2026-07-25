@@ -172,6 +172,26 @@ class EngineResult:
     minimum_return: Decimal | None
     risk_reasons: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        _identifier("opportunity_id", self.opportunity_id)
+        if not isinstance(self.status, OpportunityStatus):
+            raise TypeError("status must be OpportunityStatus")
+        for name in ("reason", "stage"):
+            if type(getattr(self, name)) is not str or not getattr(self, name):
+                raise ValueError(f"{name} must be nonempty")
+        for name in ("notified", "notification_failed", "newly_persisted"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be bool")
+        for name in (
+            "quantity", "total_investment", "minimum_proceeds",
+            "minimum_profit", "minimum_return",
+        ):
+            value = getattr(self, name)
+            if value is not None and type(value) is not Decimal:
+                raise TypeError(f"{name} must be Decimal or None")
+        if type(self.risk_reasons) is not tuple:
+            raise TypeError("risk_reasons must be tuple")
+
 
 @dataclass(frozen=True)
 class _Economics:
@@ -225,6 +245,25 @@ def _candidate(books: Mapping[str, BookSnapshot], market: BinaryMarket, settings
         + conservative_conversion_per_share
         < ONE
     )
+
+
+def _has_binary_complete_semantics(
+    relation: Relation, token_ids: tuple[str, str]
+) -> bool:
+    leg_tokens = tuple(leg.token_id for leg in relation.legs)
+    if (
+        len(leg_tokens) != 2
+        or set(leg_tokens) != set(token_ids)
+        or any(leg.weight != 1 for leg in relation.legs)
+        or len(relation.states) != 2
+    ):
+        return False
+    payoff_vectors = {
+        tuple(state.proceeds[token] for token in token_ids)
+        for state in relation.states
+        if set(state.proceeds) == set(token_ids)
+    }
+    return payoff_vectors == {(1, 0), (0, 1)}
 
 
 def _trade(book: OrderBook, fee: FeeSchedule, side: Side, quantity: Decimal) -> tuple[Decimal, Decimal]:
@@ -287,8 +326,12 @@ class StructuralArbitrageEngine:
         fee_confirmation: FeeConfirmation | None = None
         economics: _Economics | None = None
         timing_reasons: tuple[str, ...] = ()
+        assessment_reasons: tuple[str, ...] = ()
+        final_risk_reasons: tuple[str, ...] = ()
         partial_loss = ZERO
         unhedged = ZERO
+        entry_costs: dict[str, Decimal] = {}
+        unwind_values: dict[str, Decimal] = {}
 
         if base_reason is None:
             try:
@@ -366,6 +409,8 @@ class StructuralArbitrageEngine:
                                 except (InsufficientDepth, ValueError):
                                     unwind[token] = ZERO
                             partial = worst_partial_fill(economics.entry_costs, unwind)
+                            entry_costs = dict(economics.entry_costs)
+                            unwind_values = dict(unwind)
                             partial_loss, unhedged = (
                                 partial.worst_leg_failure_loss,
                                 partial.max_unhedged_notional,
@@ -384,6 +429,7 @@ class StructuralArbitrageEngine:
                                 self._d.settings.max_leg_failure_loss,
                                 self._d.settings.max_unhedged_notional,
                             )
+                            assessment_reasons = assessment.reasons
                             status = assessment.status
                             risk_reasons = list(assessment.reasons)
                             if not timing.valid and "data_invalid" in risk_reasons:
@@ -394,16 +440,21 @@ class StructuralArbitrageEngine:
                                 reason = "return_below_minimum"
                             else:
                                 reason = assessment.reasons[0]
-                            timing_reasons = tuple(risk_reasons)
+                            final_risk_reasons = tuple(risk_reasons)
                             stage = "risk"
 
-        risk_reasons = timing_reasons or (() if status is OpportunityStatus.SNAPSHOT_EXECUTABLE else (reason,))
+        risk_reasons = final_risk_reasons or (
+            () if status is OpportunityStatus.SNAPSHOT_EXECUTABLE else (reason,)
+        )
         bundle = self._bundle(
             market, opportunity_id, run_id, now_ms, evaluated_mono,
             status, reason, candidate, discovery, confirmed, fee_confirmation,
-            economics, risk_reasons, partial_loss, unhedged,
+            economics, risk_reasons, assessment_reasons, timing_reasons, partial_loss,
+            unhedged, entry_costs, unwind_values,
         )
         newly_persisted = await self._d.store.save(bundle)
+        if type(newly_persisted) is not bool:
+            raise TypeError("store.save() must return bool")
         result = EngineResult(
             opportunity_id, status, reason, stage, False, False, newly_persisted,
             economics.quantity if economics else None,
@@ -429,20 +480,7 @@ class StructuralArbitrageEngine:
             require_audited_active_relation(market.relation)
         except (TypeError, RelationValidationError):
             return "invalid_relation"
-        leg_tokens = tuple(leg.token_id for leg in market.relation.legs)
-        if (
-            len(leg_tokens) != 2
-            or set(leg_tokens) != set(market.token_ids)
-            or any(leg.weight != 1 for leg in market.relation.legs)
-            or len(market.relation.states) != 2
-        ):
-            return "invalid_relation"
-        payoff_vectors = {
-            tuple(state.proceeds[token] for token in market.token_ids)
-            for state in market.relation.states
-            if set(state.proceeds) == set(market.token_ids)
-        }
-        if payoff_vectors != {(1, 0), (0, 1)}:
+        if not _has_binary_complete_semantics(market.relation, market.token_ids):
             return "invalid_relation"
         return None
 
@@ -463,7 +501,10 @@ class StructuralArbitrageEngine:
         reason: str, candidate: bool, discovery: Mapping[str, BookSnapshot],
         confirmed: Mapping[str, BookSnapshot],
         fees: FeeConfirmation | None, economics: _Economics | None,
-        risk_reasons: tuple[str, ...], partial_loss: Decimal, unhedged: Decimal,
+        risk_reasons: tuple[str, ...], assessment_reasons: tuple[str, ...],
+        timing_reasons: tuple[str, ...], partial_loss: Decimal, unhedged: Decimal,
+        entry_costs: Mapping[str, Decimal],
+        unwind_values: Mapping[str, Decimal],
     ) -> EvidenceBundle:
         econ = economics
         gross, proceeds, costs = (econ.gross, econ.proceeds, econ.fees) if econ else (None, None, None)
@@ -570,8 +611,11 @@ class StructuralArbitrageEngine:
                                                     "book_hashes": [discovery[x].book.book_hash for x in market.token_ids if x in discovery]},
                                       "confirmation": {"book_hashes": [confirmed[x].book.book_hash for x in market.token_ids if x in confirmed]}}},
             "evaluation": {"evaluated_at_ms": now_ms,
+                           "evaluated_monotonic": Decimal(str(evaluated_mono)),
                            "maximum_book_age_ms": self._d.settings.maximum_book_age_ms,
                            "maximum_leg_skew_ms": self._d.settings.maximum_leg_skew_ms,
+                           "maximum_processing_latency_ms":
+                               self._d.settings.maximum_processing_latency_ms,
                            "minimum_return": self._d.settings.minimum_return},
             "run": {"id": run_id, "status": "COMPLETED", "started_at_ms": now_ms},
             "opportunity": opportunity,
@@ -579,7 +623,13 @@ class StructuralArbitrageEngine:
             "events": [{"id": market.event_id, "metadata": {}}],
             "markets": [{"id": market.market_id, "event_id": market.event_id,
                          "metadata": {"active": market.active, "tradeable": market.tradeable,
-                                      "condition_id": market.condition_id}}],
+                                      "condition_id": market.condition_id,
+                                      "immediate_conversion_evidenced":
+                                          market.immediate_conversion_evidenced,
+                                      "settlement_evidenced":
+                                          market.settlement_evidenced,
+                                      "release_date_known":
+                                          market.release_date_known}}],
             "tokens": [
                 {"id": market.yes_token_id, "market_id": market.market_id,
                  "outcome": "YES", "metadata": {}},
@@ -594,7 +644,14 @@ class StructuralArbitrageEngine:
                                      "auditor": review.reviewer if review else None},
                         "provenance": {"source": "Relation",
                                        "content_hash": relation.source_rules_hash}},
-                "relations": [{"id": relation.relation_id, "kind": "BINARY_COMPLETE"}],
+                "relations": [{
+                    "id": relation.relation_id,
+                    "kind": (
+                        "BINARY_COMPLETE"
+                        if _has_binary_complete_semantics(relation, market.token_ids)
+                        else "INVALID_BINARY"
+                    ),
+                }],
                 "states": [
                     {"id": state_ids[index], "label": state.name}
                     for index, state in enumerate(relation.states)
@@ -608,9 +665,36 @@ class StructuralArbitrageEngine:
             },
             "discovery_books": discovery_rows,
             "books": book_rows, "legs": legs, "actions": actions,
-            "risk": {"status": status.value, "reasons": list(risk_reasons),
-                     "worst_leg_failure_loss": partial_loss,
-                     "max_unhedged_notional": unhedged},
+            "risk": {
+                "status": status.value,
+                "reasons": list(risk_reasons),
+                "assessment_reasons": list(assessment_reasons),
+                "timing_reasons": list(timing_reasons),
+                "worst_leg_failure_loss": partial_loss,
+                "max_unhedged_notional": unhedged,
+                "entry_costs": dict(entry_costs),
+                "immediate_unwind_values": dict(unwind_values),
+                "thresholds": {
+                    "minimum_return": self._d.settings.minimum_return,
+                    "max_leg_failure_loss": self._d.settings.max_leg_failure_loss,
+                    "max_unhedged_notional": self._d.settings.max_unhedged_notional,
+                },
+                "inputs": (
+                    {
+                        "mathematical_return": econ.rate,
+                        "data_valid": not timing_reasons,
+                        "immediate_unwind_known":
+                            market.immediate_conversion_evidenced,
+                        "unresolved_rule_risk": False,
+                        "unresolved_conversion_risk":
+                            not market.immediate_conversion_evidenced,
+                        "unresolved_settlement_risk":
+                            not market.settlement_evidenced,
+                        "release_date_known": market.release_date_known,
+                    }
+                    if econ is not None else None
+                ),
+            },
             "latency_metrics": latency,
             "notifications": ([{"id": f"notice-{opportunity_id}", "channel": "desktop",
                                 "status": "PENDING", "sent_at_ms": None}]

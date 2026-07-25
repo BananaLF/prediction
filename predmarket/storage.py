@@ -14,6 +14,7 @@ from typing import Any
 import aiosqlite
 
 from predmarket.exact_math import decimal_ratio
+from predmarket.risk import RiskInputs, assess_risk, worst_partial_fill
 
 
 SCHEMA_VERSION = 2
@@ -104,6 +105,7 @@ def _restore_schema_decimals(value: Any) -> dict[str, Any]:
         raise ValueError("stored evidence root must be an object")
     for field in ("minimum_return",):
         _restore_decimal(value["evaluation"], field)
+    _restore_decimal(value["evaluation"], "evaluated_monotonic")
     if value["economics"]["status"] == "EVALUATED":
         for field in (
             "quantity", "total_investment", "minimum_proceeds", "net_profit",
@@ -136,6 +138,20 @@ def _restore_schema_decimals(value: Any) -> dict[str, Any]:
         _restore_decimal(action, "amount")
     _restore_decimal(value["risk"], "worst_leg_failure_loss")
     _restore_decimal(value["risk"], "max_unhedged_notional")
+    for field in value["risk"]["entry_costs"]:
+        value["risk"]["entry_costs"][field] = Decimal(
+            value["risk"]["entry_costs"][field]
+        )
+    for field in value["risk"]["immediate_unwind_values"]:
+        value["risk"]["immediate_unwind_values"][field] = Decimal(
+            value["risk"]["immediate_unwind_values"][field]
+        )
+    for field in (
+        "minimum_return", "max_leg_failure_loss", "max_unhedged_notional",
+    ):
+        _restore_decimal(value["risk"]["thresholds"], field)
+    if value["risk"]["inputs"] is not None:
+        _restore_decimal(value["risk"]["inputs"], "mathematical_return")
     return value
 
 
@@ -260,14 +276,19 @@ def _validate_bundle(raw: Mapping[str, object]) -> None:
     evaluation = _mapping("evaluation", raw["evaluation"])
     _required(
         evaluation, "evaluated_at_ms", "maximum_book_age_ms",
-        "maximum_leg_skew_ms", "minimum_return",
+        "maximum_leg_skew_ms", "maximum_processing_latency_ms",
+        "evaluated_monotonic", "minimum_return",
     )
     for name in (
         "evaluated_at_ms", "maximum_book_age_ms", "maximum_leg_skew_ms",
+        "maximum_processing_latency_ms",
     ):
         _integer(f"evaluation.{name}", evaluation[name])
     minimum_return = _nonnegative_decimal(
         "evaluation.minimum_return", evaluation["minimum_return"]
+    )
+    _nonnegative_decimal(
+        "evaluation.evaluated_monotonic", evaluation["evaluated_monotonic"]
     )
 
     run = _mapping("run", raw["run"])
@@ -392,6 +413,12 @@ def _validate_bundle_tail(
             raise ValueError("market references an unknown event")
         _mapping("market.metadata", market["metadata"])
         _validate_opaque_json("market.metadata", market["metadata"])
+        for name in (
+            "immediate_conversion_evidenced", "settlement_evidenced",
+            "release_date_known",
+        ):
+            if type(market["metadata"].get(name)) is not bool:
+                raise ValueError(f"market metadata {name} must be bool")
 
     token_ids: set[str] = set()
     for item in _sequence("tokens", raw["tokens"]):
@@ -471,8 +498,10 @@ def _validate_bundle_tail(
     for item in relation["relations"]:
         relation_item = _mapping("relation", item)
         _required(relation_item, "id", "kind")
-        if type(relation_item["kind"]) is not str or not relation_item["kind"]:
-            raise ValueError("relation kind must be a nonempty string")
+        if relation_item["kind"] not in {
+            "BINARY_COMPLETE", "INVALID_BINARY", "UNKNOWN",
+        }:
+            raise ValueError("invalid relation kind")
     state_ids = {
         _identifier("state.id", _mapping("state", item)["id"])
         for item in _sequence("relation.states", relation["states"])
@@ -586,21 +615,113 @@ def _validate_bundle_tail(
     risk = _mapping("risk", raw["risk"])
     _required(
         risk, "status", "reasons", "worst_leg_failure_loss",
-        "max_unhedged_notional",
+        "max_unhedged_notional", "entry_costs", "immediate_unwind_values",
+        "thresholds", "inputs", "assessment_reasons", "timing_reasons",
     )
     if risk["status"] not in _OPPORTUNITY_STATUSES:
         raise ValueError("invalid risk status")
+    if risk["status"] != opportunity["status"]:
+        raise ValueError("opportunity and risk status must match")
+    if opportunity["status"] != "SNAPSHOT_EXECUTABLE" and raw["notifications"]:
+        raise ValueError("notifications are forbidden for non-executable evidence")
     reasons = _sequence("risk.reasons", risk["reasons"])
     if any(type(reason) is not str or not reason for reason in reasons):
         raise ValueError("risk reasons must be nonempty strings")
     if len(set(reasons)) != len(reasons):
         raise ValueError("risk reasons must be unique")
+    assessment_reasons = _sequence(
+        "risk.assessment_reasons", risk["assessment_reasons"]
+    )
+    timing_reasons = _sequence("risk.timing_reasons", risk["timing_reasons"])
+    for name, values in (
+        ("assessment_reasons", assessment_reasons),
+        ("timing_reasons", timing_reasons),
+    ):
+        if any(type(reason) is not str or not reason for reason in values):
+            raise ValueError(f"risk {name} must contain nonempty strings")
+        if len(set(values)) != len(values):
+            raise ValueError(f"risk {name} must be unique")
     _nonnegative_decimal(
         "risk.worst_leg_failure_loss", risk["worst_leg_failure_loss"]
     )
     _nonnegative_decimal(
         "risk.max_unhedged_notional", risk["max_unhedged_notional"]
     )
+    entry_costs = _mapping("risk.entry_costs", risk["entry_costs"])
+    unwind_values = _mapping(
+        "risk.immediate_unwind_values", risk["immediate_unwind_values"]
+    )
+    if set(entry_costs) != set(unwind_values):
+        raise ValueError("risk entry and unwind token keys must match")
+    risk_leg_tokens = {
+        _mapping("leg", item)["token_id"]
+        for item in _sequence("legs", raw["legs"])
+    }
+    if set(entry_costs) not in (set(), risk_leg_tokens):
+        raise ValueError("risk entry and unwind keys must match opportunity legs")
+    for name, values in (
+        ("entry_costs", entry_costs),
+        ("immediate_unwind_values", unwind_values),
+    ):
+        for token_id, amount in values.items():
+            _identifier(f"risk.{name}.token_id", token_id)
+            _nonnegative_decimal(f"risk.{name}[{token_id}]", amount)
+    thresholds = _mapping("risk.thresholds", risk["thresholds"])
+    _required(
+        thresholds, "minimum_return", "max_leg_failure_loss",
+        "max_unhedged_notional",
+    )
+    for name in (
+        "minimum_return", "max_leg_failure_loss", "max_unhedged_notional",
+    ):
+        _nonnegative_decimal(f"risk.thresholds.{name}", thresholds[name])
+    inputs = risk["inputs"]
+    if economics["status"] == "EVALUATED":
+        inputs = _mapping("risk.inputs", inputs)
+        _required(
+            inputs, "mathematical_return", "data_valid",
+            "immediate_unwind_known", "unresolved_rule_risk",
+            "unresolved_conversion_risk", "unresolved_settlement_risk",
+            "release_date_known",
+        )
+        for name in (
+            "data_valid", "immediate_unwind_known", "unresolved_rule_risk",
+            "unresolved_conversion_risk", "unresolved_settlement_risk",
+            "release_date_known",
+        ):
+            if type(inputs[name]) is not bool:
+                raise TypeError(f"risk.inputs.{name} must be bool")
+        mathematical_return = _decimal(
+            "risk.inputs.mathematical_return", inputs["mathematical_return"]
+        )
+        if mathematical_return != economics["net_return"]:
+            raise ValueError("risk mathematical return must match economics")
+        partial = worst_partial_fill(entry_costs, unwind_values)
+        if (
+            partial.worst_leg_failure_loss != risk["worst_leg_failure_loss"]
+            or partial.max_unhedged_notional != risk["max_unhedged_notional"]
+        ):
+            raise ValueError("partial-fill aggregates do not recompute")
+        replayed = assess_risk(
+            RiskInputs(
+                mathematical_return, inputs["data_valid"],
+                partial.worst_leg_failure_loss, partial.max_unhedged_notional,
+                inputs["immediate_unwind_known"], inputs["unresolved_rule_risk"],
+                inputs["unresolved_conversion_risk"],
+                inputs["unresolved_settlement_risk"],
+                inputs["release_date_known"],
+            ),
+            thresholds["minimum_return"],
+            thresholds["max_leg_failure_loss"],
+            thresholds["max_unhedged_notional"],
+        )
+        if replayed.status.value != risk["status"] or replayed.reasons != tuple(assessment_reasons):
+            raise ValueError("risk assessment does not recompute")
+        composed = tuple(dict.fromkeys((*assessment_reasons, *timing_reasons)))
+        if tuple(reasons) != composed:
+            raise ValueError("risk reasons must compose assessment and timing reasons")
+    elif inputs is not None or entry_costs or unwind_values:
+        raise ValueError("not-evaluated risk must not contain computed inputs")
     if risk["status"] != opportunity["status"]:
         raise ValueError("opportunity and risk status must match")
 

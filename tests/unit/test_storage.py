@@ -23,8 +23,10 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
         },
         "evaluation": {
             "evaluated_at_ms": 1000,
+            "evaluated_monotonic": Decimal("1.5"),
             "maximum_book_age_ms": 1000,
             "maximum_leg_skew_ms": 250,
+            "maximum_processing_latency_ms": 100,
             "minimum_return": Decimal("0.0075"),
         },
         "run": {"id": "run-1", "status": "COMPLETED", "started_at_ms": 1000},
@@ -57,7 +59,16 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
         },
         "events": [{"id": "event-1", "metadata": {"title": "天气 ☀"}}],
         "markets": [
-            {"id": "market-1", "event_id": "event-1", "metadata": {"active": True}}
+            {
+                "id": "market-1",
+                "event_id": "event-1",
+                "metadata": {
+                    "active": True,
+                    "immediate_conversion_evidenced": True,
+                    "settlement_evidenced": True,
+                    "release_date_known": True,
+                },
+            }
         ],
         "tokens": [
             {
@@ -153,8 +164,26 @@ def bundle(bundle_id: str = "bundle-1", opportunity_id: str = "opp-1") -> dict:
         "risk": {
             "status": "SNAPSHOT_EXECUTABLE",
             "reasons": [],
+            "assessment_reasons": [],
+            "timing_reasons": [],
             "worst_leg_failure_loss": Decimal("1.25"),
             "max_unhedged_notional": Decimal("4.5"),
+            "entry_costs": {"yes-1": Decimal("4.5")},
+            "immediate_unwind_values": {"yes-1": Decimal("3.25")},
+            "thresholds": {
+                "minimum_return": Decimal("0.0075"),
+                "max_leg_failure_loss": Decimal("5"),
+                "max_unhedged_notional": Decimal("20"),
+            },
+            "inputs": {
+                "mathematical_return": exact_return,
+                "data_valid": True,
+                "immediate_unwind_known": True,
+                "unresolved_rule_risk": False,
+                "unresolved_conversion_risk": False,
+                "unresolved_settlement_risk": False,
+                "release_date_known": True,
+            },
         },
         "latency_metrics": [
             {
@@ -395,6 +424,13 @@ def test_not_evaluated_rejection_has_no_invented_financial_fields():
     }
     value["risk"]["status"] = "REJECTED"
     value["risk"]["reasons"] = ["invalid_catalog"]
+    value["risk"]["assessment_reasons"] = []
+    value["risk"]["timing_reasons"] = []
+    value["risk"]["inputs"] = None
+    value["risk"]["entry_costs"] = {}
+    value["risk"]["immediate_unwind_values"] = {}
+    value["risk"]["worst_leg_failure_loss"] = Decimal("0")
+    value["risk"]["max_unhedged_notional"] = Decimal("0")
     value["legs"] = []
     value["actions"] = []
     value["notifications"] = []
@@ -411,6 +447,11 @@ def test_not_evaluated_economics_prohibits_financial_placeholders():
     value["opportunity"]["status"] = "REJECTED"
     value["risk"]["status"] = "REJECTED"
     value["risk"]["reasons"] = ["invalid_catalog"]
+    value["risk"]["assessment_reasons"] = []
+    value["risk"]["timing_reasons"] = []
+    value["risk"]["inputs"] = None
+    value["risk"]["entry_costs"] = {}
+    value["risk"]["immediate_unwind_values"] = {}
     value["notifications"] = []
     value["economics"]["status"] = "NOT_EVALUATED"
     value["economics"]["reason"] = "invalid_catalog"
@@ -503,6 +544,7 @@ def test_nonterminating_simulation_return_is_valid_storage_economics():
         net_return=result.minimum_return,
         costs=[],
     )
+    value["risk"]["inputs"]["mathematical_return"] = result.minimum_return
     evidence = EvidenceBundle.from_mapping(value)
     assert evidence.data["opportunity"]["net_return"] == result.minimum_return
 
