@@ -1,4 +1,5 @@
 from pathlib import Path
+from decimal import Decimal
 
 import pytest
 
@@ -6,6 +7,7 @@ from predmarket.cli import build_parser, main
 from predmarket.commands import (
     RelationRegistry,
     binary_market_from_metadata,
+    dispatch,
     relation_payload,
     scan_catalog,
 )
@@ -19,6 +21,8 @@ from predmarket.relations import RelationValidationError
 from predmarket.storage import OpportunityStore
 from predmarket.runtime import Runtime
 import httpx
+import json
+import sys
 
 
 def test_help_states_read_only_and_return_semantics(capsys):
@@ -191,6 +195,33 @@ async def test_catalog_snapshot_is_idempotent_and_survives_reopen(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_catalog_current_lifecycle_marks_missing_inactive(tmp_path):
+    path = tmp_path / "lifecycle.sqlite3"
+    first = {
+        "fetched_at_ms": 10,
+        "markets": [{"id": "m", "condition_id": "c", "event_ids": ["e"],
+                     "tokens": [{"id": "yes", "outcome": "YES"},
+                                {"id": "no", "outcome": "NO"}],
+                     "active": True, "closed": False, "tradeable": True,
+                     "neg_risk": False, "fee_provenance": {}, "raw_json": "{}"}],
+        "diagnostics": [],
+    }
+    async with OpportunityStore(path) as store:
+        await store.save_catalog_snapshot(first)
+        await store.save_catalog_snapshot(
+            {"fetched_at_ms": 20, "markets": [], "diagnostics": []}
+        )
+    async with OpportunityStore(path) as store:
+        current = await store.list_current_catalog_markets(limit=10)
+    assert current == [{
+        "market_id": "m", "condition_id": "c",
+        "last_seen_snapshot": current[0]["last_seen_snapshot"],
+        "fetched_at_ms": 10, "presence": "MISSING", "active": False,
+        "closed": False, "tradeable": False,
+    }]
+
+
+@pytest.mark.asyncio
 async def test_runtime_shares_one_public_http_client_and_closes_once(tmp_path):
     transport = httpx.MockTransport(lambda request: httpx.Response(500))
     runtime = Runtime(http_transport=transport)
@@ -209,3 +240,52 @@ async def test_store_query_limits_reject_bool_and_cap(tmp_path):
         for value in (True, 0, 10_001):
             with pytest.raises(ValueError):
                 await store.list_opportunities(limit=value)
+
+
+@pytest.mark.asyncio
+async def test_sync_command_offline_persists_normalized_catalog(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8").replace(
+            "data/predmarket.sqlite3", str(tmp_path / "catalog.sqlite3")
+        ),
+        encoding="utf-8",
+    )
+
+    class Gamma:
+        async def active_markets(self, **bounds):
+            assert bounds == {"limit": 10, "max_pages": 1, "max_markets": 10}
+            return GammaDiscovery((market(),), ())
+
+    class FakeRuntime:
+        gamma = Gamma()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    args = build_parser().parse_args([
+        "--config", str(config), "--json", "sync-markets",
+        "--limit", "10", "--max-pages", "1", "--max-markets", "10",
+        "--rules-dir", str(tmp_path / "rules"),
+    ])
+    output = await dispatch(
+        args, runtime_factory=FakeRuntime, wall_clock_ms=lambda: 123
+    )
+    assert output["markets"] == 1
+    async with OpportunityStore(tmp_path / "catalog.sqlite3") as store:
+        current = await store.list_current_catalog_markets(limit=10)
+    assert current[0]["presence"] == "SEEN"
+    assert current[0]["tradeable"] is True
+
+
+def test_json_mode_keeps_terminal_audit_off_stdout(capsys):
+    async def fake_dispatcher(args):
+        print("status=SNAPSHOT_EXECUTABLE", file=sys.stderr)
+        return {"收益": Decimal("0.0075")}
+
+    assert main(["--json", "scan-once"], dispatcher=fake_dispatcher) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"收益": "0.0075"}
+    assert captured.out.count("\n") == 1
+    assert "SNAPSHOT_EXECUTABLE" in captured.err

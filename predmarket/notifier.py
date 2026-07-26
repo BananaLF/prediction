@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import asyncio
 from typing import Protocol
+import sys
 
 from predmarket.domain import OpportunityStatus
 from predmarket.engine import EngineResult
@@ -34,9 +35,11 @@ class TerminalNotifier:
         *,
         condition_resolver: Callable[[EngineResult], str] | None = None,
         book_hash_resolver: Callable[[EngineResult], tuple[str, ...]] | None = None,
+        stream=None,
     ) -> None:
         self._condition = condition_resolver or (lambda result: result.condition_id)
         self._hashes = book_hash_resolver or (lambda result: result.book_hashes)
+        self._stream = stream or sys.stdout
 
     async def notify(self, result: EngineResult) -> None:
         if not isinstance(result, EngineResult):
@@ -72,7 +75,10 @@ class TerminalNotifier:
             "book_hashes": ",".join(_text(value) for value in self._hashes(result)),
             "risk": ",".join(_text(value) for value in result.risk_reasons),
         }
-        print(" ".join(f"{key}={value}" for key, value in values.items()), flush=True)
+        print(
+            " ".join(f"{key}={value}" for key, value in values.items()),
+            file=self._stream, flush=True,
+        )
 
 
 async def _default_runner(*argv: str) -> tuple[int, str, str]:

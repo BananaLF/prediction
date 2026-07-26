@@ -1,4 +1,5 @@
 from decimal import Decimal
+import io
 import sys
 
 import pytest
@@ -79,3 +80,10 @@ async def test_router_wraps_desktop_failure_after_terminal_audit(capsys):
         await NotificationRouter(TerminalNotifier(), Desktop()).notify(result())
     assert "secret subprocess detail" not in str(error.value)
     assert "SNAPSHOT_EXECUTABLE" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_terminal_can_route_audit_away_from_json_stdout():
+    stream = io.StringIO()
+    await TerminalNotifier(stream=stream).notify(result())
+    assert stream.getvalue().startswith("status=SNAPSHOT_EXECUTABLE")

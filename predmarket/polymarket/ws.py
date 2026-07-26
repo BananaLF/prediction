@@ -712,6 +712,7 @@ class MarketWebSocket:
         sleeper: Callable[[float], Awaitable[None]],
         base_backoff: float,
         max_backoff: float,
+        max_messages: int | None = None,
     ) -> None:
         """Run a finite reconnect loop; callers choose whether to invoke again."""
         if not callable(connector) or not callable(sleeper):
@@ -733,7 +734,9 @@ class MarketWebSocket:
         for attempt in range(max_attempts):
             try:
                 connection = await connector(MARKET_CHANNEL_URL)
-                await self.serve_connection(connection)
+                await self.serve_connection(
+                    connection, max_messages=max_messages
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:

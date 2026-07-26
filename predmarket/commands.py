@@ -92,6 +92,17 @@ class RelationRegistry:
             return ()
         return tuple(load_relation(path) for path in sorted(self.path.glob("*.yaml")))
 
+    def by_id(self, relation_id: str) -> Relation | None:
+        matches = [
+            relation for relation in self.relations()
+            if relation.relation_id == relation_id
+        ]
+        if len(matches) > 1:
+            raise RelationValidationError(
+                "multiple versions share relation_id; registry is ambiguous"
+            )
+        return matches[0] if matches else None
+
     def match(
         self, token_ids: tuple[str, ...], *, relation_id: str | None = None
     ) -> Relation | None:
@@ -290,30 +301,35 @@ def _result_payload(result: object) -> object:
     return result
 
 
-async def _scan_runtime(args: Any, settings: Any) -> dict[str, object]:
+async def _scan_runtime(
+    args: Any, settings: Any, *, runtime_factory=Runtime,
+    wall_clock_ms=lambda: time.time_ns() // 1_000_000,
+    monotonic=time.monotonic,
+) -> dict[str, object]:
     from predmarket.storage import OpportunityStore
 
     async with AsyncExitStack() as stack:
-        runtime = await stack.enter_async_context(Runtime())
+        runtime = await stack.enter_async_context(runtime_factory())
         gamma = runtime.gamma
         discovery_clob = runtime.discovery_clob
         confirmation_clob = runtime.confirmation_clob
         fee_clob = runtime.fee_clob
         store = await stack.enter_async_context(OpportunityStore(settings.database_path))
-        terminal = TerminalNotifier()
+        terminal = TerminalNotifier(
+            stream=sys.stderr if args.json_output else sys.stdout
+        )
         desktop = MacOSNotifier(platform=sys.platform)
         notifier = NotificationRouter(terminal, desktop)
         registry = RelationRegistry(args.rules_dir)
+        selected_relation = (
+            registry.by_id(args.relation_id) if args.relation_id else None
+        )
+        if args.relation_id and selected_relation is None:
+            raise RelationValidationError("selected relation_id is unknown")
 
         def resolve_relation(market: BinaryMarket) -> BinaryMarket:
-            matched = registry.match(
-                market.token_ids, relation_id=args.relation_id
-            )
+            matched = selected_relation or registry.match(market.token_ids)
             if matched is None:
-                if args.relation_id is not None:
-                    raise RelationValidationError(
-                        "selected relation does not match this market"
-                    )
                 return market
             # Generic logical/NegRisk execution is intentionally unsupported.
             # Only a strict two-state binary complete-set relation may replace
@@ -331,8 +347,8 @@ async def _scan_runtime(args: Any, settings: Any) -> dict[str, object]:
                     store,
                     notifier,
                     settings,
-                    lambda: time.time_ns() // 1_000_000,
-                    time.monotonic,
+                    wall_clock_ms,
+                    monotonic,
                     lambda market: f"opp:{market.condition_id}",
                     lambda: uuid.uuid4().hex,
                     "predmarket-0.2.0",
@@ -371,7 +387,7 @@ async def _scan_runtime(args: Any, settings: Any) -> dict[str, object]:
                     "relation_id": relation.relation_id,
                     "status": "RESEARCH_CANDIDATE",
                     "reason": "generic_logical_execution_unsupported",
-                    "observed_at_ms": time.time_ns() // 1_000_000,
+                    "observed_at_ms": wall_clock_ms(),
                     "condition_ids": sorted({
                         conditions_by_token[token] for token in relation_tokens
                     }),
@@ -396,7 +412,13 @@ async def _scan_runtime(args: Any, settings: Any) -> dict[str, object]:
         return summary
 
 
-async def _watch_runtime(args: Any, settings: Any) -> dict[str, object]:
+async def _watch_runtime(
+    args: Any, settings: Any, *, runtime_factory=Runtime,
+    websocket_connector=None,
+    sleeper=asyncio.sleep,
+    wall_clock_ms=lambda: time.time_ns() // 1_000_000,
+    monotonic=time.monotonic,
+) -> dict[str, object]:
     """Bounded public-WS discovery whose callback always reconfirms by REST."""
     import websockets
     from predmarket.polymarket.ws import (
@@ -405,7 +427,7 @@ async def _watch_runtime(args: Any, settings: Any) -> dict[str, object]:
     from predmarket.storage import OpportunityStore
 
     async with AsyncExitStack() as stack:
-        runtime = await stack.enter_async_context(Runtime())
+        runtime = await stack.enter_async_context(runtime_factory())
         gamma = runtime.gamma
         discovery_clob = runtime.discovery_clob
         confirmation_clob = runtime.confirmation_clob
@@ -415,15 +437,47 @@ async def _watch_runtime(args: Any, settings: Any) -> dict[str, object]:
             limit=100, max_pages=5, max_markets=500
         )
         registry = RelationRegistry(args.rules_dir)
+        selected_relation = (
+            registry.by_id(args.relation_id) if args.relation_id else None
+        )
+        if args.relation_id and selected_relation is None:
+            raise RelationValidationError("selected relation_id is unknown")
+        catalog_tokens = {
+            token.token_id
+            for item in catalog.markets for token in item.tokens
+        }
+        conditions_by_token = {
+            token.token_id: item.condition_id
+            for item in catalog.markets for token in item.tokens
+        }
+        research_outputs = []
+        for relation in registry.relations():
+            if selected_relation is not None and relation != selected_relation:
+                continue
+            tokens = {leg.token_id for leg in relation.legs}
+            if tokens.issubset(catalog_tokens) and len(relation.states) != 2:
+                observation = {
+                    "relation_id": relation.relation_id,
+                    "status": "RESEARCH_CANDIDATE",
+                    "reason": "generic_logical_execution_unsupported",
+                    "observed_at_ms": wall_clock_ms(),
+                    "condition_ids": sorted({
+                        conditions_by_token[token] for token in tokens
+                    }),
+                    "token_ids": sorted(tokens),
+                    "notified": False,
+                }
+                observation["id"] = await store.save_research_observation(
+                    observation
+                )
+                research_outputs.append(observation)
         markets = {
             item.condition_id: binary_market_from_metadata(item)
             for item in catalog.markets
             if item.is_tradeable and item.event is not None
         }
         for condition, market in tuple(markets.items()):
-            matched = registry.match(
-                market.token_ids, relation_id=args.relation_id
-            )
+            matched = selected_relation or registry.match(market.token_ids)
             if matched is not None and len(matched.states) == 2:
                 markets[condition] = replace(market, relation=matched)
         if not markets:
@@ -462,7 +516,9 @@ async def _watch_runtime(args: Any, settings: Any) -> dict[str, object]:
             if token in token_conditions
         }
         results: list[object] = []
-        terminal = TerminalNotifier()
+        terminal = TerminalNotifier(
+            stream=sys.stderr if args.json_output else sys.stdout
+        )
         desktop = MacOSNotifier(platform=sys.platform)
         notifier = NotificationRouter(terminal, desktop)
 
@@ -471,7 +527,7 @@ async def _watch_runtime(args: Any, settings: Any) -> dict[str, object]:
                 EngineDependencies(
                     discovery_clob, confirmation_clob,
                     AuthoritativeFeeProvider(fee_clob), store, notifier, settings,
-                    lambda: time.time_ns() // 1_000_000, time.monotonic,
+                    wall_clock_ms, monotonic,
                     lambda market: f"opp:{market.condition_id}",
                     lambda: uuid.uuid4().hex, "predmarket-0.2.0",
                 )
@@ -486,50 +542,55 @@ async def _watch_runtime(args: Any, settings: Any) -> dict[str, object]:
         watcher = MarketWebSocket(
             token_conditions,
             queue_capacity=settings.queue_capacity,
-            wall_clock_ms=lambda: time.time_ns() // 1_000_000,
-            monotonic=time.monotonic,
+            wall_clock_ms=wall_clock_ms,
+            monotonic=monotonic,
             candidate_callback=candidate,
             book_metadata=book_metadata,
         )
-        remaining = args.max_events
-        for attempt in range(args.max_connections):
-            connection = await websockets.connect(
-                MARKET_CHANNEL_URL, open_timeout=10
-            )
-            per_connection = remaining
-            await watcher.serve_connection(
-                connection, max_messages=per_connection
-            )
-            if remaining is not None:
-                # A bounded connection consumes its requested receive allowance.
-                remaining = 0
-                break
-            if attempt + 1 < args.max_connections:
-                await asyncio.sleep(min(30, 2**attempt))
-        metrics = asdict(watcher.metrics())
-        metrics["processing_latencies_ms"] = [
-            str(value) for value in metrics["processing_latencies_ms"]
-        ]
         watch_run_id = f"watch:{uuid.uuid4().hex}"
-        await store.save_watch_metrics(
-            watch_run_id, time.time_ns() // 1_000_000,
-            {
-                **metrics,
-                "epoch_states": {
-                    token: epoch.state.value
-                    for token, epoch in watcher.epochs.items()
-                },
-            },
+        started_at_ms = wall_clock_ms()
+        connector = websocket_connector or (
+            lambda url: websockets.connect(url, open_timeout=10)
         )
+        try:
+            await watcher.run(
+                connector,
+                max_attempts=args.max_connections,
+                sleeper=sleeper,
+                base_backoff=1,
+                max_backoff=30,
+                max_messages=args.max_events,
+            )
+        finally:
+            metrics = asdict(watcher.metrics())
+            metrics["processing_latencies_ms"] = [
+                str(value) for value in metrics["processing_latencies_ms"]
+            ]
+            await store.save_watch_metrics(
+                watch_run_id, started_at_ms,
+                {
+                    **metrics,
+                    "epoch_states": {
+                        token: epoch.state.value
+                        for token, epoch in watcher.epochs.items()
+                    },
+                },
+            )
         return {
             "evaluated": len(results),
             "markets": len(markets),
             "results": results,
             "ws_metrics": metrics,
+            "research_candidates": research_outputs,
         }
 
 
-async def dispatch(args: Any) -> object:
+async def dispatch(
+    args: Any, *, runtime_factory=Runtime, websocket_connector=None,
+    sleeper=asyncio.sleep,
+    wall_clock_ms=lambda: time.time_ns() // 1_000_000,
+    monotonic=time.monotonic,
+) -> object:
     """Default runtime dispatcher.
 
     Network/database operations are deliberately imported lazily; unit tests can
@@ -546,13 +607,13 @@ async def dispatch(args: Any) -> object:
             return relation_payload(args.path)
         return {"imported": str(registry.import_file(args.path))}
     if args.command == "sync-markets":
-        async with Runtime() as runtime:
+        async with runtime_factory() as runtime:
             discovery = await runtime.gamma.active_markets(
                 limit=args.limit, max_pages=args.max_pages,
                 max_markets=args.max_markets,
             )
         snapshot = catalog_snapshot(
-            discovery, time.time_ns() // 1_000_000
+            discovery, wall_clock_ms()
         )
         snapshot["audited_relation_registry"] = [
             {**item, "execution_support": "RESEARCH_ONLY"}
@@ -567,9 +628,16 @@ async def dispatch(args: Any) -> object:
             "diagnostics": [asdict(item) for item in discovery.diagnostics],
         }
     if args.command == "scan-once":
-        return await _scan_runtime(args, settings)
+        return await _scan_runtime(
+            args, settings, runtime_factory=runtime_factory,
+            wall_clock_ms=wall_clock_ms, monotonic=monotonic,
+        )
     if args.command == "watch":
-        return await _watch_runtime(args, settings)
+        return await _watch_runtime(
+            args, settings, runtime_factory=runtime_factory,
+            websocket_connector=websocket_connector, sleeper=sleeper,
+            wall_clock_ms=wall_clock_ms, monotonic=monotonic,
+        )
     if args.command in {"replay", "report"}:
         async with OpportunityStore(settings.database_path) as store:
             if args.command == "replay":

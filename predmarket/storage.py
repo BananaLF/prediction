@@ -1115,6 +1115,32 @@ CREATE TABLE IF NOT EXISTS catalog_relation_candidates (
     canonical_json TEXT NOT NULL,
     PRIMARY KEY(snapshot_id, relation_id)
 );
+CREATE TABLE IF NOT EXISTS current_catalog_markets (
+    market_id TEXT PRIMARY KEY,
+    condition_id TEXT NOT NULL,
+    last_seen_snapshot TEXT NOT NULL REFERENCES catalog_snapshots(id),
+    fetched_at_ms INTEGER NOT NULL,
+    presence TEXT NOT NULL CHECK(presence IN ('SEEN', 'MISSING')),
+    active INTEGER,
+    closed INTEGER,
+    tradeable INTEGER NOT NULL,
+    canonical_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS current_catalog_tokens (
+    token_id TEXT PRIMARY KEY,
+    market_id TEXT NOT NULL,
+    last_seen_snapshot TEXT NOT NULL REFERENCES catalog_snapshots(id),
+    fetched_at_ms INTEGER NOT NULL,
+    presence TEXT NOT NULL CHECK(presence IN ('SEEN', 'MISSING')),
+    canonical_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS current_catalog_events (
+    event_id TEXT PRIMARY KEY,
+    last_seen_snapshot TEXT NOT NULL REFERENCES catalog_snapshots(id),
+    fetched_at_ms INTEGER NOT NULL,
+    presence TEXT NOT NULL CHECK(presence IN ('SEEN', 'MISSING')),
+    canonical_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS watch_runs (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE,
@@ -1598,12 +1624,16 @@ class OpportunityStore:
                 (snapshot_id, digest, data["fetched_at_ms"], canonical),
             )
             if cursor.rowcount:
+                seen_markets: set[str] = set()
+                seen_tokens: set[str] = set()
+                seen_events: set[str] = set()
                 for market in data["markets"]:
                     record = _mapping("catalog market", market)
                     market_id = _identifier("market_id", record["id"])
                     condition_id = _identifier(
                         "condition_id", record["condition_id"]
                     )
+                    seen_markets.add(market_id)
                     await connection.execute(
                         "INSERT INTO catalog_markets VALUES (?, ?, ?, ?)",
                         (snapshot_id, market_id, condition_id, _json(record)),
@@ -1612,6 +1642,7 @@ class OpportunityStore:
                         "event_ids", record.get("event_ids", [])
                     ):
                         event = _identifier("event_id", event_id)
+                        seen_events.add(event)
                         await connection.execute(
                             """INSERT OR IGNORE INTO catalog_events
                                VALUES (?, ?, ?)""",
@@ -1619,16 +1650,84 @@ class OpportunityStore:
                         )
                     for token in _sequence("tokens", record["tokens"]):
                         token_record = _mapping("catalog token", token)
+                        token_id = _identifier("token_id", token_record["id"])
+                        seen_tokens.add(token_id)
                         await connection.execute(
                             "INSERT INTO catalog_tokens VALUES (?, ?, ?, ?, ?)",
                             (
                                 snapshot_id,
-                                _identifier("token_id", token_record["id"]),
+                                token_id,
                                 market_id,
                                 str(token_record["outcome"]),
                                 _json(token_record),
                             ),
                         )
+                        await connection.execute(
+                            """INSERT INTO current_catalog_tokens VALUES
+                               (?, ?, ?, ?, 'SEEN', ?)
+                               ON CONFLICT(token_id) DO UPDATE SET
+                               market_id=excluded.market_id,
+                               last_seen_snapshot=excluded.last_seen_snapshot,
+                               fetched_at_ms=excluded.fetched_at_ms,
+                               presence='SEEN',
+                               canonical_json=excluded.canonical_json""",
+                            (
+                                token_id, market_id, snapshot_id,
+                                data["fetched_at_ms"], _json(token_record),
+                            ),
+                        )
+                    await connection.execute(
+                        """INSERT INTO current_catalog_markets VALUES
+                           (?, ?, ?, ?, 'SEEN', ?, ?, ?, ?)
+                           ON CONFLICT(market_id) DO UPDATE SET
+                           condition_id=excluded.condition_id,
+                           last_seen_snapshot=excluded.last_seen_snapshot,
+                           fetched_at_ms=excluded.fetched_at_ms,
+                           presence='SEEN', active=excluded.active,
+                           closed=excluded.closed,
+                           tradeable=excluded.tradeable,
+                           canonical_json=excluded.canonical_json""",
+                        (
+                            market_id, condition_id, snapshot_id,
+                            data["fetched_at_ms"], record.get("active"),
+                            record.get("closed"), int(bool(record["tradeable"])),
+                            _json(record),
+                        ),
+                    )
+                for event in seen_events:
+                    await connection.execute(
+                        """INSERT INTO current_catalog_events VALUES
+                           (?, ?, ?, 'SEEN', ?)
+                           ON CONFLICT(event_id) DO UPDATE SET
+                           last_seen_snapshot=excluded.last_seen_snapshot,
+                           fetched_at_ms=excluded.fetched_at_ms,
+                           presence='SEEN',
+                           canonical_json=excluded.canonical_json""",
+                        (
+                            event, snapshot_id, data["fetched_at_ms"],
+                            _json({"id": event}),
+                        ),
+                    )
+                for table, id_column, seen in (
+                    ("current_catalog_markets", "market_id", seen_markets),
+                    ("current_catalog_tokens", "token_id", seen_tokens),
+                    ("current_catalog_events", "event_id", seen_events),
+                ):
+                    if seen:
+                        placeholders = ",".join("?" for _ in seen)
+                        await connection.execute(
+                            f"""UPDATE {table} SET presence='MISSING'
+                                WHERE {id_column} NOT IN ({placeholders})""",
+                            tuple(sorted(seen)),
+                        )
+                    else:
+                        await connection.execute(
+                            f"UPDATE {table} SET presence='MISSING'"
+                        )
+                await connection.execute(
+                    """UPDATE current_catalog_markets
+                       SET active=0, tradeable=0 WHERE presence='MISSING'"""
+                )
                 for position, diagnostic in enumerate(data["diagnostics"]):
                     await connection.execute(
                         "INSERT INTO catalog_diagnostics VALUES (?, ?, ?)",
@@ -1678,6 +1777,28 @@ class OpportunityStore:
             {"sequence": int(sequence), "id": str(snapshot_id),
              **json.loads(canonical)}
             for sequence, snapshot_id, canonical in rows
+        ]
+
+    async def list_current_catalog_markets(
+        self, *, limit: int = 100
+    ) -> list[dict[str, object]]:
+        _query_limit(limit)
+        rows = await self._require_connection().execute_fetchall(
+            """SELECT market_id, condition_id, last_seen_snapshot,
+                      fetched_at_ms, presence, active, closed, tradeable
+               FROM current_catalog_markets ORDER BY market_id LIMIT ?""",
+            (limit,),
+        )
+        return [
+            {
+                "market_id": str(row[0]), "condition_id": str(row[1]),
+                "last_seen_snapshot": str(row[2]), "fetched_at_ms": int(row[3]),
+                "presence": str(row[4]),
+                "active": None if row[5] is None else bool(row[5]),
+                "closed": None if row[6] is None else bool(row[6]),
+                "tradeable": bool(row[7]),
+            }
+            for row in rows
         ]
 
     async def save_watch_metrics(
@@ -1776,7 +1897,9 @@ class OpportunityStore:
                JOIN risk_assessments r
                  ON r.bundle_id = o.bundle_id AND r.opportunity_id = o.id
                JOIN evidence_bundles b ON b.id = o.bundle_id
-               ORDER BY o.bundle_id DESC LIMIT ?""",
+               JOIN runs run
+                 ON run.bundle_id = o.bundle_id AND run.id = o.run_id
+               ORDER BY run.started_at_ms DESC, o.rowid DESC LIMIT ?""",
             (limit + 1,),
         )
         truncated = len(rows) > limit

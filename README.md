@@ -22,7 +22,10 @@ python -m venv .venv
 `sync-markets` stores a versioned, content-hashed catalog snapshot in SQLite:
 normalized markets/events/tokens, lifecycle flags, fee provenance, diagnostics,
 and explicitly unaudited relation candidates. Repeated identical snapshots are
-idempotent; changed lifecycle data appends a new snapshot.
+idempotent; changed lifecycle data appends a new snapshot. Transactional
+current-state tables point to the last snapshot that saw each stable ID;
+markets missing from a newer snapshot become `MISSING`, inactive, and
+non-tradeable without altering historical snapshots.
 
 A deterministic targeted confirmation can be requested when the exact
 condition and token IDs are already known:
@@ -79,6 +82,11 @@ notification audit. `report` produces bounded status/reason/path counts,
 executable economics, nearest-rank p50/p95/p99 latency, and delivery outcomes.
 For empty latency samples all quantiles are `null`; for one sample all three
 equal that sample.
+
+With `--json`, stdout contains exactly one JSON document. Human-readable
+notification audit lines are sent to stderr so machine consumers are never
+given a mixed stream. Command input/configuration errors return 2 and
+operational failures return 1.
 
 ## Important limitations
 
