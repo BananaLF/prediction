@@ -286,30 +286,31 @@ def _candidate_strategy(
     market: BinaryMarket,
     settings: Settings,
 ) -> str | None:
-    try:
-        asks = [books[token].book.asks[0].price for token in market.token_ids]
-        bids = [books[token].book.bids[0].price for token in market.token_ids]
-    except IndexError:
-        return None
-    ask_gross = sum(asks, ZERO)
-    bid_gross = sum(bids, ZERO)
     conservative_conversion_per_share = (
         settings.conversion_cost / settings.default_simulation_quantity
     )
-    if (
-        ask_gross
-        + ask_gross * settings.safety_buffer_rate
-        + conservative_conversion_per_share
-        < ONE
-    ):
-        return "binary_underpriced"
-    if (
-        bid_gross
-        - bid_gross * settings.safety_buffer_rate
-        - conservative_conversion_per_share
-        > ONE
-    ):
-        return "binary_overpriced"
+    asks = tuple(books[token].book.asks for token in market.token_ids)
+    if all(asks):
+        ask_gross = sum((levels[0].price for levels in asks), ZERO)
+        if (
+            ask_gross
+            + ask_gross * settings.safety_buffer_rate
+            + conservative_conversion_per_share
+            < ONE
+        ):
+            # Deterministic safe priority. A valid uncrossed pair cannot be
+            # simultaneously underpriced on asks and overpriced on bids.
+            return "binary_underpriced"
+    bids = tuple(books[token].book.bids for token in market.token_ids)
+    if all(bids):
+        bid_gross = sum((levels[0].price for levels in bids), ZERO)
+        if (
+            bid_gross
+            - bid_gross * settings.safety_buffer_rate
+            - conservative_conversion_per_share
+            > ONE
+        ):
+            return "binary_overpriced"
     return None
 
 
@@ -607,7 +608,11 @@ class StructuralArbitrageEngine:
                 confirmed[token].book.book_hash
                 for token in market.token_ids if token in confirmed
             ),
-            "IMMEDIATE_CONVERSION",
+            (
+                "BINARY_OVERPRICED_SPLIT_SELL"
+                if strategy == "binary_overpriced"
+                else "IMMEDIATE_CONVERSION"
+            ),
             economics.gross if economics else None,
             economics.proceeds if economics else None,
         )

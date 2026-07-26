@@ -249,6 +249,57 @@ async def test_no_initial_candidate_persists_research_without_confirmation_or_no
     assert notice.calls == []
 
 
+def one_sided_snapshot(
+    token: str, *, asks=(), bids=(), received=10_001, mono=10.0
+):
+    return BookSnapshot(
+        OrderBook(
+            token, tuple(bids), tuple(asks), Decimal("0.01"), Decimal("1"),
+            10_000, f"one-sided-{token}",
+        ),
+        "condition-1", False, None, received, mono,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ask_only_underpriced_books_reach_formal_simulation():
+    snapshots = (
+        one_sided_snapshot(
+            "yes-1", asks=(BookLevel(Decimal("0.45"), Decimal("10")),)
+        ),
+        one_sided_snapshot(
+            "no-1", asks=(BookLevel(Decimal("0.45"), Decimal("10")),)
+        ),
+    )
+    subject, _store, _notice = engine(
+        Books(snapshots), Books(copies(snapshots))
+    )
+    result = await subject.evaluate_binary(market())
+    assert result.reason != "no_candidate"
+    assert result.path == "IMMEDIATE_CONVERSION"
+
+
+@pytest.mark.asyncio
+async def test_bid_only_overpriced_books_reach_formal_simulation():
+    snapshots = (
+        one_sided_snapshot(
+            "yes-1", bids=(BookLevel(Decimal("0.60"), Decimal("10")),)
+        ),
+        one_sided_snapshot(
+            "no-1", bids=(BookLevel(Decimal("0.60"), Decimal("10")),)
+        ),
+    )
+    subject, store, _notice = engine(
+        Books(snapshots), Books(copies(snapshots))
+    )
+    result = await subject.evaluate_binary(market())
+    assert result.reason != "no_candidate"
+    assert result.path == "BINARY_OVERPRICED_SPLIT_SELL"
+    assert store.items[0].data["producer"]["metadata"]["strategy"] == (
+        "binary_overpriced"
+    )
+
+
 @pytest.mark.asyncio
 async def test_candidate_disappears_during_independent_confirmation():
     discovery = Books((book("yes-1", "0.45"), book("no-1", "0.45")))
@@ -414,7 +465,7 @@ async def test_overpriced_split_sell_path_round_trips_risk_report_and_fingerprin
         report = await store.report(limit=10)
 
     assert result.status is OpportunityStatus.SNAPSHOT_EXECUTABLE
-    assert result.path == "IMMEDIATE_CONVERSION"
+    assert result.path == "BINARY_OVERPRICED_SPLIT_SELL"
     assert result.notification_fingerprint is not None
     assert len(notice.calls) == 1
     assert (

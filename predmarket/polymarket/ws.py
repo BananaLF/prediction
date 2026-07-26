@@ -677,9 +677,21 @@ class MarketWebSocket:
             return
         if any(self.epochs[token].state is not EpochState.LIVE for token in tokens):
             return
-        if any(not self._depth[token].asks for token in tokens):
-            return
-        if sum((Decimal(self._depth[token].asks[0][0]) for token in tokens), Decimal(0)) >= 1:
+        has_underpriced_asks = all(self._depth[token].asks for token in tokens) and (
+            sum(
+                (Decimal(self._depth[token].asks[0][0]) for token in tokens),
+                Decimal(0),
+            )
+            < 1
+        )
+        has_overpriced_bids = all(self._depth[token].bids for token in tokens) and (
+            sum(
+                (Decimal(self._depth[token].bids[0][0]) for token in tokens),
+                Decimal(0),
+            )
+            > 1
+        )
+        if not (has_underpriced_asks or has_overpriced_bids):
             return
         key = tuple((token, self.epochs[token].snapshot_hash) for token in tokens)
         if key in self._trigger_keys:

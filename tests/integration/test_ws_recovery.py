@@ -204,6 +204,63 @@ async def test_paired_live_books_trigger_only_external_callback_and_coalesce() -
     assert not hasattr(ws, "evidence") and not hasattr(ws, "opportunities")
 
 
+def side_only_book(token: str, *, bid: str | None, ask: str | None) -> str:
+    return json.dumps({
+        "event_type": "book",
+        "asset_id": token,
+        "market": "condition",
+        "timestamp": "1000",
+        "hash": f"{token}-{bid}-{ask}",
+        "bids": [] if bid is None else [{"price": bid, "size": "5"}],
+        "asks": [] if ask is None else [{"price": ask, "size": "5"}],
+    })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bid", "ask"),
+    [("0.60", None), (None, "0.45")],
+)
+async def test_one_sided_binary_candidate_triggers_once(bid, ask) -> None:
+    calls = []
+    ws = scanner(callback=lambda tokens, condition: calls.append((tokens, condition)))
+    for token in ("yes", "no"):
+        await ws.ingest(side_only_book(token, bid=bid, ask=ask))
+        await ws.process_one()
+    assert calls == [(("no", "yes"), "condition")]
+    assert not hasattr(ws, "evidence") and not hasattr(ws, "opportunities")
+
+
+@pytest.mark.asyncio
+async def test_unpaired_or_unprofitable_sides_do_not_trigger() -> None:
+    calls = []
+    ws = scanner(callback=lambda *_: calls.append(1))
+    await ws.ingest(side_only_book("yes", bid="0.60", ask=None))
+    await ws.process_one()
+    await ws.ingest(side_only_book("no", bid=None, ask="0.45"))
+    await ws.process_one()
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_rest_reconciled_bid_only_overpricing_invokes_external_hint() -> None:
+    calls = []
+    ws = scanner(callback=lambda tokens, condition: calls.append((tokens, condition)))
+    snapshots = tuple(
+        BookSnapshot(
+            OrderBook(
+                token, (BookLevel(Decimal("0.60"), Decimal("5")),), (),
+                Decimal("0.01"), Decimal("1"), 1002, f"rest-{token}",
+            ),
+            "condition", False, None, 2000, 2.0,
+        )
+        for token in ("yes", "no")
+    )
+    assert await ws.reconcile_rest(snapshots)
+    assert calls == [(("no", "yes"), "condition")]
+    assert not hasattr(ws, "evidence") and not hasattr(ws, "opportunities")
+
+
 @pytest.mark.asyncio
 async def test_callback_failure_isolated_and_batch_messages_supported() -> None:
     async def broken(*_):
