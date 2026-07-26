@@ -1,0 +1,26 @@
+relation_id: a-implies-b
+version: 1
+status: active
+source_rules_hash: example-reviewed-hash
+semantic_review:
+  reviewer: Example Rules Review
+  reviewed_at: 2026-07-26
+  conclusion: The allowed payoff states were manually reviewed for A implies B.
+legs:
+  - token_id: no_a
+    weight: 1
+  - token_id: yes_b
+    weight: 1
+states:
+  - name: a_false_b_false
+    proceeds:
+      no_a: 1
+      yes_b: 0
+  - name: a_false_b_true
+    proceeds:
+      no_a: 1
+      yes_b: 1
+  - name: a_true_b_true
+    proceeds:
+      no_a: 0
+      yes_b: 1

@@ -1,0 +1,1087 @@
+from pathlib import Path
+from decimal import Decimal
+
+import pytest
+
+from predmarket.cli import build_parser, main
+from predmarket.commands import (
+    RelationRegistry,
+    _reconcile_loop,
+    binary_market_from_metadata,
+    dispatch,
+    relation_payload,
+    scan_catalog,
+)
+from predmarket.polymarket.gamma import (
+    EventMetadata,
+    GammaDiscovery,
+    MarketMetadata,
+    TokenMetadata,
+)
+from predmarket.relations import RelationValidationError
+from predmarket.storage import OpportunityStore
+from predmarket.runtime import Runtime
+import httpx
+import json
+import sys
+import sqlite3
+from types import SimpleNamespace
+from dataclasses import replace
+from predmarket.fees import FeeSchedule
+from predmarket.orderbook import OrderBook
+from predmarket.domain import BookLevel, OpportunityStatus
+from predmarket.polymarket.clob import BookSnapshot
+from predmarket.polymarket.ws import BookMetadata, MarketWebSocket, WatchOperationalError
+
+
+def test_help_states_read_only_and_return_semantics(capsys):
+    assert main(["--help"]) == 0
+    output = capsys.readouterr().out
+    assert "read-only" in output
+    assert "no orders" in output
+    assert "0.75% = 0.0075" in output
+
+
+def test_parser_exposes_expected_commands_and_rejects_credentials():
+    parser = build_parser()
+    assert parser.parse_args(["sync-markets"]).command == "sync-markets"
+    assert parser.parse_args(["scan-once"]).command == "scan-once"
+    assert parser.parse_args(["watch", "--max-events", "1"]).command == "watch"
+    assert parser.parse_args(["relations", "list"]).relation_command == "list"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--api-key", "secret", "scan-once"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["watch", "--max-events", "0"])
+
+
+def test_main_has_stable_input_and_operational_exit_codes(tmp_path, capsys):
+    assert main(["--config", str(tmp_path / "missing.yaml"), "report"]) == 2
+    assert "error:" in capsys.readouterr().err
+
+
+def _relation(path: Path, *, source_hash: str = "sha256:one") -> None:
+    path.write_text(
+        f"""
+relation_id: implication-a-b
+version: 1
+status: active
+source_rules_hash: {source_hash}
+legs:
+  - token_id: NO_A
+    weight: 1
+  - token_id: YES_B
+    weight: 1
+states:
+  - name: a_true_b_true
+    proceeds: {{NO_A: 0, YES_B: 1}}
+  - name: a_false_b_true
+    proceeds: {{NO_A: 1, YES_B: 1}}
+  - name: a_false_b_false
+    proceeds: {{NO_A: 1, YES_B: 0}}
+semantic_review:
+  reviewer: human
+  reviewed_at: 2026-07-26
+  conclusion: A implies B
+""".strip(),
+        encoding="utf-8",
+    )
+
+
+def test_relation_registry_is_idempotent_and_rejects_conflict_and_traversal(tmp_path):
+    source = tmp_path / "source.yaml"
+    _relation(source)
+    registry = RelationRegistry(tmp_path / "rules")
+    first = registry.import_file(source)
+    assert registry.import_file(source) == first
+    _relation(source, source_hash="sha256:different")
+    with pytest.raises(RelationValidationError, match="conflict"):
+        registry.import_file(source)
+    with pytest.raises(ValueError):
+        RelationRegistry(tmp_path / ".." / "escape")
+    unsafe = tmp_path / "unsafe.yaml"
+    _relation(unsafe)
+    unsafe.write_text(
+        unsafe.read_text(encoding="utf-8").replace(
+            "relation_id: implication-a-b", "relation_id: ../escape"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RelationValidationError, match="safe"):
+        registry.import_file(unsafe)
+
+
+def test_relation_payload_retains_audited_identity(tmp_path):
+    source = tmp_path / "source.yaml"
+    _relation(source)
+    payload = relation_payload(source)
+    assert payload["relation_id"] == "implication-a-b"
+    assert payload["version"] == 1
+    assert payload["audited"] is True
+
+
+def test_registry_matching_relation_is_loaded_by_exact_tokens(tmp_path):
+    source = tmp_path / "source.yaml"
+    _relation(source)
+    registry = RelationRegistry(tmp_path / "rules")
+    registry.import_file(source)
+    matched = registry.match(("NO_A", "YES_B"), relation_id="implication-a-b")
+    assert matched is not None
+    assert matched.relation_id == "implication-a-b"
+    assert registry.match(("wrong", "tokens")) is None
+
+
+def market(*, tradeable=True):
+    return MarketMetadata(
+        market_id="market", condition_id="condition", question="Question?",
+        slug=None,
+        events=(EventMetadata("event", None, None, "{}"),),
+        tokens=(TokenMetadata("yes", "YES"), TokenMetadata("no", "NO")),
+        active=True if tradeable else False, closed=False, archived=False,
+        accepting_orders=True, enable_order_book=True, neg_risk=False,
+        end_date="2027-01-01", fees_enabled=True,
+        fee_schedule_source_json=None, fee_schedule_source=None,
+        source_metadata_json="{}",
+    )
+
+
+def test_binary_market_factory_uses_exact_pairing_and_audited_payoffs():
+    value = binary_market_from_metadata(market())
+    assert value.token_ids == ("yes", "no")
+    assert value.relation.minimum_units_received() == 1
+    assert value.relation.semantic_review is not None
+
+
+@pytest.mark.asyncio
+async def test_catalog_scan_skips_bad_markets_and_continues_operational_errors():
+    calls = []
+
+    class Engine:
+        async def scan_binary(self, value):
+            calls.append(value.condition_id)
+            raise RuntimeError("market failed")
+
+    discovery = GammaDiscovery(
+        (market(), market(tradeable=False)), ()
+    )
+    summary = await scan_catalog(discovery, engine_factory=lambda _market: Engine())
+    assert calls == ["condition"]
+    assert summary["failed"] == 1
+    assert summary["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_empty_report_has_defined_quantiles_and_bounds(tmp_path):
+    async with OpportunityStore(tmp_path / "evidence.sqlite3") as store:
+        report = await store.report(limit=10)
+    assert report["total"] == 0
+    assert report["latency_ms"] == {"p50": None, "p95": None, "p99": None}
+    with pytest.raises(ValueError):
+        async with OpportunityStore(tmp_path / "evidence.sqlite3") as store:
+            await store.report(limit=0)
+
+
+@pytest.mark.asyncio
+async def test_catalog_snapshot_is_idempotent_and_survives_reopen(tmp_path):
+    path = tmp_path / "catalog.sqlite3"
+    snapshot = {
+        "fetched_at_ms": 10,
+        "markets": [{"id": "m", "condition_id": "c", "event_ids": ["e"],
+                     "tokens": [{"id": "yes", "outcome": "YES"},
+                                {"id": "no", "outcome": "NO"}],
+                     "active": True, "tradeable": True, "neg_risk": False,
+                     "fee_provenance": {"source": "gamma"}, "raw_json": "{}"}],
+        "diagnostics": [],
+    }
+    async with OpportunityStore(path) as store:
+        first = await store.save_catalog_snapshot(snapshot)
+        assert await store.save_catalog_snapshot(snapshot) == first
+        later = {**snapshot, "fetched_at_ms": 99}
+        assert await store.save_catalog_snapshot(later) == first
+        current = await store.list_current_catalog_markets(limit=10)
+        assert current[0]["fetched_at_ms"] == 99
+    async with OpportunityStore(path) as store:
+        records = await store.list_catalog_snapshots(limit=10)
+    assert records[0]["id"] == first
+    assert records[0]["markets"][0]["condition_id"] == "c"
+
+
+@pytest.mark.asyncio
+async def test_catalog_current_lifecycle_marks_missing_inactive(tmp_path):
+    path = tmp_path / "lifecycle.sqlite3"
+    first = {
+        "fetched_at_ms": 10,
+        "markets": [{"id": "m", "condition_id": "c", "event_ids": ["e"],
+                     "tokens": [{"id": "yes", "outcome": "YES"},
+                                {"id": "no", "outcome": "NO"}],
+                     "active": True, "closed": False, "tradeable": True,
+                     "neg_risk": False, "fee_provenance": {}, "raw_json": "{}"}],
+        "diagnostics": [],
+    }
+    async with OpportunityStore(path) as store:
+        await store.save_catalog_snapshot(first)
+        await store.save_catalog_snapshot(
+            {"fetched_at_ms": 20, "markets": [], "diagnostics": []}
+        )
+    async with OpportunityStore(path) as store:
+        current = await store.list_current_catalog_markets(limit=10)
+    assert current == [{
+        "market_id": "m", "condition_id": "c",
+        "last_seen_snapshot": current[0]["last_seen_snapshot"],
+        "fetched_at_ms": 10, "last_seen_at_ms": 10,
+        "state_updated_at_ms": 20, "state_update_sequence": 2,
+        "presence": "MISSING", "active": False,
+        "closed": False, "tradeable": False,
+        "last_seen_run_id": current[0]["last_seen_run_id"],
+    }]
+
+
+@pytest.mark.asyncio
+async def test_partial_catalog_never_marks_unseen_missing(tmp_path):
+    path = tmp_path / "partial.sqlite3"
+    original = {
+        "fetched_at_ms": 10, "complete": True, "provenance": "exhausted",
+        "markets": [{"id": "m", "condition_id": "c", "event_ids": ["e"],
+                     "tokens": [{"id": "yes", "outcome": "YES"}],
+                     "active": True, "closed": False, "tradeable": True}],
+        "diagnostics": [],
+    }
+    async with OpportunityStore(path) as store:
+        await store.save_catalog_snapshot(original)
+        await store.save_catalog_snapshot({
+            "fetched_at_ms": 20, "complete": False,
+            "provenance": "max_pages", "markets": [], "diagnostics": [],
+        })
+        assert (await store.list_current_catalog_markets(limit=10))[0][
+            "presence"
+        ] == "SEEN"
+        await store.save_catalog_snapshot({
+            "fetched_at_ms": 30, "complete": True,
+            "provenance": "exhausted", "markets": [], "diagnostics": [],
+        })
+        assert (await store.list_current_catalog_markets(limit=10))[0][
+            "presence"
+        ] == "MISSING"
+
+
+@pytest.mark.asyncio
+async def test_catalog_child_failure_rolls_back_snapshot_and_current(tmp_path):
+    path = tmp_path / "rollback.sqlite3"
+    malformed = {
+        "fetched_at_ms": 10, "complete": True, "provenance": "exhausted",
+        "markets": [
+            {"id": "good", "condition_id": "c1", "event_ids": [],
+             "tokens": [{"id": "token", "outcome": "YES"}],
+             "active": True, "closed": False, "tradeable": True},
+            {"id": "../unsafe", "condition_id": "c2", "event_ids": [],
+             "tokens": [{"id": "other", "outcome": "NO"}],
+             "active": True, "closed": False, "tradeable": True},
+        ],
+        "diagnostics": [],
+    }
+    async with OpportunityStore(path) as store:
+        with pytest.raises(ValueError):
+            await store.save_catalog_snapshot(malformed)
+        assert await store.list_catalog_snapshots(limit=10) == []
+        assert await store.list_current_catalog_markets(limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_delayed_older_catalog_sync_cannot_regress_newer_current_state(tmp_path):
+    path = tmp_path / "chronology.sqlite3"
+    def snapshot(at, *, active, closed, markets=True):
+        return {
+            "fetched_at_ms": at, "complete": True, "provenance": "exhausted",
+            "markets": ([{
+                "id": "m", "condition_id": "c", "event_ids": ["e"],
+                "tokens": [{"id": "yes", "outcome": "YES"}],
+                "active": active, "closed": closed,
+                "tradeable": active and not closed,
+            }] if markets else []),
+            "diagnostics": [],
+        }
+    async with OpportunityStore(path) as store:
+        await store.save_catalog_snapshot(snapshot(20, active=False, closed=True))
+        await store.save_catalog_snapshot(snapshot(10, active=True, closed=False))
+        await store.save_catalog_snapshot(
+            snapshot(15, active=False, closed=False, markets=False)
+        )
+        current = (await store.list_current_catalog_markets(limit=10))[0]
+        assert current["fetched_at_ms"] == 20
+        assert current["presence"] == "SEEN"
+        assert current["active"] is False
+        assert current["closed"] is True
+        assert len(await store.list_catalog_snapshots(limit=10)) == 3
+
+
+@pytest.mark.asyncio
+async def test_delayed_seen_cannot_override_newer_missing_state(tmp_path):
+    path = tmp_path / "missing-watermark.sqlite3"
+    seen = {
+        "complete": True, "provenance": "exhausted",
+        "markets": [{
+            "id": "m", "condition_id": "c", "event_ids": ["e"],
+            "tokens": [{"id": "yes", "outcome": "YES"}],
+            "active": True, "closed": False, "tradeable": True,
+        }],
+        "diagnostics": [],
+    }
+    async with OpportunityStore(path) as store:
+        await store.save_catalog_snapshot({**seen, "fetched_at_ms": 10})
+        await store.save_catalog_snapshot({
+            "fetched_at_ms": 20, "complete": True,
+            "provenance": "exhausted", "markets": [], "diagnostics": [],
+        })
+        await store.save_catalog_snapshot({
+            **seen, "fetched_at_ms": 15, "complete": False,
+            "provenance": "delayed_partial",
+        })
+    async with OpportunityStore(path) as store:
+        current = (await store.list_current_catalog_markets(limit=10))[0]
+    assert current["presence"] == "MISSING"
+    assert current["last_seen_at_ms"] == 10
+    assert current["state_updated_at_ms"] == 20
+    assert current["active"] is False
+    assert current["tradeable"] is False
+
+
+@pytest.mark.asyncio
+async def test_v3_migration_backfills_missing_from_complete_sync_watermark(tmp_path):
+    path = tmp_path / "v3.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+        PRAGMA user_version=3;
+        CREATE TABLE catalog_sync_runs (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          snapshot_id TEXT NOT NULL,
+          fetched_at_ms INTEGER NOT NULL,
+          complete INTEGER NOT NULL,
+          provenance TEXT NOT NULL
+        );
+        CREATE TABLE current_catalog_markets (
+          market_id TEXT PRIMARY KEY, condition_id TEXT NOT NULL,
+          last_seen_snapshot TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
+          presence TEXT NOT NULL, active INTEGER, closed INTEGER,
+          tradeable INTEGER NOT NULL, canonical_json TEXT NOT NULL
+        );
+        CREATE TABLE current_catalog_tokens (
+          token_id TEXT PRIMARY KEY, market_id TEXT NOT NULL,
+          last_seen_snapshot TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
+          presence TEXT NOT NULL, canonical_json TEXT NOT NULL
+        );
+        CREATE TABLE current_catalog_events (
+          event_id TEXT PRIMARY KEY, last_seen_snapshot TEXT NOT NULL,
+          fetched_at_ms INTEGER NOT NULL, presence TEXT NOT NULL,
+          canonical_json TEXT NOT NULL
+        );
+        INSERT INTO catalog_sync_runs
+          (snapshot_id,fetched_at_ms,complete,provenance)
+          VALUES ('seen10',10,1,'exhausted'),('empty20',20,1,'exhausted');
+        INSERT INTO current_catalog_markets VALUES
+          ('a','ca','seen10',10,'MISSING',0,0,0,'{}'),
+          ('b','cb','seen12',12,'SEEN',1,0,1,'{}');
+    """)
+    connection.commit()
+    connection.close()
+
+    delayed = {
+        "fetched_at_ms": 15, "complete": False, "provenance": "delayed",
+        "markets": [{
+            "id": "a", "condition_id": "ca", "event_ids": [],
+            "tokens": [{"id": "ta", "outcome": "YES"}],
+            "active": True, "closed": False, "tradeable": True,
+        }],
+        "diagnostics": [],
+    }
+    async with OpportunityStore(path) as store:
+        migrated = {
+            row["market_id"]: row
+            for row in await store.list_current_catalog_markets(limit=10)
+        }
+        assert migrated["a"]["last_seen_at_ms"] == 10
+        assert migrated["a"]["state_updated_at_ms"] == 20
+        assert migrated["b"]["state_updated_at_ms"] == 12
+        await store.save_catalog_snapshot(delayed)
+        after = {
+            row["market_id"]: row
+            for row in await store.list_current_catalog_markets(limit=10)
+        }
+    assert after["a"]["presence"] == "MISSING"
+    assert after["a"]["last_seen_at_ms"] == 10
+    assert after["a"]["state_updated_at_ms"] == 20
+
+
+@pytest.mark.asyncio
+async def test_v3_missing_without_sync_history_migrates_fail_closed(tmp_path):
+    path = tmp_path / "v3-no-history.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+        PRAGMA user_version=3;
+        CREATE TABLE catalog_sync_runs (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          snapshot_id TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
+          complete INTEGER NOT NULL, provenance TEXT NOT NULL
+        );
+        CREATE TABLE current_catalog_markets (
+          market_id TEXT PRIMARY KEY, condition_id TEXT NOT NULL,
+          last_seen_snapshot TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
+          presence TEXT NOT NULL, active INTEGER, closed INTEGER,
+          tradeable INTEGER NOT NULL, canonical_json TEXT NOT NULL
+        );
+        CREATE TABLE current_catalog_tokens (
+          token_id TEXT PRIMARY KEY, market_id TEXT NOT NULL,
+          last_seen_snapshot TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
+          presence TEXT NOT NULL, canonical_json TEXT NOT NULL
+        );
+        CREATE TABLE current_catalog_events (
+          event_id TEXT PRIMARY KEY, last_seen_snapshot TEXT NOT NULL,
+          fetched_at_ms INTEGER NOT NULL, presence TEXT NOT NULL,
+          canonical_json TEXT NOT NULL
+        );
+        INSERT INTO current_catalog_markets VALUES
+          ('a','ca','unknown',10,'MISSING',0,0,0,'{}'),
+          ('b','cb','unknown',10,'MISSING',0,0,0,'{}');
+    """)
+    connection.commit()
+    connection.close()
+    async with OpportunityStore(path) as store:
+        rows = await store.list_current_catalog_markets(limit=10)
+        assert rows[0]["last_seen_at_ms"] == 10
+        assert rows[0]["state_updated_at_ms"] == 9223372036854775807
+        partial_a = {
+            "fetched_at_ms": 15, "complete": False,
+            "provenance": "partial",
+            "markets": [{
+                "id": "a", "condition_id": "ca", "event_ids": [],
+                "tokens": [{"id": "ta", "outcome": "YES"}],
+                "active": True, "closed": False, "tradeable": True,
+            }],
+            "diagnostics": [],
+        }
+        await store.save_catalog_snapshot(partial_a)
+        still_missing = {
+            row["market_id"]: row
+            for row in await store.list_current_catalog_markets(limit=10)
+        }
+        assert still_missing["a"]["presence"] == "MISSING"
+        assert still_missing["a"]["state_updated_at_ms"] == 9223372036854775807
+
+        await store.save_catalog_snapshot({
+            **partial_a, "fetched_at_ms": 20, "complete": True,
+            "provenance": "pagination_exhausted",
+        })
+    async with OpportunityStore(path) as store:
+        reconciled = {
+            row["market_id"]: row
+            for row in await store.list_current_catalog_markets(limit=10)
+        }
+        assert reconciled["a"]["presence"] == "SEEN"
+        assert reconciled["a"]["last_seen_at_ms"] == 20
+        assert reconciled["a"]["state_updated_at_ms"] == 20
+        assert reconciled["b"]["presence"] == "MISSING"
+        assert reconciled["b"]["last_seen_at_ms"] == 10
+        assert reconciled["b"]["state_updated_at_ms"] == 20
+
+        await store.save_catalog_snapshot({
+            "fetched_at_ms": 19, "complete": False,
+            "provenance": "delayed_partial",
+            "markets": [{
+                "id": "b", "condition_id": "cb", "event_ids": [],
+                "tokens": [{"id": "tb", "outcome": "YES"}],
+                "active": True, "closed": False, "tradeable": True,
+            }],
+            "diagnostics": [],
+        })
+        after_delayed = {
+            row["market_id"]: row
+            for row in await store.list_current_catalog_markets(limit=10)
+        }
+        await store.save_catalog_snapshot({
+            "fetched_at_ms": 21, "complete": False,
+            "provenance": "newer_partial",
+            "markets": [{
+                "id": "a", "condition_id": "ca", "event_ids": [],
+                "tokens": [{"id": "ta", "outcome": "YES"}],
+                "active": False, "closed": True, "tradeable": False,
+            }],
+            "diagnostics": [],
+        })
+        normal = {
+            row["market_id"]: row
+            for row in await store.list_current_catalog_markets(limit=10)
+        }
+    assert after_delayed["b"]["presence"] == "MISSING"
+    assert after_delayed["b"]["state_updated_at_ms"] == 20
+    assert normal["a"]["presence"] == "SEEN"
+    assert normal["a"]["last_seen_at_ms"] == 21
+    assert normal["a"]["state_updated_at_ms"] == 21
+    assert normal["a"]["closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_shares_one_public_http_client_and_closes_once(tmp_path):
+    transport = httpx.MockTransport(lambda request: httpx.Response(500))
+    runtime = Runtime(http_transport=transport)
+    async with runtime:
+        assert runtime.gamma.http is runtime.discovery_clob.http
+        assert runtime.discovery_clob.http is runtime.confirmation_clob.http
+        assert "authorization" not in runtime.http.headers
+    assert runtime.http.is_closed
+
+
+@pytest.mark.asyncio
+async def test_store_query_limits_reject_bool_and_cap(tmp_path):
+    async with OpportunityStore(tmp_path / "bounded.sqlite3") as store:
+        assert await store.list_opportunities(limit=1) == []
+        assert await store.list_runs(limit=1) == []
+        for value in (True, 0, 10_001):
+            with pytest.raises(ValueError):
+                await store.list_opportunities(limit=value)
+
+
+@pytest.mark.asyncio
+async def test_sync_command_offline_persists_normalized_catalog(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8").replace(
+            "data/predmarket.sqlite3", str(tmp_path / "catalog.sqlite3")
+        ),
+        encoding="utf-8",
+    )
+
+    class Gamma:
+        async def active_markets(self, **bounds):
+            assert bounds == {
+                "limit": 10, "max_pages": 1, "max_markets": 10,
+                "allow_partial": True,
+            }
+            return GammaDiscovery((market(),), ())
+
+    class FakeRuntime:
+        gamma = Gamma()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    args = build_parser().parse_args([
+        "--config", str(config), "--json", "sync-markets",
+        "--limit", "10", "--max-pages", "1", "--max-markets", "10",
+        "--rules-dir", str(tmp_path / "rules"),
+    ])
+    output = await dispatch(
+        args, runtime_factory=FakeRuntime, wall_clock_ms=lambda: 123
+    )
+    assert output["markets"] == 1
+    async with OpportunityStore(tmp_path / "catalog.sqlite3") as store:
+        current = await store.list_current_catalog_markets(limit=10)
+    assert current[0]["presence"] == "SEEN"
+    assert current[0]["tradeable"] is True
+
+
+def test_json_mode_keeps_terminal_audit_off_stdout(capsys):
+    async def fake_dispatcher(args):
+        print("status=SNAPSHOT_EXECUTABLE", file=sys.stderr)
+        return {"收益": Decimal("0.0075")}
+
+    assert main(["--json", "scan-once"], dispatcher=fake_dispatcher) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"收益": "0.0075"}
+    assert captured.out.count("\n") == 1
+    assert "SNAPSHOT_EXECUTABLE" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_watch_command_retries_initial_connect_and_persists_metrics(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8").replace(
+            "data/predmarket.sqlite3", str(tmp_path / "watch.sqlite3")
+        ),
+        encoding="utf-8",
+    )
+
+    class Gamma:
+        async def active_markets(self, **_bounds):
+            return GammaDiscovery((market(),), ())
+
+    class FeeClob:
+        async def market_info(self, condition, *, expected_token_ids):
+            assert condition == "condition"
+            assert expected_token_ids == ("yes", "no")
+            return SimpleNamespace(
+                tick_size=Decimal("0.01"),
+                minimum_order_size=Decimal("1"),
+            )
+
+    class FakeRuntime:
+        gamma = Gamma()
+        discovery_clob = object()
+        confirmation_clob = object()
+        fee_clob = FeeClob()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    attempts = []
+    async def connector(url):
+        attempts.append(url)
+        raise ConnectionError("offline")
+
+    async def no_sleep(_delay):
+        pass
+
+    args = build_parser().parse_args([
+        "--config", str(config), "watch", "--max-connections", "2",
+        "--max-events", "1", "--rules-dir", str(tmp_path / "rules"),
+    ])
+    with pytest.raises(WatchOperationalError):
+        await dispatch(
+            args, runtime_factory=FakeRuntime, websocket_connector=connector,
+            sleeper=no_sleep, wall_clock_ms=lambda: 1000,
+            monotonic=lambda: 1.0,
+        )
+    assert len(attempts) == 2
+    async with OpportunityStore(tmp_path / "watch.sqlite3") as store:
+        metrics = await store.list_watch_metrics(limit=1)
+    assert metrics[0]["reconnects"] == 1
+    assert metrics[0]["disconnects"] == 2
+    assert metrics[0]["epoch_states"] == {"no": "RESYNC", "yes": "RESYNC"}
+
+
+def test_main_maps_exhausted_watch_to_operational_exit(capsys):
+    async def failed(_args):
+        raise WatchOperationalError("no accepted event")
+
+    assert main(["watch"], dispatcher=failed) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "WatchOperationalError" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_reconcile_loop_consumes_configured_interval_and_is_cancellable():
+    import asyncio
+
+    calls = []
+    fetched = asyncio.Event()
+
+    class Provider:
+        async def books(self, token_ids):
+            calls.append(("books", token_ids))
+            fetched.set()
+            return tuple(
+                BookSnapshot(
+                    OrderBook(
+                        token, (BookLevel(Decimal("0.44"), Decimal("2")),),
+                        (BookLevel(Decimal("0.45"), Decimal("2")),),
+                        Decimal("0.01"), Decimal("1"), 1000, f"rest-{token}",
+                    ),
+                    "condition", False, None, 1000, 1.0,
+                )
+                for token in token_ids
+            )
+
+    first = True
+    async def scheduler(delay):
+        nonlocal first
+        calls.append(("sleep", delay))
+        if first:
+            first = False
+            return
+        await asyncio.Future()
+
+    watcher = MarketWebSocket(
+        {"yes": "condition", "no": "condition"},
+        queue_capacity=2,
+        wall_clock_ms=lambda: 1000,
+        monotonic=lambda: 1.0,
+        book_metadata={
+            token: BookMetadata("condition", Decimal("0.01"), Decimal("1"))
+            for token in ("yes", "no")
+        },
+    )
+    task = asyncio.create_task(
+        _reconcile_loop(watcher, Provider(), ("yes", "no"), 17, scheduler)
+    )
+    await fetched.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls[:2] == [("sleep", 17), ("books", ("yes", "no"))]
+    assert watcher.metrics().reconciliation_successes == 1
+
+
+@pytest.mark.asyncio
+async def test_watch_command_offline_success_reconfirms_with_two_rest_books(
+    tmp_path, monkeypatch
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8").replace(
+            "data/predmarket.sqlite3", str(tmp_path / "watch-ok.sqlite3")
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def snapshots(received_ms, received_mono):
+        return tuple(
+            BookSnapshot(
+                OrderBook(
+                    token, (BookLevel(Decimal("0.44"), Decimal("10")),),
+                    (BookLevel(Decimal("0.45"), Decimal("10")),),
+                    Decimal("0.01"), Decimal("1"), 1000, f"{token}-{received_ms}",
+                ),
+                "condition", False, None, received_ms, received_mono,
+            )
+            for token in ("yes", "no")
+        )
+
+    class Books:
+        def __init__(self, name, values):
+            self.name, self.values = name, values
+        async def books(self, token_ids):
+            calls.append((self.name, token_ids, self.values))
+            return self.values
+
+    schedule = FeeSchedule(Decimal("0"), 1, True, 1000)
+    class FeeClob:
+        async def market_info(self, condition, *, expected_token_ids):
+            calls.append(("fee", condition, expected_token_ids))
+            return SimpleNamespace(
+                tick_size=Decimal("0.01"), minimum_order_size=Decimal("1"),
+                bound_fee_schedules=lambda: (
+                    ("yes", schedule), ("no", schedule)
+                ),
+            )
+
+    class Gamma:
+        async def active_markets(self, **_bounds):
+            return GammaDiscovery((market(),), ())
+
+    discovery = Books("discovery", snapshots(1100, 1.1))
+    confirmation = Books("confirmation", snapshots(1200, 1.2))
+    class FakeRuntime:
+        gamma = Gamma()
+        discovery_clob = discovery
+        confirmation_clob = confirmation
+        fee_clob = FeeClob()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    fixture_root = Path("tests/fixtures/polymarket")
+    class Connection:
+        def __init__(self):
+            self.messages = [
+                (fixture_root / "ws_book_yes.json").read_text(),
+                (fixture_root / "ws_delta.json").read_text(),
+                (fixture_root / "ws_book_no.json").read_text(),
+            ]
+            self.closed = False
+        async def send(self, _message):
+            pass
+        async def recv(self):
+            return self.messages.pop(0)
+        async def close(self):
+            self.closed = True
+
+    connection = Connection()
+    async def connector(_url):
+        return connection
+    async def idle_scheduler(_delay):
+        import asyncio
+        await asyncio.Future()
+
+    monkeypatch.setattr("predmarket.commands.sys.platform", "linux")
+    args = build_parser().parse_args([
+        "--config", str(config), "--json", "watch",
+        "--max-connections", "1", "--max-events", "3",
+        "--rules-dir", str(tmp_path / "rules"),
+    ])
+    output = await dispatch(
+        args, runtime_factory=FakeRuntime, websocket_connector=connector,
+        sleeper=idle_scheduler, wall_clock_ms=lambda: 2000,
+        monotonic=lambda: 1.3,
+    )
+    assert output["evaluated"] == 1
+    assert output["results"][0]["status"] == OpportunityStatus.SNAPSHOT_EXECUTABLE
+    assert [call[0] for call in calls] == [
+        "fee", "discovery", "confirmation", "fee"
+    ]
+    assert calls[1][2] is not calls[2][2]
+    assert connection.closed is True
+    async with OpportunityStore(tmp_path / "watch-ok.sqlite3") as store:
+        assert len(await store.list_opportunities(limit=10)) == 1
+        assert (await store.list_watch_metrics(limit=1))[0]["received"] == 3
+
+    report_args = build_parser().parse_args([
+        "--config", str(config), "--json", "report", "--limit", "10",
+    ])
+    report = await dispatch(report_args)
+    assert report["by_status"]["SNAPSHOT_EXECUTABLE"] == 1
+    assert report["by_path"]["IMMEDIATE_CONVERSION"] == 1
+    assert report["by_pipeline_reason"]["all_gates_passed"] == 1
+    economics = report["executable_economics"][0]
+    assert set(economics) == {
+        "quantity", "total_investment", "minimum_proceeds",
+        "net_profit", "net_return",
+    }
+    assert all(type(value) is str for value in economics.values())
+    assert all(report["latency_ms"][key] is not None for key in ("p50", "p95", "p99"))
+    assert report["notification_attempts"]["FAILED"] == 1
+    assert report["notification_claims"]["FAILED"] == 1
+    assert report["delivery_uncertain"] == 0
+    assert report["ws_metrics"]["queue_high_water"] >= 1
+    assert report["ws_metrics"]["received"] == 3
+
+    evidence_id = output["results"][0]["evidence_id"]
+    latest = await dispatch(build_parser().parse_args([
+        "--config", str(config), "--json", "replay", "opp:condition",
+    ]))
+    exact = await dispatch(build_parser().parse_args([
+        "--config", str(config), "--json", "replay", "--bundle-id", evidence_id,
+    ]))
+    assert latest["core_evidence"]["id"] == evidence_id
+    assert exact["core_evidence"]["id"] == evidence_id
+    audit = exact["notification_audit"]
+    assert audit["claims"][0]["state"] == "FAILED"
+    assert audit["attempts"][0][1] == "FAILED"
+    assert [event[1] for event in audit["events"]] == ["CLAIMED", "FAILED"]
+    with pytest.raises(KeyError):
+        await dispatch(build_parser().parse_args([
+            "--config", str(config), "replay", "unknown",
+        ]))
+
+
+@pytest.mark.asyncio
+async def test_targeted_scan_rejects_selected_relation_token_mismatch(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8").replace(
+            "data/predmarket.sqlite3", str(tmp_path / "mismatch.sqlite3")
+        ),
+        encoding="utf-8",
+    )
+    source = tmp_path / "relation.yaml"
+    _relation(source)
+    registry = RelationRegistry(tmp_path / "rules")
+    registry.import_file(source)
+
+    class FakeRuntime:
+        gamma = object()
+        discovery_clob = object()
+        confirmation_clob = object()
+        fee_clob = object()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    args = build_parser().parse_args([
+        "--config", str(config), "scan-once", "--condition", "condition",
+        "--yes-token", "yes", "--no-token", "no",
+        "--rules-dir", str(tmp_path / "rules"),
+        "--relation-id", "implication-a-b",
+    ])
+    with pytest.raises(RelationValidationError, match="does not match"):
+        await dispatch(args, runtime_factory=FakeRuntime)
+
+
+@pytest.mark.asyncio
+async def test_relation_commands_flow_through_parser_and_dispatch(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    source = tmp_path / "relation.yaml"
+    _relation(source)
+    rules = tmp_path / "rules"
+    common = ["--config", str(config), "relations", "--rules-dir", str(rules)]
+    validated = await dispatch(build_parser().parse_args([
+        *common, "validate", str(source),
+    ]))
+    assert validated["audited"] is True
+    imported = await dispatch(build_parser().parse_args([
+        *common, "import", str(source),
+    ]))
+    assert Path(imported["imported"]).exists()
+    listed = await dispatch(build_parser().parse_args([*common, "list"]))
+    assert [item["relation_id"] for item in listed["relations"]] == [
+        "implication-a-b"
+    ]
+
+
+def test_targeted_scan_replay_and_report_flow_through_main_json(
+    tmp_path, monkeypatch, capsys
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8").replace(
+            "data/predmarket.sqlite3", str(tmp_path / "flow.sqlite3")
+        ),
+        encoding="utf-8",
+    )
+
+    def batch(received_ms, mono):
+        return tuple(
+            BookSnapshot(
+                OrderBook(
+                    token, (BookLevel(Decimal("0.44"), Decimal("10")),),
+                    (BookLevel(Decimal("0.45"), Decimal("10")),),
+                    Decimal("0.01"), Decimal("1"), 1000, f"{token}-{received_ms}",
+                ),
+                "condition", False, None, received_ms, mono,
+            )
+            for token in ("yes", "no")
+        )
+
+    class Books:
+        def __init__(self, values):
+            self.values = values
+        async def books(self, _tokens):
+            return self.values
+
+    schedule = FeeSchedule(Decimal("0"), 1, True, 1000)
+    class Fees:
+        async def market_info(self, _condition, *, expected_token_ids):
+            return SimpleNamespace(bound_fee_schedules=lambda: tuple(
+                (token, schedule) for token in expected_token_ids
+            ))
+
+    class FakeRuntime:
+        gamma = object()
+        discovery_clob = Books(batch(1100, 1.1))
+        confirmation_clob = Books(batch(1200, 1.2))
+        fee_clob = Fees()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    async def bound(args):
+        return await dispatch(
+            args, runtime_factory=FakeRuntime,
+            wall_clock_ms=lambda: 2000, monotonic=lambda: 1.25,
+        )
+
+    monkeypatch.setattr("predmarket.commands.sys.platform", "linux")
+    assert main([
+        "--config", str(config), "--json", "scan-once",
+        "--condition", "condition", "--yes-token", "yes",
+        "--no-token", "no", "--rules-dir", str(tmp_path / "rules"),
+    ], dispatcher=bound) == 0
+    scan_output = json.loads(capsys.readouterr().out)
+    assert scan_output["results"][0]["status"] == "RESEARCH_CANDIDATE"
+
+    assert main([
+        "--config", str(config), "--json", "replay", "opp:condition",
+    ], dispatcher=bound) == 0
+    replay_output = json.loads(capsys.readouterr().out)
+    assert replay_output["core_evidence"]["opportunity"]["id"] == "opp:condition"
+    assert "notification_audit" in replay_output
+
+    assert main([
+        "--config", str(config), "--json", "report", "--limit", "10",
+    ], dispatcher=bound) == 0
+    report_output = json.loads(capsys.readouterr().out)
+    assert report_output["by_status"]["RESEARCH_CANDIDATE"] == 1
+    assert report_output["by_path"]["IMMEDIATE_CONVERSION"] == 1
+    assert report_output["by_pipeline_reason"]["release_date_unknown"] == 1
+
+
+def test_catalog_scan_command_continues_provider_failure_and_outputs_json(
+    tmp_path, monkeypatch, capsys
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8").replace(
+            "data/predmarket.sqlite3", str(tmp_path / "catalog-scan.sqlite3")
+        ),
+        encoding="utf-8",
+    )
+    first = market()
+    second = replace(
+        market(), market_id="market2", condition_id="condition2",
+        events=(EventMetadata("event2", None, None, "{}"),),
+        tokens=(TokenMetadata("yes2", "YES"), TokenMetadata("no2", "NO")),
+    )
+    calls = []
+
+    def snapshots(received_ms, mono):
+        return tuple(
+            BookSnapshot(
+                OrderBook(
+                    token, (BookLevel(Decimal("0.44"), Decimal("10")),),
+                    (BookLevel(Decimal("0.45"), Decimal("10")),),
+                    Decimal("0.01"), Decimal("1"), 1000, f"{token}-{received_ms}",
+                ),
+                "condition", False, None, received_ms, mono,
+            )
+            for token in ("yes", "no")
+        )
+
+    class Gamma:
+        async def active_markets(self, **_bounds):
+            return GammaDiscovery((first, second), ())
+
+    class Books:
+        def __init__(self, stage, values):
+            self.stage, self.values = stage, values
+        async def books(self, tokens):
+            calls.append((self.stage, tokens))
+            if "yes2" in tokens:
+                raise ConnectionError("second market offline")
+            return self.values
+
+    schedule = FeeSchedule(Decimal("0"), 1, True, 1000)
+    class Fees:
+        async def market_info(self, condition, *, expected_token_ids):
+            calls.append(("fees", condition))
+            return SimpleNamespace(bound_fee_schedules=lambda: tuple(
+                (token, schedule) for token in expected_token_ids
+            ))
+
+    class FakeRuntime:
+        gamma = Gamma()
+        discovery_clob = Books("discovery", snapshots(1100, 1.1))
+        confirmation_clob = Books("confirmation", snapshots(1200, 1.2))
+        fee_clob = Fees()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    async def bound(args):
+        return await dispatch(
+            args, runtime_factory=FakeRuntime,
+            wall_clock_ms=lambda: 2000, monotonic=lambda: 1.25,
+        )
+
+    monkeypatch.setattr("predmarket.commands.sys.platform", "linux")
+    argv = [
+        "--config", str(config), "--json", "scan-once", "--limit", "2",
+        "--rules-dir", str(tmp_path / "rules"),
+    ]
+    assert main(argv, dispatcher=bound) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["evaluated"] == 2
+    assert [item["status"] for item in output["results"]] == [
+        "SNAPSHOT_EXECUTABLE", "REJECTED",
+    ]
+    assert output["results"][1]["reason"] == "discovery_provider_failure"
+    assert calls == [
+        ("discovery", ("yes", "no")),
+        ("confirmation", ("yes", "no")),
+        ("fees", "condition"),
+        ("discovery", ("yes2", "no2")),
+    ]
+
+    human_argv = [item for item in argv if item != "--json"]
+    assert main(human_argv, dispatcher=bound) == 0
+    human = capsys.readouterr()
+    assert '"status": "SNAPSHOT_EXECUTABLE"' in human.out
+    assert '"evaluated": 2' in human.out

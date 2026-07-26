@@ -1,0 +1,34 @@
+{
+  "markets": [
+    {
+      "id": "101",
+      "slug": "example-market",
+      "question": "Will the example happen?",
+      "conditionId": "condition-101",
+      "events": [
+        {
+          "id": "event-10",
+          "slug": "example-event",
+          "title": "Example Event"
+        }
+      ],
+      "active": true,
+      "closed": false,
+      "archived": false,
+      "acceptingOrders": true,
+      "enableOrderBook": true,
+      "negRisk": false,
+      "outcomes": "[\"Yes\", \"No\"]",
+      "clobTokenIds": "[\"yes-101\", \"no-101\"]",
+      "endDate": "2027-01-01T00:00:00Z",
+      "feesEnabled": true,
+      "feeSchedule": {
+        "exponent": 2,
+        "rate": 0.02,
+        "takerOnly": true,
+        "rebateRate": 0.2
+      }
+    }
+  ],
+  "next_cursor": "next/+=="
+}
