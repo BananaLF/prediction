@@ -87,6 +87,11 @@ class RelationRegistry:
             return []
         return [relation_payload(path) for path in sorted(self.path.glob("*.yaml"))]
 
+    def relations(self) -> tuple[Relation, ...]:
+        if not self.path.exists():
+            return ()
+        return tuple(load_relation(path) for path in sorted(self.path.glob("*.yaml")))
+
     def match(
         self, token_ids: tuple[str, ...], *, relation_id: str | None = None
     ) -> Relation | None:
@@ -350,6 +355,33 @@ async def _scan_runtime(args: Any, settings: Any) -> dict[str, object]:
             max_pages=max(1, (args.limit + 99) // 100),
             max_markets=args.limit,
         )
+        catalog_tokens = {
+            token.token_id
+            for metadata in discovery.markets for token in metadata.tokens
+        }
+        conditions_by_token = {
+            token.token_id: metadata.condition_id
+            for metadata in discovery.markets for token in metadata.tokens
+        }
+        research_outputs = []
+        for relation in registry.relations():
+            relation_tokens = {leg.token_id for leg in relation.legs}
+            if relation_tokens.issubset(catalog_tokens) and len(relation.states) != 2:
+                observation = {
+                    "relation_id": relation.relation_id,
+                    "status": "RESEARCH_CANDIDATE",
+                    "reason": "generic_logical_execution_unsupported",
+                    "observed_at_ms": time.time_ns() // 1_000_000,
+                    "condition_ids": sorted({
+                        conditions_by_token[token] for token in relation_tokens
+                    }),
+                    "token_ids": sorted(relation_tokens),
+                    "notified": False,
+                }
+                observation["id"] = await store.save_research_observation(
+                    observation
+                )
+                research_outputs.append(observation)
         summary = await scan_catalog(
             discovery, engine_factory=engine_for,
             relation_resolver=resolve_relation,
@@ -359,6 +391,7 @@ async def _scan_runtime(args: Any, settings: Any) -> dict[str, object]:
             if item["relation_id"] == args.relation_id
             or args.relation_id is None
         ]
+        summary["research_candidates"] = research_outputs
         summary["results"] = [_result_payload(item) for item in summary["results"]]
         return summary
 

@@ -1121,6 +1121,12 @@ CREATE TABLE IF NOT EXISTS watch_runs (
     started_at_ms INTEGER NOT NULL,
     canonical_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS research_observations (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    observed_at_ms INTEGER NOT NULL,
+    canonical_json TEXT NOT NULL
+);
 """
 
 
@@ -1703,6 +1709,44 @@ class OpportunityStore:
             for run_id, started, canonical in rows
         ]
 
+    async def save_research_observation(
+        self, observation: Mapping[str, object]
+    ) -> str:
+        data = dict(observation)
+        _required(
+            data, "relation_id", "status", "reason", "observed_at_ms",
+            "condition_ids", "token_ids",
+        )
+        if data["status"] != "RESEARCH_CANDIDATE":
+            raise ValueError("research observation status must be RESEARCH_CANDIDATE")
+        _integer("observed_at_ms", data["observed_at_ms"])
+        canonical = _json(data)
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        identifier = f"research:{digest}"
+        connection = self._require_connection()
+        async with self._write_lock:
+            await connection.execute(
+                """INSERT OR IGNORE INTO research_observations
+                   (id, observed_at_ms, canonical_json) VALUES (?, ?, ?)""",
+                (identifier, data["observed_at_ms"], canonical),
+            )
+            await connection.commit()
+        return identifier
+
+    async def list_research_observations(
+        self, *, limit: int = 100
+    ) -> list[dict[str, object]]:
+        _query_limit(limit)
+        rows = await self._require_connection().execute_fetchall(
+            """SELECT id, canonical_json FROM research_observations
+               ORDER BY observed_at_ms DESC, sequence DESC LIMIT ?""",
+            (limit,),
+        )
+        return [
+            {"id": str(identifier), **json.loads(canonical)}
+            for identifier, canonical in rows
+        ]
+
     async def list_opportunities(
         self, *, limit: int = 100, after_bundle_id: str | None = None
     ) -> list[tuple[str, str, str]]:
@@ -1812,6 +1856,7 @@ class OpportunityStore:
             notification_rows, claims = [], []
         watch_rows = await self.list_watch_metrics(limit=1)
         catalog_rows = await self.list_catalog_snapshots(limit=1)
+        research_rows = await self.list_research_observations(limit=limit)
         return {
             "total": len(rows),
             "truncated": truncated,
@@ -1835,7 +1880,7 @@ class OpportunityStore:
                 int(count) for state, count in claims if state == "CLAIMED"
             ),
             "ws_metrics": watch_rows[0] if watch_rows else None,
-            "research_relations": (
+            "research_relations": research_rows or (
                 catalog_rows[0].get("audited_relation_registry", [])
                 if catalog_rows else []
             ),
