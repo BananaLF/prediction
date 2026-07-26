@@ -137,3 +137,11 @@ operational failures return 1.
 
 The program is a measurement and evidence tool, not financial advice and not a
 guaranteed-profit system.
+
+## Further documentation
+
+- [Strategy, rules, risks, and diagrams](STRATEGY.md)
+- [Operations, recovery, metrics, and public endpoints](docs/OPERATIONS.md)
+- [24-hour and seven-day observation protocol](docs/SOAK-TEST.md)
+- [Read-only security and threat model](SECURITY.md)
+- [Latest verification evidence](docs/VERIFICATION.md)

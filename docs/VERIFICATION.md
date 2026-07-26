@@ -1,0 +1,77 @@
+# 验证记录
+
+**日期：2026-07-26（Asia/Hong_Kong）**
+
+## 被验证版本
+
+- 工作树：`feature/structural-arbitrage-scanner`
+- 验证开始时基线 HEAD：`aba36e6891f7d1729950d93e933f5e46c14e88f2`
+- Task 13 最终提交：本文件所在提交；检出后用 `git rev-parse HEAD` 获取精确值
+- 包/发行版版本：`0.2.0`
+- Python：3.13.12
+
+本记录中的测试和 smoke 针对基线加 Task 13 工作树变更。提交前会再次运行全量验证和差异检查；不要把基线哈希误认为最终提交哈希。
+
+## 自动与离线验证
+
+| 命令 | 观察结果 |
+|---|---|
+| `.venv/bin/python -m pytest` | 最终轮 629 passed in 1.17s |
+| `.venv/bin/python -m pytest tests/integration/test_read_only_surface.py -q` | 4 passed |
+| `.venv/bin/python -m compileall -q predmarket` | exit 0 |
+| `.venv/bin/python -m predmarket --help` | exit 0；显示 6 个只读子命令和 `0.75%=0.0075` |
+| `.venv/bin/python -m predmarket relations validate rules/example-implication.yaml` | exit 0；audited=true，minimum_units_received=1 |
+| 临时配置 + `--json report --limit 5` | exit 0；空库 total=0，p50/p95/p99=null |
+| `sqlite3 ... "PRAGMA integrity_check; PRAGMA user_version;"` | `ok`，schema 4 |
+| 旧文件存在性检查 | `core.py`、`api.py`、`ledger.py`、`tests/test_core.py` 均不存在 |
+
+临时数据库是 `/tmp/predmarket-task13-smoke.sqlite3`，未保存进仓库。JSON stdout 保持单一文档。
+
+## 公开只读联网 smoke
+
+本次联网成功，严格限制为公开数据，没有认证、钱包、签名、WebSocket 长连接或订单调用。
+
+1. Gamma：
+
+   ```console
+   .venv/bin/python -m predmarket \
+     --config /tmp/predmarket-task13-smoke.yaml --json \
+     sync-markets --limit 5 --max-pages 1 --max-markets 5
+   ```
+
+   结果：exit 0；读取 5 个市场，5 个 tradeable；按 `max_markets` 明确标记截断，没有继续翻页。
+
+2. 一个活跃二元市场的公开 CLOB：
+
+   - condition：`0x1fad72fae204143ff1c3035e99e7c0f65ea8d5cd9bd1070987bd1a3316f772be`
+   - `POST /books` 仅用于这一市场的 YES/NO 公开盘口。
+   - targeted `scan-once`：exit 0，evaluated=1，安全拒绝为 `invalid_discovery`，没有通知；拒绝证据已写临时库。
+   - `GET /clob-markets/{condition}`：exit 0，确认 2 个 token，正式 fee rate=`0.05`、tick size=`0.01`。
+   - replay：exit 0，状态 `REJECTED`，无通知 claim/attempt/event。
+
+`invalid_discovery` 表示当时公开盘口未形成模拟器接受的便宜完整集候选，不是网络失败，也不能被解释成没有市场机会。
+
+## 最终提交前验证
+
+最终轮记录：
+
+```text
+full pytest: 629 passed in 1.17s
+focused read-only: 4 passed
+compileall: exit 0
+CLI help: exit 0
+relation validate: exit 0
+offline report/replay/integrity: exit 0 / ok
+git diff --check: exit 0
+```
+
+## 限制
+
+- **24 小时 soak：NOT RUN（2026-07-26）。**
+- **7 天观察：NOT RUN（2026-07-26）。**
+- 联网 smoke 只覆盖 5 个 Gamma 市场和其中一个二元市场，不能代表全目录或长期稳定性。
+- 没有执行任何交易，不能验证同时成交、真实排队位置、部分成交退出或实际结算。
+- `SNAPSHOT_EXECUTABLE` 仍只表示快照模型通过，不是利润或成交保证。
+- 零机会是正常且可接受的观察结果。
+
+长期验收必须独立执行 `docs/SOAK-TEST.md`，不得用本次短 smoke 替代。
