@@ -46,9 +46,13 @@ authoritative CLOB market fee schedule before assigning a formal status:
 .venv/bin/predmarket watch --max-connections 3 --max-events 500
 ```
 
-`--max-events` is one cumulative budget for the whole command, including all
-reconnections. Once reached, the command closes cleanly without opening another
-connection; `--max-connections` bounds total connection attempts.
+`--max-events` is one cumulative budget of accepted market-domain events for
+the whole command, including all reconnections. PONG and invalid frames do not
+consume it. If a JSON batch exceeds the remaining budget, the prefix is
+accepted and the remainder is counted as dropped. Once reached, the command
+closes cleanly without opening another connection; `--max-connections` bounds
+total connection attempts. Exhausting all attempts without one accepted event
+is an operational failure (exit code 1), with metrics still persisted.
 
 Audited logical rules are managed without silently replacing an existing
 ID/version:

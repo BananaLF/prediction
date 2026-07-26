@@ -50,7 +50,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     watch = commands.add_parser("watch", help="discover via public WebSocket")
     watch.add_argument("--max-connections", type=_positive, default=10)
-    watch.add_argument("--max-events", type=_positive)
+    watch.add_argument(
+        "--max-events", type=_positive,
+        help="whole-command budget of accepted market events; PONG/invalid frames do not count",
+    )
     watch.add_argument("--rules-dir", default="rules")
     watch.add_argument("--relation-id")
 

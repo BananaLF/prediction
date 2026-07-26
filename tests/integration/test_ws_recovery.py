@@ -11,6 +11,7 @@ from predmarket.polymarket.ws import (
     BookMetadata,
     MARKET_CHANNEL_URL,
     MarketWebSocket,
+    WatchOperationalError,
     WsProtocolError,
 )
 
@@ -275,7 +276,8 @@ async def test_bounded_reconnect_backoff_is_deterministic() -> None:
     async def sleep(delay):
         delays.append(delay)
 
-    await ws.run(connect, max_attempts=2, sleeper=sleep, base_backoff=0.25, max_backoff=1)
+    with pytest.raises(WatchOperationalError):
+        await ws.run(connect, max_attempts=2, sleeper=sleep, base_backoff=0.25, max_backoff=1)
     assert delays == [0.25]
     assert ws.metrics().reconnects == 1
 
@@ -315,6 +317,31 @@ async def test_run_rejects_invalid_whole_command_message_budget(invalid) -> None
             lambda _url: None, max_attempts=1, sleeper=asyncio.sleep,
             base_backoff=0, max_backoff=0, max_messages=invalid,
         )
+
+
+@pytest.mark.asyncio
+async def test_budget_counts_only_accepted_events_not_pong_or_malformed() -> None:
+    ws = scanner()
+    connection = Connection([
+        "PONG", '{"not": valid json', fixture("ws_book_yes.json"),
+    ])
+    await ws.serve_connection(connection, max_messages=1)
+    assert ws.metrics().received == 1
+    assert ws.metrics().heartbeats == 1
+    assert ws.metrics().malformed == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_is_truncated_to_remaining_budget_and_remainder_dropped() -> None:
+    ws = scanner()
+    batch = json.dumps([
+        json.loads(fixture("ws_book_yes.json")),
+        json.loads(fixture("ws_book_no.json")),
+    ])
+    connection = Connection([batch])
+    await ws.serve_connection(connection, max_messages=1)
+    assert ws.metrics().received == 1
+    assert ws.metrics().dropped == 1
 
 
 @pytest.mark.asyncio

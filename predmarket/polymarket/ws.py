@@ -33,6 +33,10 @@ class WsProtocolError(ValueError):
         self.token_id = token_id
 
 
+class WatchOperationalError(RuntimeError):
+    """All bounded connection attempts produced no accepted domain event."""
+
+
 @dataclass(frozen=True)
 class ReceivedMessage:
     raw: str
@@ -234,7 +238,13 @@ class MarketWebSocket:
             raise ValueError("monotonic clock must return finite nonnegative seconds")
         return wall, float(mono)
 
-    async def ingest(self, raw: str | bytes) -> bool:
+    async def ingest(
+        self, raw: str | bytes, *, max_accepted: int | None = None
+    ) -> bool:
+        if max_accepted is not None and (
+            type(max_accepted) is not int or max_accepted <= 0
+        ):
+            raise ValueError("max_accepted must be a positive integer or None")
         if isinstance(raw, bytes):
             if len(raw) > MAX_MESSAGE_BYTES:
                 self._unknown_corruption("message_too_large")
@@ -311,6 +321,12 @@ class MarketWebSocket:
                 )
             )
 
+        if max_accepted is not None and len(messages) > max_accepted:
+            remainder = len(messages) - max_accepted
+            messages = messages[:max_accepted]
+            self._metrics = replace(
+                self._metrics, dropped=self._metrics.dropped + remainder
+            )
         if self._queue.qsize() + len(messages) > self._queue.maxsize:
             dropped = len(messages)
             while not self._queue.empty():
@@ -647,11 +663,16 @@ class MarketWebSocket:
         stop = asyncio.Event()
 
         async def receive_messages() -> None:
-            count = 0
-            while max_messages is None or count < max_messages:
+            accepted = 0
+            while max_messages is None or accepted < max_messages:
                 raw = await recv()
-                count += 1
-                await self.ingest(raw)
+                remaining = (
+                    None if max_messages is None
+                    else max_messages - accepted
+                )
+                before = self._metrics.received
+                await self.ingest(raw, max_accepted=remaining)
+                accepted += self._metrics.received - before
 
         async def process_messages() -> None:
             while True:
@@ -735,6 +756,7 @@ class MarketWebSocket:
         ):
             raise ValueError("backoff values must be finite and ordered")
 
+        starting_received = self._metrics.received
         for attempt in range(max_attempts):
             remaining = (
                 None if max_messages is None
@@ -761,3 +783,8 @@ class MarketWebSocket:
                     self._metrics, reconnects=self._metrics.reconnects + 1
                 )
                 await sleeper(min(max_backoff, base_backoff * (2**attempt)))
+        if self._metrics.received == starting_received:
+            self._invalidate_all("watch_attempts_exhausted")
+            raise WatchOperationalError(
+                "watch attempts exhausted without an accepted market event"
+            )

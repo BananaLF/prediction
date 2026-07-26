@@ -296,7 +296,7 @@ def targeted_binary_market(
     )
     return BinaryMarket(
         f"target:{condition_id}", f"target:{condition_id}", condition_id,
-        yes, no, True, True, relation, True, False, False,
+        yes, no, True, True, relation, True, True, False,
     )
 
 
@@ -694,7 +694,9 @@ async def dispatch(
                 return {
                     "core_evidence": audit.evidence.data,
                     "notification_audit": {
-                        "claims": [asdict(item) for item in audit.claims],
+                        "claims": [
+                            asdict(item) for item in audit.current_claims
+                        ],
                         "attempts": audit.attempts,
                         "events": audit.events,
                     },

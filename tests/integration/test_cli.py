@@ -28,6 +28,7 @@ from predmarket.fees import FeeSchedule
 from predmarket.orderbook import OrderBook
 from predmarket.domain import BookLevel, OpportunityStatus
 from predmarket.polymarket.clob import BookSnapshot
+from predmarket.polymarket.ws import WatchOperationalError
 
 
 def test_help_states_read_only_and_return_semantics(capsys):
@@ -394,16 +395,28 @@ async def test_watch_command_retries_initial_connect_and_persists_metrics(tmp_pa
         "--config", str(config), "watch", "--max-connections", "2",
         "--max-events", "1", "--rules-dir", str(tmp_path / "rules"),
     ])
-    output = await dispatch(
-        args, runtime_factory=FakeRuntime, websocket_connector=connector,
-        sleeper=no_sleep, wall_clock_ms=lambda: 1000, monotonic=lambda: 1.0,
-    )
+    with pytest.raises(WatchOperationalError):
+        await dispatch(
+            args, runtime_factory=FakeRuntime, websocket_connector=connector,
+            sleeper=no_sleep, wall_clock_ms=lambda: 1000,
+            monotonic=lambda: 1.0,
+        )
     assert len(attempts) == 2
-    assert output["ws_metrics"]["reconnects"] == 1
     async with OpportunityStore(tmp_path / "watch.sqlite3") as store:
         metrics = await store.list_watch_metrics(limit=1)
+    assert metrics[0]["reconnects"] == 1
     assert metrics[0]["disconnects"] == 2
     assert metrics[0]["epoch_states"] == {"no": "RESYNC", "yes": "RESYNC"}
+
+
+def test_main_maps_exhausted_watch_to_operational_exit(capsys):
+    async def failed(_args):
+        raise WatchOperationalError("no accepted event")
+
+    assert main(["watch"], dispatcher=failed) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "WatchOperationalError" in captured.err
 
 
 @pytest.mark.asyncio
@@ -541,3 +554,106 @@ async def test_targeted_scan_rejects_selected_relation_token_mismatch(tmp_path):
     ])
     with pytest.raises(RelationValidationError, match="does not match"):
         await dispatch(args, runtime_factory=FakeRuntime)
+
+
+@pytest.mark.asyncio
+async def test_relation_commands_flow_through_parser_and_dispatch(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    source = tmp_path / "relation.yaml"
+    _relation(source)
+    rules = tmp_path / "rules"
+    common = ["--config", str(config), "relations", "--rules-dir", str(rules)]
+    validated = await dispatch(build_parser().parse_args([
+        *common, "validate", str(source),
+    ]))
+    assert validated["audited"] is True
+    imported = await dispatch(build_parser().parse_args([
+        *common, "import", str(source),
+    ]))
+    assert Path(imported["imported"]).exists()
+    listed = await dispatch(build_parser().parse_args([*common, "list"]))
+    assert [item["relation_id"] for item in listed["relations"]] == [
+        "implication-a-b"
+    ]
+
+
+def test_targeted_scan_replay_and_report_flow_through_main_json(
+    tmp_path, monkeypatch, capsys
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8").replace(
+            "data/predmarket.sqlite3", str(tmp_path / "flow.sqlite3")
+        ),
+        encoding="utf-8",
+    )
+
+    def batch(received_ms, mono):
+        return tuple(
+            BookSnapshot(
+                OrderBook(
+                    token, (BookLevel(Decimal("0.44"), Decimal("10")),),
+                    (BookLevel(Decimal("0.45"), Decimal("10")),),
+                    Decimal("0.01"), Decimal("1"), 1000, f"{token}-{received_ms}",
+                ),
+                "target:condition", False, None, received_ms, mono,
+            )
+            for token in ("yes", "no")
+        )
+
+    class Books:
+        def __init__(self, values):
+            self.values = values
+        async def books(self, _tokens):
+            return self.values
+
+    schedule = FeeSchedule(Decimal("0"), 1, True, 1000)
+    class Fees:
+        async def market_info(self, _condition, *, expected_token_ids):
+            return SimpleNamespace(bound_fee_schedules=lambda: tuple(
+                (token, schedule) for token in expected_token_ids
+            ))
+
+    class FakeRuntime:
+        gamma = object()
+        discovery_clob = Books(batch(1100, 1.1))
+        confirmation_clob = Books(batch(1200, 1.2))
+        fee_clob = Fees()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    async def bound(args):
+        return await dispatch(
+            args, runtime_factory=FakeRuntime,
+            wall_clock_ms=lambda: 2000, monotonic=lambda: 1.25,
+        )
+
+    monkeypatch.setattr("predmarket.commands.sys.platform", "linux")
+    assert main([
+        "--config", str(config), "--json", "scan-once",
+        "--condition", "condition", "--yes-token", "yes",
+        "--no-token", "no", "--rules-dir", str(tmp_path / "rules"),
+    ], dispatcher=bound) == 0
+    scan_output = json.loads(capsys.readouterr().out)
+    assert scan_output["results"][0]["status"] == "RESEARCH_CANDIDATE"
+
+    assert main([
+        "--config", str(config), "--json", "replay", "opp:condition",
+    ], dispatcher=bound) == 0
+    replay_output = json.loads(capsys.readouterr().out)
+    assert replay_output["core_evidence"]["opportunity"]["id"] == "opp:condition"
+    assert "notification_audit" in replay_output
+
+    assert main([
+        "--config", str(config), "--json", "report", "--limit", "10",
+    ], dispatcher=bound) == 0
+    report_output = json.loads(capsys.readouterr().out)
+    assert report_output["by_status"]["RESEARCH_CANDIDATE"] == 1
+    assert report_output["by_path"]["IMMEDIATE_CONVERSION"] == 1
+    assert report_output["by_pipeline_reason"]["release_date_unknown"] == 1
