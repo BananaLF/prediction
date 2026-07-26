@@ -23,6 +23,7 @@ from predmarket.runtime import Runtime
 import httpx
 import json
 import sys
+from types import SimpleNamespace
 
 
 def test_help_states_read_only_and_return_semantics(capsys):
@@ -289,3 +290,60 @@ def test_json_mode_keeps_terminal_audit_off_stdout(capsys):
     assert json.loads(captured.out) == {"收益": "0.0075"}
     assert captured.out.count("\n") == 1
     assert "SNAPSHOT_EXECUTABLE" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_watch_command_retries_initial_connect_and_persists_metrics(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8").replace(
+            "data/predmarket.sqlite3", str(tmp_path / "watch.sqlite3")
+        ),
+        encoding="utf-8",
+    )
+
+    class Gamma:
+        async def active_markets(self, **_bounds):
+            return GammaDiscovery((market(),), ())
+
+    class FeeClob:
+        async def market_info(self, condition, *, expected_token_ids):
+            assert condition == "condition"
+            assert expected_token_ids == ("yes", "no")
+            return SimpleNamespace(
+                tick_size=Decimal("0.01"),
+                minimum_order_size=Decimal("1"),
+            )
+
+    class FakeRuntime:
+        gamma = Gamma()
+        discovery_clob = object()
+        confirmation_clob = object()
+        fee_clob = FeeClob()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    attempts = []
+    async def connector(url):
+        attempts.append(url)
+        raise ConnectionError("offline")
+
+    async def no_sleep(_delay):
+        pass
+
+    args = build_parser().parse_args([
+        "--config", str(config), "watch", "--max-connections", "2",
+        "--max-events", "1", "--rules-dir", str(tmp_path / "rules"),
+    ])
+    output = await dispatch(
+        args, runtime_factory=FakeRuntime, websocket_connector=connector,
+        sleeper=no_sleep, wall_clock_ms=lambda: 1000, monotonic=lambda: 1.0,
+    )
+    assert len(attempts) == 2
+    assert output["ws_metrics"]["reconnects"] == 1
+    async with OpportunityStore(tmp_path / "watch.sqlite3") as store:
+        metrics = await store.list_watch_metrics(limit=1)
+    assert metrics[0]["disconnects"] == 2
+    assert metrics[0]["epoch_states"] == {"no": "RESYNC", "yes": "RESYNC"}
