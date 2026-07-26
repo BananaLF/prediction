@@ -178,6 +178,21 @@ async def test_pagination_repetition_and_bounds_fail_closed():
 
 
 @pytest.mark.asyncio
+async def test_intentional_page_bound_returns_explicit_partial_discovery():
+    payload = fixture("gamma_page_1.json")
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
+    async with httpx.AsyncClient(transport=transport) as http:
+        result = await GammaClient(http, "https://gamma.test").active_markets(
+            max_pages=1, max_markets=100, allow_partial=True
+        )
+    assert [market.market_id for market in result.markets] == ["101"]
+    assert result.complete is False
+    assert result.next_cursor == "next/+=="
+    assert result.termination == "max_pages"
+    assert result.diagnostics[-1].reason == "catalog truncated by max_pages"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("response", "error"),
     [

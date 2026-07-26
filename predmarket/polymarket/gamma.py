@@ -232,6 +232,9 @@ def _normalize_fee_schedule(raw: dict[str, Any]) -> tuple[str | None, str | None
 class GammaDiscovery(Sequence[MarketMetadata]):
     markets: tuple[MarketMetadata, ...]
     diagnostics: tuple[MarketDiagnostic, ...]
+    complete: bool = True
+    next_cursor: str | None = None
+    termination: str = "pagination_exhausted"
 
     def __getitem__(self, index):
         return self.markets[index]
@@ -350,6 +353,7 @@ class GammaClient:
         limit: int = 100,
         max_pages: int = 100,
         max_markets: int = 10_000,
+        allow_partial: bool = False,
     ) -> GammaDiscovery:
         for name, value, upper in (
             ("limit", limit, 100),
@@ -360,6 +364,8 @@ class GammaClient:
                 raise TypeError(f"{name} must be an integer")
             if value < 1 or (upper is not None and value > upper):
                 raise ValueError(f"{name} is outside its allowed range")
+        if type(allow_partial) is not bool:
+            raise TypeError("allow_partial must be bool")
 
         cursor: str | None = None
         seen: set[str] = set()
@@ -371,8 +377,11 @@ class GammaClient:
         for _page_number in range(max_pages):
             payload = await self._get_page(limit=limit, cursor=cursor)
             page_markets = payload["markets"]
-            if len(markets) + len(page_markets) > max_markets:
+            room = max_markets - len(markets)
+            page_truncated = len(page_markets) > room
+            if page_truncated and not allow_partial:
                 raise AdapterInvariantError("max_markets bound exceeded")
+            page_markets = page_markets[:room]
             for raw in page_markets:
                 market_id = raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else None
                 try:
@@ -406,10 +415,26 @@ class GammaClient:
             next_cursor = payload["next_cursor"]
             if not next_cursor:
                 return GammaDiscovery(tuple(markets), tuple(diagnostics))
+            if page_truncated or len(markets) >= max_markets:
+                diagnostics.append(
+                    MarketDiagnostic(None, "catalog truncated by max_markets")
+                )
+                return GammaDiscovery(
+                    tuple(markets), tuple(diagnostics), False,
+                    next_cursor, "max_markets",
+                )
             if next_cursor == cursor or next_cursor in seen:
                 raise AdapterInvariantError("keyset cursor repeated without progress")
             seen.add(next_cursor)
             cursor = next_cursor
+        if allow_partial:
+            diagnostics.append(
+                MarketDiagnostic(None, "catalog truncated by max_pages")
+            )
+            return GammaDiscovery(
+                tuple(markets), tuple(diagnostics), False,
+                cursor, "max_pages",
+            )
         raise AdapterInvariantError("max_pages bound reached before pagination completed")
 
 

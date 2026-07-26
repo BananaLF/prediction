@@ -22,6 +22,7 @@ from predmarket.epochs import EpochBook, EpochState
 MARKET_CHANNEL_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 MAX_SUBSCRIPTION_TOKENS = 500
 MAX_MESSAGE_BYTES = 1_000_000
+LATENCY_SAMPLE_CAPACITY = 1024
 
 
 class WsProtocolError(ValueError):
@@ -87,6 +88,11 @@ class WsMetrics:
     callback_failures: int = 0
     queue_high_water: int = 0
     processing_latencies_ms: tuple[float, ...] = ()
+    processing_latency_count: int = 0
+    processing_latency_sum_ms: float = 0.0
+    processing_latency_min_ms: float | None = None
+    processing_latency_max_ms: float | None = None
+    processing_latency_sample_truncated: bool = False
 
 
 def _identifier(value: object, name: str) -> str:
@@ -360,8 +366,27 @@ class MarketWebSocket:
             self._metrics = replace(
                 self._metrics,
                 processing_latencies_ms=(
-                    *self._metrics.processing_latencies_ms,
-                    latency,
+                    (*self._metrics.processing_latencies_ms, latency)[
+                        -LATENCY_SAMPLE_CAPACITY:
+                    ]
+                ),
+                processing_latency_count=(
+                    self._metrics.processing_latency_count + 1
+                ),
+                processing_latency_sum_ms=(
+                    self._metrics.processing_latency_sum_ms + latency
+                ),
+                processing_latency_min_ms=(
+                    latency if self._metrics.processing_latency_min_ms is None
+                    else min(self._metrics.processing_latency_min_ms, latency)
+                ),
+                processing_latency_max_ms=(
+                    latency if self._metrics.processing_latency_max_ms is None
+                    else max(self._metrics.processing_latency_max_ms, latency)
+                ),
+                processing_latency_sample_truncated=(
+                    self._metrics.processing_latency_count + 1
+                    > LATENCY_SAMPLE_CAPACITY
                 ),
             )
             return message

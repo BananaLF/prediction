@@ -29,6 +29,10 @@ non-tradeable without altering historical snapshots. Missing-state transitions
 are allowed only after a complete, pagination-exhausted sync; bounded or partial
 observations refresh seen entries without deactivating unseen ones. Every sync
 has its own observation/run even when its immutable content hash is unchanged.
+When a caller intentionally reaches its page or market bound, the returned
+catalog is explicitly marked incomplete with its continuation cursor and
+truncation reason; scan/watch may process that deterministic prefix, but it can
+never deactivate unseen current records.
 
 A deterministic targeted confirmation can be requested when the exact
 condition and token IDs are already known:
@@ -53,6 +57,10 @@ accepted and the remainder is counted as dropped. Once reached, the command
 closes cleanly without opening another connection; `--max-connections` bounds
 total connection attempts. Exhausting all attempts without one accepted event
 is an operational failure (exit code 1), with metrics still persisted.
+Long-running watch uses fixed memory: only the latest 100 result summaries and
+the latest 1024 latency samples are retained, alongside cumulative
+status/reason counts and streaming latency count/min/max/sum. Output marks when
+the recent-result or latency sample was truncated.
 
 Audited logical rules are managed without silently replacing an existing
 ID/version:

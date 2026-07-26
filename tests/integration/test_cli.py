@@ -282,6 +282,34 @@ async def test_catalog_child_failure_rolls_back_snapshot_and_current(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_delayed_older_catalog_sync_cannot_regress_newer_current_state(tmp_path):
+    path = tmp_path / "chronology.sqlite3"
+    def snapshot(at, *, active, closed, markets=True):
+        return {
+            "fetched_at_ms": at, "complete": True, "provenance": "exhausted",
+            "markets": ([{
+                "id": "m", "condition_id": "c", "event_ids": ["e"],
+                "tokens": [{"id": "yes", "outcome": "YES"}],
+                "active": active, "closed": closed,
+                "tradeable": active and not closed,
+            }] if markets else []),
+            "diagnostics": [],
+        }
+    async with OpportunityStore(path) as store:
+        await store.save_catalog_snapshot(snapshot(20, active=False, closed=True))
+        await store.save_catalog_snapshot(snapshot(10, active=True, closed=False))
+        await store.save_catalog_snapshot(
+            snapshot(15, active=False, closed=False, markets=False)
+        )
+        current = (await store.list_current_catalog_markets(limit=10))[0]
+        assert current["fetched_at_ms"] == 20
+        assert current["presence"] == "SEEN"
+        assert current["active"] is False
+        assert current["closed"] is True
+        assert len(await store.list_catalog_snapshots(limit=10)) == 3
+
+
+@pytest.mark.asyncio
 async def test_runtime_shares_one_public_http_client_and_closes_once(tmp_path):
     transport = httpx.MockTransport(lambda request: httpx.Response(500))
     runtime = Runtime(http_transport=transport)
@@ -314,7 +342,10 @@ async def test_sync_command_offline_persists_normalized_catalog(tmp_path):
 
     class Gamma:
         async def active_markets(self, **bounds):
-            assert bounds == {"limit": 10, "max_pages": 1, "max_markets": 10}
+            assert bounds == {
+                "limit": 10, "max_pages": 1, "max_markets": 10,
+                "allow_partial": True,
+            }
             return GammaDiscovery((market(),), ())
 
     class FakeRuntime:

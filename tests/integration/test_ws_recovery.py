@@ -345,6 +345,20 @@ async def test_batch_is_truncated_to_remaining_budget_and_remainder_dropped() ->
 
 
 @pytest.mark.asyncio
+async def test_latency_history_is_bounded_with_streaming_totals() -> None:
+    ws = scanner()
+    for _ in range(1100):
+        await ws.ingest(fixture("ws_book_yes.json"))
+        await ws.process_one()
+    metrics = ws.metrics()
+    assert metrics.processing_latency_count == 1100
+    assert len(metrics.processing_latencies_ms) == 1024
+    assert metrics.processing_latency_sample_truncated is True
+    assert metrics.processing_latency_min_ms == 0
+    assert metrics.processing_latency_max_ms == 0
+
+
+@pytest.mark.asyncio
 async def test_idle_time_based_heartbeat_timeout_closes_and_invalidates() -> None:
     sleeper = ControlledSleeper()
     ws = scanner(

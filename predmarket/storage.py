@@ -1705,7 +1705,9 @@ class OpportunityStore:
                                last_seen_snapshot=excluded.last_seen_snapshot,
                                fetched_at_ms=excluded.fetched_at_ms,
                                presence='SEEN',
-                               canonical_json=excluded.canonical_json""",
+                               canonical_json=excluded.canonical_json
+                               WHERE excluded.fetched_at_ms >=
+                                     current_catalog_tokens.fetched_at_ms""",
                             (
                                 token_id, market_id, snapshot_id,
                                 data["fetched_at_ms"], _json(token_record),
@@ -1721,7 +1723,9 @@ class OpportunityStore:
                            presence='SEEN', active=excluded.active,
                            closed=excluded.closed,
                            tradeable=excluded.tradeable,
-                           canonical_json=excluded.canonical_json""",
+                           canonical_json=excluded.canonical_json
+                           WHERE excluded.fetched_at_ms >=
+                                 current_catalog_markets.fetched_at_ms""",
                         (
                             market_id, condition_id, snapshot_id,
                             data["fetched_at_ms"], record.get("active"),
@@ -1737,7 +1741,9 @@ class OpportunityStore:
                            last_seen_snapshot=excluded.last_seen_snapshot,
                            fetched_at_ms=excluded.fetched_at_ms,
                            presence='SEEN',
-                           canonical_json=excluded.canonical_json""",
+                           canonical_json=excluded.canonical_json
+                           WHERE excluded.fetched_at_ms >=
+                                 current_catalog_events.fetched_at_ms""",
                         (
                             event, snapshot_id, data["fetched_at_ms"],
                             _json({"id": event}),
@@ -1752,16 +1758,21 @@ class OpportunityStore:
                         placeholders = ",".join("?" for _ in seen)
                         await connection.execute(
                             f"""UPDATE {table} SET presence='MISSING'
-                                WHERE {id_column} NOT IN ({placeholders})""",
-                            tuple(sorted(seen)),
+                                WHERE {id_column} NOT IN ({placeholders})
+                                  AND fetched_at_ms <= ?""",
+                            (*tuple(sorted(seen)), data["fetched_at_ms"]),
                         )
                     elif data["complete"]:
                         await connection.execute(
-                            f"UPDATE {table} SET presence='MISSING'"
+                            f"""UPDATE {table} SET presence='MISSING'
+                                WHERE fetched_at_ms <= ?""",
+                            (data["fetched_at_ms"],),
                         )
                 await connection.execute(
                     """UPDATE current_catalog_markets
-                       SET active=0, tradeable=0 WHERE presence='MISSING'"""
+                       SET active=0, tradeable=0 WHERE presence='MISSING'
+                         AND fetched_at_ms <= ?""",
+                    (data["fetched_at_ms"],),
                 )
                 for position, diagnostic in enumerate(data["diagnostics"]):
                     await connection.execute(
@@ -1801,29 +1812,36 @@ class OpportunityStore:
                         """UPDATE current_catalog_markets SET
                            last_seen_snapshot=?, fetched_at_ms=?,
                            presence='SEEN', active=?, closed=?, tradeable=?
-                           WHERE market_id=?""",
+                           WHERE market_id=? AND fetched_at_ms <= ?""",
                         (
                             snapshot_id, data["fetched_at_ms"],
                             record.get("active"), record.get("closed"),
                             int(bool(record["tradeable"])), market_id,
+                            data["fetched_at_ms"],
                         ),
                     )
                     for token in record["tokens"]:
                         await connection.execute(
                             """UPDATE current_catalog_tokens SET
                                last_seen_snapshot=?, fetched_at_ms=?,
-                               presence='SEEN' WHERE token_id=?""",
+                               presence='SEEN'
+                               WHERE token_id=? AND fetched_at_ms <= ?""",
                             (
                                 snapshot_id, data["fetched_at_ms"],
                                 _mapping("token", token)["id"],
+                                data["fetched_at_ms"],
                             ),
                         )
                     for event_id in record.get("event_ids", []):
                         await connection.execute(
                             """UPDATE current_catalog_events SET
                                last_seen_snapshot=?, fetched_at_ms=?,
-                               presence='SEEN' WHERE event_id=?""",
-                            (snapshot_id, data["fetched_at_ms"], event_id),
+                               presence='SEEN'
+                               WHERE event_id=? AND fetched_at_ms <= ?""",
+                            (
+                                snapshot_id, data["fetched_at_ms"], event_id,
+                                data["fetched_at_ms"],
+                            ),
                         )
         return snapshot_id
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter, deque
 from dataclasses import asdict, replace
 from contextlib import AsyncExitStack
 import hashlib
@@ -215,8 +216,8 @@ def catalog_snapshot(discovery: GammaDiscovery, fetched_at_ms: int) -> dict[str,
             })
     return {
         "fetched_at_ms": fetched_at_ms,
-        "complete": True,
-        "provenance": "gamma_keyset_pagination_exhausted",
+        "complete": discovery.complete,
+        "provenance": f"gamma_keyset:{discovery.termination}",
         "markets": markets,
         "diagnostics": [asdict(item) for item in discovery.diagnostics],
         "relation_candidates": relation_candidates,
@@ -390,6 +391,7 @@ async def _scan_runtime(
             limit=min(args.limit, 100),
             max_pages=max(1, (args.limit + 99) // 100),
             max_markets=args.limit,
+            allow_partial=True,
         )
         catalog_tokens = {
             token.token_id
@@ -458,7 +460,8 @@ async def _watch_runtime(
         fee_clob = runtime.fee_clob
         store = await stack.enter_async_context(OpportunityStore(settings.database_path))
         catalog = await gamma.active_markets(
-            limit=100, max_pages=5, max_markets=500
+            limit=100, max_pages=5, max_markets=500,
+            allow_partial=True,
         )
         registry = RelationRegistry(args.rules_dir)
         selected_relation = (
@@ -556,7 +559,11 @@ async def _watch_runtime(
             token: metadata for token, metadata in book_metadata.items()
             if token in token_conditions
         }
-        results: list[object] = []
+        result_capacity = 100
+        results: deque[object] = deque(maxlen=result_capacity)
+        result_count = 0
+        status_counts: Counter[str] = Counter()
+        reason_counts: Counter[str] = Counter()
         terminal = TerminalNotifier(
             stream=sys.stderr if args.json_output else sys.stdout
         )
@@ -575,10 +582,14 @@ async def _watch_runtime(
             )
 
         async def candidate(_tokens: tuple[str, ...], condition: str) -> None:
+            nonlocal result_count
             # WS values are only a hint. Formal status comes from two new REST
             # snapshots and authoritative fees inside the engine.
             result = await engine_for().scan_binary(markets[condition])
             results.append(_result_payload(result))
+            result_count += 1
+            status_counts[result.status.value] += 1
+            reason_counts[result.reason] += 1
 
         watcher = MarketWebSocket(
             token_conditions,
@@ -607,6 +618,12 @@ async def _watch_runtime(
             metrics["processing_latencies_ms"] = [
                 str(value) for value in metrics["processing_latencies_ms"]
             ]
+            for field in (
+                "processing_latency_sum_ms", "processing_latency_min_ms",
+                "processing_latency_max_ms",
+            ):
+                if metrics[field] is not None:
+                    metrics[field] = str(metrics[field])
             await store.save_watch_metrics(
                 watch_run_id, started_at_ms,
                 {
@@ -618,9 +635,12 @@ async def _watch_runtime(
                 },
             )
         return {
-            "evaluated": len(results),
+            "evaluated": result_count,
             "markets": len(markets),
-            "results": results,
+            "results": list(results),
+            "results_truncated": result_count > len(results),
+            "status_counts": dict(sorted(status_counts.items())),
+            "reason_counts": dict(sorted(reason_counts.items())),
             "ws_metrics": metrics,
             "research_candidates": research_outputs,
         }
@@ -652,6 +672,7 @@ async def dispatch(
             discovery = await runtime.gamma.active_markets(
                 limit=args.limit, max_pages=args.max_pages,
                 max_markets=args.max_markets,
+                allow_partial=True,
             )
         snapshot = catalog_snapshot(
             discovery, wall_clock_ms()
