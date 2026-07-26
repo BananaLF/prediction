@@ -16,7 +16,7 @@
 
 | 命令 | 观察结果 |
 |---|---|
-| `.venv/bin/python -m pytest` | 最终轮 629 passed in 1.17s |
+| `.venv/bin/python -m pytest` | Task 13 初始轮 629 passed in 1.17s；质量复审修复后的最终轮见下方 |
 | `.venv/bin/python -m pytest tests/integration/test_read_only_surface.py -q` | 4 passed |
 | `.venv/bin/python -m compileall -q predmarket` | exit 0 |
 | `.venv/bin/python -m predmarket --help` | exit 0；显示 6 个只读子命令和 `0.75%=0.0075` |
@@ -64,6 +64,18 @@ relation validate: exit 0
 offline report/replay/integrity: exit 0 / ok
 git diff --check: exit 0
 ```
+
+## 质量复审后追加验证
+
+复审后把 Gamma/CLOB origin 从“任意无凭据 HTTP(S) origin”收紧为精确官方 HTTPS origin，静态测试改为 AST 枚举实际 HTTP 调用和端点构造器，并增加 `overflows` 实际输出指标。通知文档统一为“持久单次尝试 + 租约式崩溃回收”，不作送达保证。
+
+```text
+Gamma/CLOB/read-only/WS/CLI focused: 153 passed in 0.54s
+full pytest: 639 passed in 1.19s
+read-only AST surface: 4 passed
+```
+
+联网 smoke 未因本轮变更重新扩大范围；仍以本文件前述最多 5 个 Gamma 市场和一个 CLOB 二元市场结果为准。
 
 ## 限制
 

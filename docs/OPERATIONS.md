@@ -86,37 +86,68 @@ sqlite3 /absolute/backup/predmarket-YYYYMMDD.sqlite3 "PRAGMA integrity_check;"
 
 ## 通知语义
 
-SQLite 通知 outbox 使用**至少一次**语义：
+SQLite 通知 outbox 使用**持久单次尝试 + 租约式崩溃回收**，不保证成功送达：
 
 - 新指纹先取得 `CLAIMED` 租约。
 - 租约到期且未终结时，重启进程可 `RECLAIMED`。
-- `SUCCEEDED` 和 `FAILED` 为终态；失败不自动重复弹窗。
-- 若发送耗时超过租约，理论上可能重复，因此下游应按 fingerprint 去重。
+- `SUCCEEDED` 和有意记录的 `FAILED` 为终态；失败不自动重试。
+- 若发送结果不确定且进程崩溃，租约到期后可回收；发送耗时超过租约时可能重复，因此下游应按 fingerprint 去重。
 - claim、尝试和事件均附着于证据 bundle；通知不是事实来源。
 
-只对 `SNAPSHOT_EXECUTABLE` 请求桌面通知。桌面通知失败不会改变已保存的机会证据。
+只对 `SNAPSHOT_EXECUTABLE` 请求桌面通知。桌面通知失败不会改变已保存的机会证据。运维人员必须轮询 SQLite `report`/`replay` 发现漏提醒，不能依赖桌面弹窗作为完整事件流。
 
 ## 指标解释
 
-- `accepted_events`：被接受的市场域事件；PONG 和无效帧不计。
-- `dropped_events`：超过累计预算或队列容量而丢弃的事件。非零意味着本地状态必须失效并重新同步。
-- `reconnects` / `connection_attempts`：连接质量；尝试耗尽且未收到一个有效事件是运行故障。
-- `queue_high_watermark`：接近 `queue_capacity` 说明处理能力不足。
+- `received`：入队接受的市场域事件；PONG 和无效帧不计。
+- `dropped`：超过累计事件预算或队列容量而丢弃的事件。结合 `overflows` 判断是否由队列溢出导致。
+- `queue_high_water`：队列实际达到的最高深度；接近 `queue_capacity` 说明处理能力不足。
+- `reconnects`、`disconnects`：重连次数和断开次数。实现不输出 `connection_attempts`；需要尝试次数时由外部监管器独立记录，不能用不存在的键。
+- `overflows`、`resyncs`：队列溢出次数和强制重新同步次数；任何 overflow 都必须导致相关 epoch 失效。
+- `malformed`、`unknown`、`heartbeats`、`callback_failures`：畸形帧、未知事件、心跳和回调失败累计数。
 - 延迟 `p50/p95/p99`：最近有界样本的 nearest-rank 分位数；空样本为 `null`。
 - `status_counts` / `reason_counts`：分类结果与拒绝原因；大量 stale/leg_skew/processing_latency 指向数据链路问题。
 - `notification_claims` / `notification_attempts`：积压、成功和失败；长期 CLAIMED 可能等待租约恢复。
 
-`watch` 只保留最近 100 条结果摘要和 1024 个延迟样本，同时保留累计计数与流式 count/min/max/sum；输出的 truncation 标记表示更早明细已丢弃，不表示累计计数丢失。
+`watch` 只保留最近 100 条结果摘要和 1024 个延迟样本，同时保留累计计数与流式 `processing_latency_count`、`processing_latency_sum_ms`、`processing_latency_min_ms`、`processing_latency_max_ms`；`processing_latency_sample_truncated` 或顶层 `results_truncated` 表示更早明细已丢弃，不表示累计计数丢失。
+
+`report` 的 `ws_metrics` 最近一次记录键图如下；`id`、`started_at_ms` 和 `epoch_states` 是持久化包装字段：
+
+```json
+{
+  "ws_metrics": {
+    "id": "watch:...",
+    "started_at_ms": 0,
+    "received": 0,
+    "dropped": 0,
+    "malformed": 0,
+    "unknown": 0,
+    "heartbeats": 0,
+    "disconnects": 0,
+    "reconnects": 0,
+    "resyncs": 0,
+    "overflows": 0,
+    "callback_failures": 0,
+    "queue_high_water": 0,
+    "processing_latencies_ms": [],
+    "processing_latency_count": 0,
+    "processing_latency_sum_ms": "0.0",
+    "processing_latency_min_ms": null,
+    "processing_latency_max_ms": null,
+    "processing_latency_sample_truncated": false,
+    "epoch_states": {}
+  }
+}
+```
 
 ## 故障处置
 
 ### WebSocket 断线
 
-确认连接尝试和最后事件时间；让程序按上限重连。重连后必须先取得完整快照/REST 确认，不能沿用旧 epoch。反复失败时停止依赖 WS，运行有界 `scan-once` 并保留指标。
+确认 `reconnects`、`disconnects` 和最后事件时间；让程序按上限重连。连接尝试次数由外部监管器记录。重连后必须先取得完整快照/REST 确认，不能沿用旧 epoch。反复失败时停止依赖 WS，运行有界 `scan-once` 并保留指标。
 
 ### 队列溢出
 
-看到 dropped 或 overflow 后，将相关 epoch 视为无效；等待完整快照重建。降低订阅范围/事件预算，检查 CPU 和数据库写入延迟。不能通过扩大队列掩盖持续处理不足。
+看到 `dropped` 或 `overflows` 增长后，将相关 epoch 视为无效；确认 `resyncs` 同步增长并等待完整快照重建。降低订阅范围/事件预算，检查 CPU 和数据库写入延迟。不能通过扩大队列掩盖持续处理不足。
 
 ### 数据陈旧或延迟门失败
 

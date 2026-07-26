@@ -130,7 +130,9 @@ operational failures return 1.
 - Conversion, settlement interpretation, release timing, and platform behavior
   remain risks even where currently evidenced.
 - Desktop delivery can fail or be uncertain; SQLite evidence remains the source
-  of truth.
+  of truth. Notification handling is a durable single attempt with lease-based
+  crash reclaim, not a delivery guarantee; operators must poll
+  `report`/`replay`, and an expired uncertain lease can lead to a duplicate.
 - No 24-hour soak test or seven-day observation is claimed by this repository.
 - One composition root owns a single credential-free HTTP client shared by all
   public adapters and closes it once; no credential environment is trusted.

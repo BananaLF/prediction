@@ -38,6 +38,7 @@ CI 的 `tests/integration/test_read_only_surface.py` 只扫描生产 Python 包�
 | WS 丢包或乱序 | 有界队列；溢出/时序回退使 epoch 失效；完整同步后恢复 |
 | 供应链加入交易能力 | 依赖版本范围、锁定/审计安装物、只读静态测试；禁止钱包和签名依赖 |
 | 通知命令注入 | 使用参数数组调用固定 `/usr/bin/osascript`，不使用 shell；文本清理和长度限制 |
+| 把桌面通知误当可靠事件流 | SQLite/report 轮询是事实来源；持久单次尝试不保证送达；仅对过期不确定租约做崩溃回收，可能产生可审计重复 |
 | 规则文件路径/覆盖攻击 | 拒绝目录 traversal；安全 relation ID；原子独占创建；冲突不覆盖 |
 | SQLite 篡改或泄漏 | 专用 OS 用户、目录 0700、数据库/备份 0600、最小化备份访问、校验哈希 |
 | WAL 不完整备份 | 停写后使用 SQLite `.backup`，恢复前 integrity check |

@@ -48,7 +48,7 @@ du -k /absolute/soak/data/predmarket.sqlite3*
   --config /absolute/soak/soak.yaml --json report --limit 100
 ```
 
-收集 queue high-watermark、accepted/dropped、连接尝试/重连、stale/skew/processing-latency 原因、延迟 count/min/max/mean/p50/p95/p99、状态计数、通知 claims/attempts、目录同步完整/截断信息，以及结果/延迟 recent-window truncation 标志。
+从 `report.ws_metrics` 收集 `received`、`dropped`、`queue_high_water`、`reconnects`、`disconnects`、`overflows`、`resyncs`、`malformed`、`unknown`、`heartbeats`、`callback_failures`、`processing_latency_count`、`processing_latency_sum_ms`、`processing_latency_min_ms`、`processing_latency_max_ms`、`processing_latency_sample_truncated` 和 `epoch_states`。另收集顶层 `results_truncated`（watch 输出）、延迟 p50/p95/p99、状态/原因计数、通知 claims/attempts、目录同步完整/截断信息。实现不输出 `connection_attempts`；如需该数值，由外部监管器直接记录每次进程/连接尝试，不能从不存在的 JSON 键采集。
 
 ### 中断和重启检查
 
@@ -57,7 +57,7 @@ du -k /absolute/soak/data/predmarket.sqlite3*
 - 旧 WS epoch 不会在重连后直接接受增量；
 - 完整快照/REST 重新确认后才产生正式结果；
 - SQLite `integrity_check` 为 `ok`；
-- 已成功通知的 fingerprint 不重复，过期 CLAIMED 可回收；
+- 通知审计可解释：SUCCEEDED/有意 FAILED 为终态；过期 CLAIMED 可回收；若发送结果不确定且租约过期，允许出现有证据的重复；
 - report/replay 能读取中断前后的证据。
 
 ## 7 天观察
@@ -84,10 +84,10 @@ sqlite3 /absolute/soak/data/predmarket.sqlite3 \
 
 - 无未处理异常、数据库损坏、进程无界增长或磁盘耗尽。
 - 有界缓存保持约束：最近结果 ≤100，延迟样本 ≤1024；截断标志准确。
-- 队列丢弃一旦发生，相关 epoch 失效并经完整同步恢复；不存在从失效本地书直接升级为可执行。
+- `overflows` 一旦增长，相关 epoch 失效且 `resyncs` 增长，并经完整同步恢复；`dropped` 的预算截断与溢出可区分；不存在从失效本地书直接升级为可执行。
 - 只有正式 REST 结果可为 `SNAPSHOT_EXECUTABLE`；每个结果都有完整证据 bundle。
 - 延迟、fee、tick、深度、部分成交和关系门均能在证据中解释分类。
-- 通知 claim/attempt/event 可追溯；没有无法解释的重复或永久 CLAIMED。
+- 通知 claim/attempt/event 可追溯；成功送达不作保证，SQLite/report 轮询能发现漏提醒；没有无法解释的重复或永久 CLAIMED。
 - 重启后 report/replay 一致，迁移版本稳定，备份可打开且 integrity_check 为 `ok`。
 - 资源基线无持续单调泄漏；数据库增长与事件量大致成比例并在容量预算内。
 - 机会为零不构成失败；出现机会也不构成成功，必须审查证据完整性。

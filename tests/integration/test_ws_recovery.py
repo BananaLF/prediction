@@ -147,6 +147,7 @@ async def test_queue_overflow_drains_and_invalidates_without_blocking() -> None:
     assert ws.queue_size == 0
     assert all(epoch.state is EpochState.RESYNC for epoch in ws.epochs.values())
     assert (ws.metrics().dropped, ws.metrics().queue_high_water, ws.metrics().resyncs) == (2, 1, 1)
+    assert ws.metrics().overflows == 1
 
 
 @pytest.mark.asyncio

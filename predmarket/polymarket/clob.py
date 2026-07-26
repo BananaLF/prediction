@@ -22,6 +22,9 @@ from predmarket.polymarket import (
 from predmarket.polymarket.gamma import _reject_credential_headers, _validate_base_url
 
 
+CLOB_PUBLIC_ORIGIN = "https://clob.polymarket.com"
+
+
 def _string(raw: dict[str, Any], key: str) -> str:
     value = raw.get(key)
     if (
@@ -155,7 +158,7 @@ class ClobRestClient:
     def __init__(
         self,
         http: httpx.AsyncClient | None = None,
-        base_url: str = "https://clob.polymarket.com",
+        base_url: str = CLOB_PUBLIC_ORIGIN,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         timeout: float = 10.0,
@@ -163,7 +166,7 @@ class ClobRestClient:
         wall_clock_ms: Callable[[], int] | None = None,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
-        self.base_url = _validate_base_url(base_url)
+        self.base_url = _validate_base_url(base_url, CLOB_PUBLIC_ORIGIN)
         if isinstance(max_response_bytes, bool) or not isinstance(max_response_bytes, int):
             raise TypeError("max_response_bytes must be an integer")
         if max_response_bytes <= 0:

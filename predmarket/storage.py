@@ -1343,12 +1343,12 @@ class OpportunityStore:
     ) -> bool:
         """Claim a leased outbox item.
 
-        This provides at-least-once delivery: an expired CLAIMED row is
-        reclaimable after restart. SUCCEEDED and FAILED are terminal; FAILED
-        is intentionally not retried to avoid repeated desktop alerts. If a
-        notification send itself outlives the lease, another worker may send
-        the same fingerprint; notifiers must use that fingerprint for
-        downstream idempotency.
+        This is a durable single-attempt policy with lease-based crash reclaim,
+        not a delivery guarantee. An expired CLAIMED row is reclaimable after
+        restart. SUCCEEDED and intentional FAILED are terminal; FAILED is not
+        retried to avoid repeated desktop alerts. If a send outlives the lease,
+        another worker may repeat an uncertain send; consumers must use the
+        fingerprint for downstream idempotency.
         """
         _identifier("notification fingerprint", fingerprint)
         _identifier("bundle_id", bundle_id)

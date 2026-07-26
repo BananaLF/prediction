@@ -69,21 +69,125 @@ def test_production_has_no_trade_wallet_auth_or_shell_surface() -> None:
     assert violations == []
 
 
-def test_network_origins_and_websocket_channel_are_public_and_fixed() -> None:
-    gamma = (PACKAGE / "polymarket" / "gamma.py").read_text(encoding="utf-8")
-    clob = (PACKAGE / "polymarket" / "clob.py").read_text(encoding="utf-8")
-    websocket = (PACKAGE / "polymarket" / "ws.py").read_text(encoding="utf-8")
+def _assignment(tree: ast.AST, name: str) -> object:
+    matches = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+    ]
+    assert len(matches) == 1
+    return ast.literal_eval(matches[0])
 
-    assert '"https://gamma-api.polymarket.com"' in gamma
-    assert 'f"{self.base_url}/markets/keyset"' in gamma
-    assert '"https://clob.polymarket.com"' in clob
-    assert all(
-        token in clob for token in ('"/books"', '"/fee-rate"', 'f"/clob-markets/')
+
+def _http_calls(tree: ast.AST) -> list[ast.Call]:
+    calls: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        receiver = node.func.value
+        if (
+            isinstance(receiver, ast.Attribute)
+            and isinstance(receiver.value, ast.Name)
+            and receiver.value.id == "self"
+            and receiver.attr == "http"
+            and node.func.attr in {"get", "post", "put", "patch", "delete", "request"}
+        ):
+            calls.append(node)
+    return calls
+
+
+def _looks_like_direct_http_call(node: ast.Call) -> bool:
+    if not isinstance(node.func, ast.Attribute) or node.func.attr not in {
+        "get", "post", "put", "patch", "delete", "request"
+    }:
+        return False
+    receiver = node.func.value
+    if isinstance(receiver, ast.Name):
+        return receiver.id == "httpx" or receiver.id.endswith(("http", "client"))
+    return (
+        isinstance(receiver, ast.Attribute)
+        and receiver.attr in {"http", "client"}
     )
-    assert (
-        '"wss://ws-subscriptions-clob.polymarket.com/ws/market"' in websocket
+
+
+def test_network_origins_and_endpoint_builders_are_an_exact_allowlist() -> None:
+    gamma_path = PACKAGE / "polymarket" / "gamma.py"
+    clob_path = PACKAGE / "polymarket" / "clob.py"
+    ws_path = PACKAGE / "polymarket" / "ws.py"
+    gamma = ast.parse(gamma_path.read_text(encoding="utf-8"))
+    clob = ast.parse(clob_path.read_text(encoding="utf-8"))
+    websocket = ast.parse(ws_path.read_text(encoding="utf-8"))
+
+    assert _assignment(gamma, "GAMMA_PUBLIC_ORIGIN") == (
+        "https://gamma-api.polymarket.com"
     )
-    assert "wss://ws-subscriptions-clob.polymarket.com/ws/user" not in websocket
+    assert _assignment(clob, "CLOB_PUBLIC_ORIGIN") == "https://clob.polymarket.com"
+    assert _assignment(websocket, "MARKET_CHANNEL_URL") == (
+        "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    )
+
+    gamma_calls = _http_calls(gamma)
+    assert len(gamma_calls) == 1
+    assert gamma_calls[0].func.attr == "get"
+    assert ast.unparse(gamma_calls[0].args[0]) == (
+        "f'{self.base_url}/markets/keyset'"
+    )
+
+    clob_calls = _http_calls(clob)
+    assert len(clob_calls) == 1
+    assert clob_calls[0].func.attr == "request"
+    assert [ast.unparse(value) for value in clob_calls[0].args[:2]] == [
+        "method",
+        "f'{self.base_url}{path}'",
+    ]
+
+    request_builders: set[tuple[str, str]] = set()
+    for node in ast.walk(clob):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_request"
+        ):
+            assert len(node.args) >= 2
+            method = ast.literal_eval(node.args[0])
+            route = node.args[1]
+            if isinstance(route, ast.Constant):
+                path = ast.literal_eval(route)
+            else:
+                assert isinstance(route, ast.JoinedStr)
+                assert route.values[0].value == "/clob-markets/"
+                formatted = route.values[1]
+                assert isinstance(formatted, ast.FormattedValue)
+                assert ast.unparse(formatted.value) == "quote(condition, safe='')"
+                path = "/clob-markets/{urlencoded_condition}"
+            request_builders.add((method, path))
+    assert request_builders == {
+        ("POST", "/books"),
+        ("GET", "/fee-rate"),
+        ("GET", "/clob-markets/{urlencoded_condition}"),
+    }
+
+    ws_connector_calls = [
+        node
+        for node in ast.walk(websocket)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "connector"
+    ]
+    assert len(ws_connector_calls) == 1
+    assert ast.unparse(ws_connector_calls[0].args[0]) == "MARKET_CHANNEL_URL"
+
+    enumerated: list[tuple[str, int]] = []
+    for source_path in _production_sources():
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _looks_like_direct_http_call(node):
+                enumerated.append((str(source_path.relative_to(PACKAGE.parent)), node.lineno))
+    assert enumerated == [
+        ("predmarket/polymarket/clob.py", clob_calls[0].lineno),
+        ("predmarket/polymarket/gamma.py", gamma_calls[0].lineno),
+    ]
 
 
 def test_legacy_modules_are_absent() -> None:

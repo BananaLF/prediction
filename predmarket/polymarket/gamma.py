@@ -28,23 +28,26 @@ _CREDENTIAL_HEADERS = frozenset(
         "poly-passphrase",
     }
 )
+GAMMA_PUBLIC_ORIGIN = "https://gamma-api.polymarket.com"
 
 
-def _validate_base_url(value: str) -> str:
+def _validate_base_url(value: str, official_origin: str) -> str:
     if not isinstance(value, str):
         raise TypeError("base_url must be a string")
+    if value != official_origin:
+        raise ValueError(f"base_url must be the official public origin {official_origin}")
     parsed = urlsplit(value)
     if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.netloc
+        parsed.scheme != "https"
         or parsed.username is not None
         or parsed.password is not None
+        or parsed.port is not None
+        or parsed.path
         or parsed.query
         or parsed.fragment
-        or parsed.path not in {"", "/"}
     ):
-        raise ValueError("base_url must be an origin without credentials, path, query, or fragment")
-    return value.rstrip("/")
+        raise ValueError(f"base_url must be the official public origin {official_origin}")
+    return value
 
 
 def _reject_credential_headers(http: httpx.AsyncClient) -> None:
@@ -286,13 +289,13 @@ class GammaClient:
     def __init__(
         self,
         http: httpx.AsyncClient | None = None,
-        base_url: str = "https://gamma-api.polymarket.com",
+        base_url: str = GAMMA_PUBLIC_ORIGIN,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         timeout: float = 10.0,
         max_response_bytes: int = 8_000_000,
     ) -> None:
-        self.base_url = _validate_base_url(base_url)
+        self.base_url = _validate_base_url(base_url, GAMMA_PUBLIC_ORIGIN)
         if isinstance(max_response_bytes, bool) or not isinstance(max_response_bytes, int):
             raise TypeError("max_response_bytes must be an integer")
         if max_response_bytes <= 0:

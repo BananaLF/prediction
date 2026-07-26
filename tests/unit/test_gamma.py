@@ -31,7 +31,7 @@ async def test_keyset_pagination_preserves_cursor_and_normalizes_binary_tokens()
         return httpx.Response(200, json=payload)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        result = await GammaClient(http, "https://gamma.test").active_markets(limit=100)
+        result = await GammaClient(http, "https://gamma-api.polymarket.com").active_markets(limit=100)
 
     assert [market.market_id for market in result] == ["101", "102"]
     assert result[0].yes_token_id == "yes-101"
@@ -69,7 +69,7 @@ async def test_last_page_may_omit_cursor_and_preserves_nested_event_and_fee_evid
         lambda _: httpx.Response(200, json=fixture("gamma_last_page_no_cursor.json"))
     )
     async with httpx.AsyncClient(transport=transport) as http:
-        result = await GammaClient(http, "https://gamma.test").active_markets()
+        result = await GammaClient(http, "https://gamma-api.polymarket.com").active_markets()
     assert [market.market_id for market in result] == ["103"]
     assert result[0].event is not None
     assert result[0].event.event_id == "event-103"
@@ -92,7 +92,7 @@ async def test_malformed_market_is_diagnosed_not_silently_invented():
     )
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
     async with httpx.AsyncClient(transport=transport) as http:
-        result = await GammaClient(http, "https://gamma.test").active_markets(max_pages=1)
+        result = await GammaClient(http, "https://gamma-api.polymarket.com").active_markets(max_pages=1)
     assert [m.market_id for m in result] == ["101"]
     assert len(result.diagnostics) == 1
     assert result.diagnostics[0].market_id == "bad"
@@ -105,7 +105,7 @@ async def test_explicitly_untradeable_market_is_skipped_with_diagnostic():
     payload["markets"][0]["acceptingOrders"] = False
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
     async with httpx.AsyncClient(transport=transport) as http:
-        result = await GammaClient(http, "https://gamma.test").active_markets()
+        result = await GammaClient(http, "https://gamma-api.polymarket.com").active_markets()
     assert result.markets == ()
     assert result.diagnostics[0].reason == "market is not tradeable"
 
@@ -117,7 +117,7 @@ async def test_zero_and_multiple_nested_events_are_deterministic():
     payload["markets"][0]["events"] = []
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
     async with httpx.AsyncClient(transport=transport) as http:
-        zero = await GammaClient(http, "https://gamma.test").active_markets()
+        zero = await GammaClient(http, "https://gamma-api.polymarket.com").active_markets()
     assert zero[0].events == () and zero[0].event is None
 
     payload["markets"][0]["events"] = [
@@ -127,7 +127,7 @@ async def test_zero_and_multiple_nested_events_are_deterministic():
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
     ) as http:
-        multiple = await GammaClient(http, "https://gamma.test").active_markets()
+        multiple = await GammaClient(http, "https://gamma-api.polymarket.com").active_markets()
     assert [event.event_id for event in multiple[0].events] == ["e1", "e2"]
     assert multiple[0].event is None
 
@@ -153,7 +153,7 @@ async def test_malformed_nested_relations_and_fee_schedule_are_diagnostics(mutat
         market["fee_schedule"] = market["feeSchedule"]
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
     async with httpx.AsyncClient(transport=transport) as http:
-        result = await GammaClient(http, "https://gamma.test").active_markets()
+        result = await GammaClient(http, "https://gamma-api.polymarket.com").active_markets()
     assert result.markets == ()
     assert result.diagnostics[0].market_id == "101"
 
@@ -163,7 +163,7 @@ async def test_malformed_nested_relations_and_fee_schedule_are_diagnostics(mutat
 async def test_limit_is_strict(limit):
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: None)) as http:
         with pytest.raises((TypeError, ValueError)):
-            await GammaClient(http, "https://gamma.test").active_markets(limit=limit)
+            await GammaClient(http, "https://gamma-api.polymarket.com").active_markets(limit=limit)
 
 
 @pytest.mark.asyncio
@@ -172,9 +172,9 @@ async def test_pagination_repetition_and_bounds_fail_closed():
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
     async with httpx.AsyncClient(transport=transport) as http:
         with pytest.raises(AdapterInvariantError, match="cursor"):
-            await GammaClient(http, "https://gamma.test").active_markets()
+            await GammaClient(http, "https://gamma-api.polymarket.com").active_markets()
         with pytest.raises(AdapterInvariantError, match="max_pages"):
-            await GammaClient(http, "https://gamma.test").active_markets(max_pages=1)
+            await GammaClient(http, "https://gamma-api.polymarket.com").active_markets(max_pages=1)
 
 
 @pytest.mark.asyncio
@@ -182,7 +182,7 @@ async def test_intentional_page_bound_returns_explicit_partial_discovery():
     payload = fixture("gamma_page_1.json")
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
     async with httpx.AsyncClient(transport=transport) as http:
-        result = await GammaClient(http, "https://gamma.test").active_markets(
+        result = await GammaClient(http, "https://gamma-api.polymarket.com").active_markets(
             max_pages=1, max_markets=100, allow_partial=True
         )
     assert [market.market_id for market in result.markets] == ["101"]
@@ -205,7 +205,7 @@ async def test_intentional_page_bound_returns_explicit_partial_discovery():
 async def test_response_failures_are_typed(response, error):
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: response)) as http:
         with pytest.raises(error):
-            await GammaClient(http, "https://gamma.test").active_markets()
+            await GammaClient(http, "https://gamma-api.polymarket.com").active_markets()
 
 
 @pytest.mark.asyncio
@@ -215,17 +215,32 @@ async def test_transport_failures_are_typed():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         with pytest.raises(AdapterTransportError):
-            await GammaClient(http, "https://gamma.test").active_markets()
+            await GammaClient(http, "https://gamma-api.polymarket.com").active_markets()
 
 
 @pytest.mark.asyncio
 async def test_base_url_and_auth_defaults_are_rejected():
     async with httpx.AsyncClient(headers={"Authorization": "secret"}) as http:
         with pytest.raises(ValueError, match="credential"):
-            GammaClient(http, "https://gamma.test")
+            GammaClient(http, "https://gamma-api.polymarket.com")
     async with httpx.AsyncClient() as http:
         with pytest.raises(ValueError):
             GammaClient(http, "https://user:pass@gamma.test/path")
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://gamma.evil.example",
+        "http://gamma-api.polymarket.com",
+        "https://gamma-api.polymarket.com:443",
+        "https://gamma-api.polymarket.com/path",
+        "https://user@gamma-api.polymarket.com",
+    ],
+)
+def test_gamma_rejects_every_nonofficial_origin(origin):
+    with pytest.raises(ValueError, match="official public origin"):
+        GammaClient(base_url=origin, transport=httpx.MockTransport(lambda _: None))
 
 
 @pytest.mark.asyncio
@@ -247,4 +262,4 @@ async def test_identifiers_must_be_unique_across_keyset_pages(collision):
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         with pytest.raises(AdapterInvariantError, match="duplicate"):
-            await GammaClient(http, "https://gamma.test").active_markets()
+            await GammaClient(http, "https://gamma-api.polymarket.com").active_markets()

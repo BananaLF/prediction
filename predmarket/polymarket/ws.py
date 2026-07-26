@@ -85,6 +85,7 @@ class WsMetrics:
     disconnects: int = 0
     reconnects: int = 0
     resyncs: int = 0
+    overflows: int = 0
     callback_failures: int = 0
     queue_high_water: int = 0
     processing_latencies_ms: tuple[float, ...] = ()
@@ -342,6 +343,7 @@ class MarketWebSocket:
             self._metrics = replace(
                 self._metrics,
                 dropped=self._metrics.dropped + dropped,
+                overflows=self._metrics.overflows + 1,
             )
             self._invalidate_all("queue_overflow")
             return False
