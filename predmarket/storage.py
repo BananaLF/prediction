@@ -1248,7 +1248,37 @@ class OpportunityStore:
                     )
                     await connection.execute(
                         f"""UPDATE {table}
-                            SET state_updated_at_ms=fetched_at_ms"""
+                            SET state_updated_at_ms =
+                                CASE WHEN presence='MISSING' THEN
+                                  COALESCE(
+                                    (SELECT fetched_at_ms
+                                     FROM catalog_sync_runs
+                                     WHERE complete=1
+                                     ORDER BY fetched_at_ms DESC, sequence DESC
+                                     LIMIT 1),
+                                    (SELECT MAX(fetched_at_ms)
+                                     FROM catalog_sync_runs),
+                                    9223372036854775807
+                                  )
+                                ELSE fetched_at_ms END,
+                                state_update_sequence =
+                                CASE WHEN presence='MISSING' THEN
+                                  COALESCE(
+                                    (SELECT sequence
+                                     FROM catalog_sync_runs
+                                     WHERE complete=1
+                                     ORDER BY fetched_at_ms DESC, sequence DESC
+                                     LIMIT 1),
+                                    (SELECT MAX(sequence)
+                                     FROM catalog_sync_runs),
+                                    9223372036854775807
+                                  )
+                                ELSE COALESCE(
+                                  (SELECT MAX(sequence)
+                                   FROM catalog_sync_runs run
+                                   WHERE run.fetched_at_ms={table}.fetched_at_ms),
+                                  0
+                                ) END"""
                     )
             await connection.executescript(_SCHEMA)
             await connection.execute(
@@ -1973,7 +2003,9 @@ class OpportunityStore:
                 "active": None if row[7] is None else bool(row[7]),
                 "closed": None if row[8] is None else bool(row[8]),
                 "tradeable": bool(row[9]),
-                "last_seen_run_id": f"sync:{int(row[10])}",
+                "last_seen_run_id": (
+                    None if row[10] is None else f"sync:{int(row[10])}"
+                ),
             }
             for row in rows
         ]

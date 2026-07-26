@@ -23,6 +23,7 @@ from predmarket.runtime import Runtime
 import httpx
 import json
 import sys
+import sqlite3
 from types import SimpleNamespace
 from dataclasses import replace
 from predmarket.fees import FeeSchedule
@@ -340,6 +341,110 @@ async def test_delayed_seen_cannot_override_newer_missing_state(tmp_path):
     assert current["state_updated_at_ms"] == 20
     assert current["active"] is False
     assert current["tradeable"] is False
+
+
+@pytest.mark.asyncio
+async def test_v3_migration_backfills_missing_from_complete_sync_watermark(tmp_path):
+    path = tmp_path / "v3.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+        PRAGMA user_version=3;
+        CREATE TABLE catalog_sync_runs (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          snapshot_id TEXT NOT NULL,
+          fetched_at_ms INTEGER NOT NULL,
+          complete INTEGER NOT NULL,
+          provenance TEXT NOT NULL
+        );
+        CREATE TABLE current_catalog_markets (
+          market_id TEXT PRIMARY KEY, condition_id TEXT NOT NULL,
+          last_seen_snapshot TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
+          presence TEXT NOT NULL, active INTEGER, closed INTEGER,
+          tradeable INTEGER NOT NULL, canonical_json TEXT NOT NULL
+        );
+        CREATE TABLE current_catalog_tokens (
+          token_id TEXT PRIMARY KEY, market_id TEXT NOT NULL,
+          last_seen_snapshot TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
+          presence TEXT NOT NULL, canonical_json TEXT NOT NULL
+        );
+        CREATE TABLE current_catalog_events (
+          event_id TEXT PRIMARY KEY, last_seen_snapshot TEXT NOT NULL,
+          fetched_at_ms INTEGER NOT NULL, presence TEXT NOT NULL,
+          canonical_json TEXT NOT NULL
+        );
+        INSERT INTO catalog_sync_runs
+          (snapshot_id,fetched_at_ms,complete,provenance)
+          VALUES ('seen10',10,1,'exhausted'),('empty20',20,1,'exhausted');
+        INSERT INTO current_catalog_markets VALUES
+          ('a','ca','seen10',10,'MISSING',0,0,0,'{}'),
+          ('b','cb','seen12',12,'SEEN',1,0,1,'{}');
+    """)
+    connection.commit()
+    connection.close()
+
+    delayed = {
+        "fetched_at_ms": 15, "complete": False, "provenance": "delayed",
+        "markets": [{
+            "id": "a", "condition_id": "ca", "event_ids": [],
+            "tokens": [{"id": "ta", "outcome": "YES"}],
+            "active": True, "closed": False, "tradeable": True,
+        }],
+        "diagnostics": [],
+    }
+    async with OpportunityStore(path) as store:
+        migrated = {
+            row["market_id"]: row
+            for row in await store.list_current_catalog_markets(limit=10)
+        }
+        assert migrated["a"]["last_seen_at_ms"] == 10
+        assert migrated["a"]["state_updated_at_ms"] == 20
+        assert migrated["b"]["state_updated_at_ms"] == 12
+        await store.save_catalog_snapshot(delayed)
+        after = {
+            row["market_id"]: row
+            for row in await store.list_current_catalog_markets(limit=10)
+        }
+    assert after["a"]["presence"] == "MISSING"
+    assert after["a"]["last_seen_at_ms"] == 10
+    assert after["a"]["state_updated_at_ms"] == 20
+
+
+@pytest.mark.asyncio
+async def test_v3_missing_without_sync_history_migrates_fail_closed(tmp_path):
+    path = tmp_path / "v3-no-history.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+        PRAGMA user_version=3;
+        CREATE TABLE catalog_sync_runs (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          snapshot_id TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
+          complete INTEGER NOT NULL, provenance TEXT NOT NULL
+        );
+        CREATE TABLE current_catalog_markets (
+          market_id TEXT PRIMARY KEY, condition_id TEXT NOT NULL,
+          last_seen_snapshot TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
+          presence TEXT NOT NULL, active INTEGER, closed INTEGER,
+          tradeable INTEGER NOT NULL, canonical_json TEXT NOT NULL
+        );
+        CREATE TABLE current_catalog_tokens (
+          token_id TEXT PRIMARY KEY, market_id TEXT NOT NULL,
+          last_seen_snapshot TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
+          presence TEXT NOT NULL, canonical_json TEXT NOT NULL
+        );
+        CREATE TABLE current_catalog_events (
+          event_id TEXT PRIMARY KEY, last_seen_snapshot TEXT NOT NULL,
+          fetched_at_ms INTEGER NOT NULL, presence TEXT NOT NULL,
+          canonical_json TEXT NOT NULL
+        );
+        INSERT INTO current_catalog_markets VALUES
+          ('a','ca','unknown',10,'MISSING',0,0,0,'{}');
+    """)
+    connection.commit()
+    connection.close()
+    async with OpportunityStore(path) as store:
+        row = (await store.list_current_catalog_markets(limit=1))[0]
+    assert row["last_seen_at_ms"] == 10
+    assert row["state_updated_at_ms"] == 9223372036854775807
 
 
 @pytest.mark.asyncio
