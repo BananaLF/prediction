@@ -1715,6 +1715,24 @@ class OpportunityStore:
                 ),
             )
             sync_sequence = int(sync_cursor.lastrowid)
+            if data["complete"]:
+                # v3 databases without any catalog-sync history migrate
+                # unknown MISSING rows to a fail-closed sentinel watermark.
+                # Only a complete authoritative observation may explicitly
+                # open those rows for one-time reconciliation.
+                for table in (
+                    "current_catalog_markets",
+                    "current_catalog_tokens",
+                    "current_catalog_events",
+                ):
+                    await connection.execute(
+                        f"""UPDATE {table}
+                            SET state_updated_at_ms=0,
+                                state_update_sequence=0
+                            WHERE presence='MISSING'
+                              AND state_updated_at_ms=9223372036854775807
+                              AND state_update_sequence=9223372036854775807"""
+                    )
             if cursor.rowcount:
                 seen_markets: set[str] = set()
                 seen_tokens: set[str] = set()
@@ -1755,7 +1773,11 @@ class OpportunityStore:
                             ),
                         )
                         await connection.execute(
-                            """INSERT INTO current_catalog_tokens VALUES
+                            """INSERT INTO current_catalog_tokens
+                               (token_id, market_id, last_seen_snapshot,
+                                fetched_at_ms, state_updated_at_ms,
+                                state_update_sequence, presence, canonical_json)
+                               VALUES
                                (?, ?, ?, ?, ?, ?, 'SEEN', ?)
                                ON CONFLICT(token_id) DO UPDATE SET
                                market_id=excluded.market_id,
@@ -1778,7 +1800,12 @@ class OpportunityStore:
                             ),
                         )
                     await connection.execute(
-                        """INSERT INTO current_catalog_markets VALUES
+                        """INSERT INTO current_catalog_markets
+                           (market_id, condition_id, last_seen_snapshot,
+                            fetched_at_ms, state_updated_at_ms,
+                            state_update_sequence, presence, active, closed,
+                            tradeable, canonical_json)
+                           VALUES
                            (?, ?, ?, ?, ?, ?, 'SEEN', ?, ?, ?, ?)
                            ON CONFLICT(market_id) DO UPDATE SET
                            condition_id=excluded.condition_id,
@@ -1806,7 +1833,11 @@ class OpportunityStore:
                     )
                 for event in seen_events:
                     await connection.execute(
-                        """INSERT INTO current_catalog_events VALUES
+                        """INSERT INTO current_catalog_events
+                           (event_id, last_seen_snapshot, fetched_at_ms,
+                            state_updated_at_ms, state_update_sequence,
+                            presence, canonical_json)
+                           VALUES
                            (?, ?, ?, ?, ?, 'SEEN', ?)
                            ON CONFLICT(event_id) DO UPDATE SET
                            last_seen_snapshot=excluded.last_seen_snapshot,

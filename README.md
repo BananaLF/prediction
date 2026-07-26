@@ -36,7 +36,10 @@ When upgrading a v3 database, MISSING rows take the newest recorded complete
 sync as their conservative state watermark rather than their older last-seen
 time. If the legacy database has no sync history at all, migration uses a
 fail-closed maximum watermark; an operator must obtain a newer authoritative
-state instead of silently reviving the row.
+state instead of silently reviving the row. Recovery requires a
+`sync-markets` run that finishes the complete authoritative pagination; partial
+or bounded-prefix syncs intentionally cannot clear the sentinel. That complete
+run reconciles both present and still-missing rows back to normal watermarks.
 When a caller intentionally reaches its page or market bound, the returned
 catalog is explicitly marked incomplete with its continuation cursor and
 truncation reason; scan/watch may process that deterministic prefix, but it can

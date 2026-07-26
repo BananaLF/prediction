@@ -437,14 +437,83 @@ async def test_v3_missing_without_sync_history_migrates_fail_closed(tmp_path):
           canonical_json TEXT NOT NULL
         );
         INSERT INTO current_catalog_markets VALUES
-          ('a','ca','unknown',10,'MISSING',0,0,0,'{}');
+          ('a','ca','unknown',10,'MISSING',0,0,0,'{}'),
+          ('b','cb','unknown',10,'MISSING',0,0,0,'{}');
     """)
     connection.commit()
     connection.close()
     async with OpportunityStore(path) as store:
-        row = (await store.list_current_catalog_markets(limit=1))[0]
-    assert row["last_seen_at_ms"] == 10
-    assert row["state_updated_at_ms"] == 9223372036854775807
+        rows = await store.list_current_catalog_markets(limit=10)
+        assert rows[0]["last_seen_at_ms"] == 10
+        assert rows[0]["state_updated_at_ms"] == 9223372036854775807
+        partial_a = {
+            "fetched_at_ms": 15, "complete": False,
+            "provenance": "partial",
+            "markets": [{
+                "id": "a", "condition_id": "ca", "event_ids": [],
+                "tokens": [{"id": "ta", "outcome": "YES"}],
+                "active": True, "closed": False, "tradeable": True,
+            }],
+            "diagnostics": [],
+        }
+        await store.save_catalog_snapshot(partial_a)
+        still_missing = {
+            row["market_id"]: row
+            for row in await store.list_current_catalog_markets(limit=10)
+        }
+        assert still_missing["a"]["presence"] == "MISSING"
+        assert still_missing["a"]["state_updated_at_ms"] == 9223372036854775807
+
+        await store.save_catalog_snapshot({
+            **partial_a, "fetched_at_ms": 20, "complete": True,
+            "provenance": "pagination_exhausted",
+        })
+    async with OpportunityStore(path) as store:
+        reconciled = {
+            row["market_id"]: row
+            for row in await store.list_current_catalog_markets(limit=10)
+        }
+        assert reconciled["a"]["presence"] == "SEEN"
+        assert reconciled["a"]["last_seen_at_ms"] == 20
+        assert reconciled["a"]["state_updated_at_ms"] == 20
+        assert reconciled["b"]["presence"] == "MISSING"
+        assert reconciled["b"]["last_seen_at_ms"] == 10
+        assert reconciled["b"]["state_updated_at_ms"] == 20
+
+        await store.save_catalog_snapshot({
+            "fetched_at_ms": 19, "complete": False,
+            "provenance": "delayed_partial",
+            "markets": [{
+                "id": "b", "condition_id": "cb", "event_ids": [],
+                "tokens": [{"id": "tb", "outcome": "YES"}],
+                "active": True, "closed": False, "tradeable": True,
+            }],
+            "diagnostics": [],
+        })
+        after_delayed = {
+            row["market_id"]: row
+            for row in await store.list_current_catalog_markets(limit=10)
+        }
+        await store.save_catalog_snapshot({
+            "fetched_at_ms": 21, "complete": False,
+            "provenance": "newer_partial",
+            "markets": [{
+                "id": "a", "condition_id": "ca", "event_ids": [],
+                "tokens": [{"id": "ta", "outcome": "YES"}],
+                "active": False, "closed": True, "tradeable": False,
+            }],
+            "diagnostics": [],
+        })
+        normal = {
+            row["market_id"]: row
+            for row in await store.list_current_catalog_markets(limit=10)
+        }
+    assert after_delayed["b"]["presence"] == "MISSING"
+    assert after_delayed["b"]["state_updated_at_ms"] == 20
+    assert normal["a"]["presence"] == "SEEN"
+    assert normal["a"]["last_seen_at_ms"] == 21
+    assert normal["a"]["state_updated_at_ms"] == 21
+    assert normal["a"]["closed"] is True
 
 
 @pytest.mark.asyncio
