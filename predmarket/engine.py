@@ -11,7 +11,11 @@ import json
 from types import MappingProxyType
 from typing import Callable, Protocol
 
-from predmarket.actions import ActionKind, binary_underpriced_path
+from predmarket.actions import (
+    ActionKind,
+    binary_overpriced_path,
+    binary_underpriced_path,
+)
 from predmarket.config import Settings
 from predmarket.domain import OpportunityStatus, Side
 from predmarket.exact_math import decimal_ratio
@@ -277,21 +281,36 @@ def _snapshots(
     return by_token
 
 
-def _candidate(books: Mapping[str, BookSnapshot], market: BinaryMarket, settings: Settings) -> bool:
+def _candidate_strategy(
+    books: Mapping[str, BookSnapshot],
+    market: BinaryMarket,
+    settings: Settings,
+) -> str | None:
     try:
         asks = [books[token].book.asks[0].price for token in market.token_ids]
+        bids = [books[token].book.bids[0].price for token in market.token_ids]
     except IndexError:
-        return False
-    gross = sum(asks, ZERO)
+        return None
+    ask_gross = sum(asks, ZERO)
+    bid_gross = sum(bids, ZERO)
     conservative_conversion_per_share = (
         settings.conversion_cost / settings.default_simulation_quantity
     )
-    return (
-        gross
-        + gross * settings.safety_buffer_rate
+    if (
+        ask_gross
+        + ask_gross * settings.safety_buffer_rate
         + conservative_conversion_per_share
         < ONE
-    )
+    ):
+        return "binary_underpriced"
+    if (
+        bid_gross
+        - bid_gross * settings.safety_buffer_rate
+        - conservative_conversion_per_share
+        > ONE
+    ):
+        return "binary_overpriced"
+    return None
 
 
 def _has_binary_complete_semantics(
@@ -327,26 +346,51 @@ def _trade(book: OrderBook, fee: FeeSchedule, side: Side, quantity: Decimal) -> 
     return fill.gross, total_fee
 
 
-def _economics(quantity: Decimal, books: Mapping[str, OrderBook],
-               fees: Mapping[str, FeeSchedule], settings: Settings) -> _Economics:
+def _economics(
+    quantity: Decimal,
+    books: Mapping[str, OrderBook],
+    fees: Mapping[str, FeeSchedule],
+    settings: Settings,
+    strategy: str,
+) -> _Economics:
     gross_by, fee_by = {}, {}
+    side = Side.BUY if strategy == "binary_underpriced" else Side.SELL
     for token in books:
-        gross_by[token], fee_by[token] = _trade(books[token], fees[token], Side.BUY, quantity)
-    gross = sum(gross_by.values(), ZERO)
+        gross_by[token], fee_by[token] = _trade(
+            books[token], fees[token], side, quantity
+        )
+    trading_gross = sum(gross_by.values(), ZERO)
     trade_fees = sum(fee_by.values(), ZERO)
-    buffer = gross * settings.safety_buffer_rate
+    buffer = trading_gross * settings.safety_buffer_rate
     costs = trade_fees + buffer + settings.conversion_cost
+    if strategy == "binary_underpriced":
+        gross = trading_gross
+        proceeds = quantity
+    elif strategy == "binary_overpriced":
+        gross = quantity
+        proceeds = trading_gross
+    else:
+        raise ValueError("unsupported binary strategy")
     total = gross + costs
-    proceeds = quantity
     profit = proceeds - total
     per_leg_conversion = settings.conversion_cost / Decimal(len(books))
-    entry_costs = {
-        token: gross_by[token]
-        + fee_by[token]
-        + gross_by[token] * settings.safety_buffer_rate
-        + per_leg_conversion
-        for token in books
-    }
+    if strategy == "binary_underpriced":
+        entry_costs = {
+            token: gross_by[token]
+            + fee_by[token]
+            + gross_by[token] * settings.safety_buffer_rate
+            + per_leg_conversion
+            for token in books
+        }
+    else:
+        split_allocation = quantity / Decimal(len(books))
+        entry_costs = {
+            token: split_allocation
+            + fee_by[token]
+            + gross_by[token] * settings.safety_buffer_rate
+            + per_leg_conversion
+            for token in books
+        }
     return _Economics(quantity, gross, proceeds, costs, total, profit,
                       decimal_ratio(profit, total), gross_by, entry_costs,
                       fee_by, buffer)
@@ -383,6 +427,7 @@ class StructuralArbitrageEngine:
         temporal_reasons: tuple[str, ...] = ()
         now_ms: int | None = None
         evaluated_mono: float | None = None
+        strategy: str | None = None
 
         if base_reason is None:
             try:
@@ -393,7 +438,9 @@ class StructuralArbitrageEngine:
             except Exception:
                 base_reason = "discovery_provider_failure"
                 base_stage = "discovery"
-        candidate = base_reason is None and _candidate(discovery, market, self._d.settings)
+        if base_reason is None:
+            strategy = _candidate_strategy(discovery, market, self._d.settings)
+        candidate = strategy is not None
         if base_reason is None and not candidate:
             status, reason, stage = OpportunityStatus.REJECTED, "no_candidate", "discovery"
         elif base_reason is not None:
@@ -426,7 +473,11 @@ class StructuralArbitrageEngine:
                     "confirmation",
                 )
             else:
-                if not _candidate(confirmed, market, self._d.settings):
+                if (
+                    strategy is None
+                    or _candidate_strategy(confirmed, market, self._d.settings)
+                    != strategy
+                ):
                     status, reason, stage = OpportunityStatus.REJECTED, "expired_before_confirmation", "confirmation"
                 else:
                     try:
@@ -454,7 +505,11 @@ class StructuralArbitrageEngine:
                             max_processing_ms=self._d.settings.maximum_processing_latency_ms,
                         )
                         timing_reasons = timing.reasons
-                        path = binary_underpriced_path(*market.token_ids)
+                        path = (
+                            binary_underpriced_path(*market.token_ids)
+                            if strategy == "binary_underpriced"
+                            else binary_overpriced_path(*market.token_ids)
+                        )
                         simulations = optimize_quantities(
                             path, books, fees,
                             self._d.settings.safety_buffer_rate,
@@ -464,7 +519,13 @@ class StructuralArbitrageEngine:
                         exact = []
                         for item in simulations:
                             try:
-                                value = _economics(item.quantity, books, fees, self._d.settings)
+                                value = _economics(
+                                    item.quantity,
+                                    books,
+                                    fees,
+                                    self._d.settings,
+                                    strategy,
+                                )
                             except (InsufficientDepth, ValueError):
                                 continue
                             if value.total <= self._d.settings.bankroll:
@@ -527,6 +588,7 @@ class StructuralArbitrageEngine:
             status, reason, stage, candidate, discovery, confirmed, fee_confirmation,
             economics, risk_reasons, assessment_reasons, timing_reasons, partial_loss,
             unhedged, entry_costs, unwind_values, evidence_id, temporal_reasons,
+            strategy or "binary_underpriced",
         )
         newly_persisted = await self._d.store.save(bundle)
         if type(newly_persisted) is not bool:
@@ -552,7 +614,7 @@ class StructuralArbitrageEngine:
         if status is OpportunityStatus.SNAPSHOT_EXECUTABLE and newly_persisted:
             assert economics is not None and fee_confirmation is not None
             fingerprint = self._notification_fingerprint(
-                market, economics, confirmed
+                market, economics, confirmed, strategy or "binary_underpriced"
             )
             claim_ms, _claim_mono = _clock(self._d)
             try:
@@ -622,10 +684,11 @@ class StructuralArbitrageEngine:
         market: BinaryMarket,
         economics: _Economics,
         confirmed: Mapping[str, BookSnapshot],
+        strategy: str = "binary_underpriced",
     ) -> str:
         material = {
             "condition_id": market.condition_id,
-            "path": "binary_underpriced",
+            "path": strategy,
             "quantity": format(economics.quantity, "f"),
             "net_return": format(economics.rate, "f"),
             "books": [
@@ -674,6 +737,7 @@ class StructuralArbitrageEngine:
         unwind_values: Mapping[str, Decimal],
         evidence_id: str,
         temporal_reasons: tuple[str, ...],
+        strategy: str,
     ) -> EvidenceBundle:
         econ = economics
         gross, proceeds, costs = (econ.gross, econ.proceeds, econ.fees) if econ else (None, None, None)
@@ -687,7 +751,12 @@ class StructuralArbitrageEngine:
             cost_rows.append({"id": "cost-buffer", "kind": "SAFETY_BUFFER",
                               "component": "safety_buffer", "amount": econ.buffer})
             cost_rows.append({"id": "cost-conversion", "kind": "CONVERSION",
-                              "component": "merge", "amount": self._d.settings.conversion_cost})
+                              "component": (
+                                  "merge"
+                                  if strategy == "binary_underpriced"
+                                  else "split"
+                              ),
+                              "amount": self._d.settings.conversion_cost})
         def staged_books(stage: str, values: Mapping[str, BookSnapshot]) -> list[dict]:
             rows = []
             for token in market.token_ids:
@@ -735,24 +804,46 @@ class StructuralArbitrageEngine:
             for token, schedule in ((token, fees.schedules[token]) for token in market.token_ids)
         ]
         legs = [] if econ is None else [
-            {"id": f"leg-{token}", "token_id": token, "side": "BUY",
+            {"id": f"leg-{token}", "token_id": token,
+             "side": (
+                 "BUY" if strategy == "binary_underpriced" else "SELL"
+             ),
              "quantity": econ.quantity, "notional": econ.gross_notionals[token]}
             for token in market.token_ids
         ]
-        actions = [] if econ is None else [
-            {"id": f"action-{index}", "kind": kind, "sequence": index,
-             **({"token_id": token} if token else {}),
-             "quantity": econ.quantity,
-             "amount": econ.gross_notionals[token] if token else econ.quantity,
-             "asset_in": "pUSD" if token else "YES+NO",
-             "asset_out": token if token else "pUSD",
-             "cash_flow": "OUTFLOW" if token else "INFLOW"}
-            for index, (kind, token) in enumerate((
-                (ActionKind.BUY.value, market.yes_token_id),
-                (ActionKind.BUY.value, market.no_token_id),
-                (ActionKind.MERGE.value, None),
-            ))
-        ]
+        if econ is None:
+            actions = []
+        elif strategy == "binary_underpriced":
+            actions = [
+                {"id": f"action-{index}", "kind": kind, "sequence": index,
+                 **({"token_id": token} if token else {}),
+                 "quantity": econ.quantity,
+                 "amount": econ.gross_notionals[token] if token else econ.quantity,
+                 "asset_in": "pUSD" if token else "YES+NO",
+                 "asset_out": token if token else "pUSD",
+                 "cash_flow": "OUTFLOW" if token else "INFLOW"}
+                for index, (kind, token) in enumerate((
+                    (ActionKind.BUY.value, market.yes_token_id),
+                    (ActionKind.BUY.value, market.no_token_id),
+                    (ActionKind.MERGE.value, None),
+                ))
+            ]
+        else:
+            actions = [
+                {"id": "action-0", "kind": ActionKind.SPLIT.value,
+                 "sequence": 0, "quantity": econ.quantity,
+                 "amount": econ.quantity, "asset_in": "pUSD",
+                 "asset_out": "YES+NO", "cash_flow": "OUTFLOW"},
+                *[
+                    {"id": f"action-{index}", "kind": ActionKind.SELL.value,
+                     "sequence": index, "token_id": token,
+                     "quantity": econ.quantity,
+                     "amount": econ.gross_notionals[token],
+                     "asset_in": token, "asset_out": "pUSD",
+                     "cash_flow": "INFLOW"}
+                    for index, token in enumerate(market.token_ids, start=1)
+                ],
+            ]
         opportunity = {
             "id": opportunity_id, "status": status.value,
             "relation_id": market.relation.relation_id,
@@ -777,7 +868,7 @@ class StructuralArbitrageEngine:
         value = {
             "version": 2, "id": evidence_id,
             "producer": {"engine": "predmarket", "version": self._d.engine_version,
-                         "metadata": {"strategy": "binary_underpriced",
+                         "metadata": {"strategy": strategy,
                                       "pipeline_reason": reason,
                                       "pipeline_stage": stage,
                                       "discovery": {"candidate": candidate,

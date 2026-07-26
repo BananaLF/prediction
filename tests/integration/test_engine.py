@@ -392,6 +392,67 @@ async def test_exact_profitable_path_persists_before_notify_and_replays():
 
 
 @pytest.mark.asyncio
+async def test_overpriced_split_sell_path_round_trips_risk_report_and_fingerprint(
+    tmp_path,
+):
+    snapshots = (
+        book("yes-1", "0.70", bid="0.60"),
+        book("no-1", "0.70", bid="0.60"),
+    )
+    path = tmp_path / "overpriced.sqlite3"
+    notice = Notice()
+    async with OpportunityStore(path) as store:
+        subject, _, _ = engine(
+            Books(snapshots),
+            Books(copies(snapshots)),
+            store=store,
+            notice=notice,
+            run_id="overpriced",
+        )
+        result = await subject.evaluate_binary(market())
+        replayed = await store.replay_opportunity(result.opportunity_id)
+        report = await store.report(limit=10)
+
+    assert result.status is OpportunityStatus.SNAPSHOT_EXECUTABLE
+    assert result.path == "IMMEDIATE_CONVERSION"
+    assert result.notification_fingerprint is not None
+    assert len(notice.calls) == 1
+    assert (
+        notice.calls[0].notification_fingerprint
+        == result.notification_fingerprint
+    )
+    data = replayed.evidence.data
+    assert data["producer"]["metadata"]["strategy"] == "binary_overpriced"
+    assert [row["kind"] for row in data["actions"]] == [
+        "SPLIT",
+        "SELL",
+        "SELL",
+    ]
+    assert {row["side"] for row in data["legs"]} == {"SELL"}
+    assert data["risk"]["status"] == "SNAPSHOT_EXECUTABLE"
+    assert (
+        data["economics"]["gross_proceeds"]
+        - data["economics"]["total_costs"]
+        == data["economics"]["net_profit"]
+    )
+    assert report["by_path"]["IMMEDIATE_CONVERSION"] == 1
+    assert Decimal(
+        report["executable_economics"][0]["net_return"]
+    ) == result.minimum_return
+
+    underpriced = StructuralArbitrageEngine._notification_fingerprint(
+        market(),
+        type("Economics", (), {
+            "quantity": result.quantity,
+            "rate": result.minimum_return,
+        })(),
+        {item.token_id: item for item in copies(snapshots)},
+        "binary_underpriced",
+    )
+    assert result.notification_fingerprint != underpriced
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "snapshots,changes,timing_reason",
     [

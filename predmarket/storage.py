@@ -656,46 +656,100 @@ def _validate_bundle_tail(
                 raise ValueError("merge amount must equal converted proceeds")
             if sum((action["amount"] for action in buys), Decimal("0")) != economics["gross_investment"]:
                 raise ValueError("buy action amounts must equal gross investment")
-    if opportunity["status"] == "SNAPSHOT_EXECUTABLE":
-        actions = list(raw["actions"])
-        outcomes = {
-            token["outcome"]: token["id"] for token in raw["tokens"]
-        }
-        expected_tokens = (outcomes.get("YES"), outcomes.get("NO"))
-        legs_by_token = {
-            leg["token_id"]: leg for leg in raw["legs"]
-        }
-        if (
-            len(actions) != 3
-            or tuple(action["kind"] for action in actions)
-            != ("BUY", "BUY", "MERGE")
-            or tuple(action.get("token_id") for action in actions[:2])
-            != expected_tokens
-            or any(
-                action["quantity"] != opportunity["quantity"]
-                for action in actions
+        if opportunity["status"] == "SNAPSHOT_EXECUTABLE":
+            actions = list(raw["actions"])
+            outcomes = {
+                token["outcome"]: token["id"] for token in raw["tokens"]
+            }
+            expected_tokens = (outcomes.get("YES"), outcomes.get("NO"))
+            legs_by_token = {
+                leg["token_id"]: leg for leg in raw["legs"]
+            }
+            common_invalid = (
+                len(actions) != 3
+                or any(
+                    action["quantity"] != opportunity["quantity"]
+                    for action in actions
+                )
+                or set(legs_by_token) != set(expected_tokens)
             )
-            or actions[0]["asset_in"] != "pUSD"
-            or actions[1]["asset_in"] != "pUSD"
-            or tuple(action["asset_out"] for action in actions[:2])
-            != expected_tokens
-            or any(action["cash_flow"] != "OUTFLOW" for action in actions[:2])
-            or actions[2]["asset_in"] != "YES+NO"
-            or actions[2]["asset_out"] != "pUSD"
-            or actions[2]["cash_flow"] != "INFLOW"
-            or set(legs_by_token) != set(expected_tokens)
-            or any(
-                legs_by_token[token]["side"] != "BUY"
-                or legs_by_token[token]["quantity"] != opportunity["quantity"]
-                for token in expected_tokens
-            )
-            or sum(
-                (legs_by_token[token]["notional"] for token in expected_tokens),
-                Decimal("0"),
-            )
-            != economics["gross_investment"]
-        ):
-            raise ValueError("executable actions must be BUY YES, BUY NO, MERGE")
+            kinds = tuple(action["kind"] for action in actions)
+            if kinds == ("BUY", "BUY", "MERGE"):
+                path_invalid = (
+                    tuple(action.get("token_id") for action in actions[:2])
+                    != expected_tokens
+                    or actions[0]["asset_in"] != "pUSD"
+                    or actions[1]["asset_in"] != "pUSD"
+                    or tuple(action["asset_out"] for action in actions[:2])
+                    != expected_tokens
+                    or any(
+                        action["cash_flow"] != "OUTFLOW"
+                        for action in actions[:2]
+                    )
+                    or actions[2]["asset_in"] != "YES+NO"
+                    or actions[2]["asset_out"] != "pUSD"
+                    or actions[2]["cash_flow"] != "INFLOW"
+                    or any(
+                        legs_by_token[token]["side"] != "BUY"
+                        or legs_by_token[token]["quantity"]
+                        != opportunity["quantity"]
+                        for token in expected_tokens
+                    )
+                    or sum(
+                        (
+                            legs_by_token[token]["notional"]
+                            for token in expected_tokens
+                        ),
+                        Decimal("0"),
+                    )
+                    != economics["gross_investment"]
+                )
+            elif kinds == ("SPLIT", "SELL", "SELL"):
+                path_invalid = (
+                    actions[0]["asset_in"] != "pUSD"
+                    or actions[0]["asset_out"] != "YES+NO"
+                    or actions[0]["cash_flow"] != "OUTFLOW"
+                    or actions[0]["amount"] != economics["gross_investment"]
+                    or tuple(
+                        action.get("token_id") for action in actions[1:]
+                    )
+                    != expected_tokens
+                    or tuple(
+                        action["asset_in"] for action in actions[1:]
+                    )
+                    != expected_tokens
+                    or any(
+                        action["asset_out"] != "pUSD"
+                        or action["cash_flow"] != "INFLOW"
+                        for action in actions[1:]
+                    )
+                    or any(
+                        legs_by_token[token]["side"] != "SELL"
+                        or legs_by_token[token]["quantity"]
+                        != opportunity["quantity"]
+                        for token in expected_tokens
+                    )
+                    or sum(
+                        (
+                            legs_by_token[token]["notional"]
+                            for token in expected_tokens
+                        ),
+                        Decimal("0"),
+                    )
+                    != economics["gross_proceeds"]
+                    or sum(
+                        (action["amount"] for action in actions[1:]),
+                        Decimal("0"),
+                    )
+                    != economics["gross_proceeds"]
+                )
+            else:
+                path_invalid = True
+            if common_invalid or path_invalid:
+                raise ValueError(
+                    "executable actions must be BUY/BUY/MERGE or "
+                    "SPLIT/SELL/SELL"
+                )
 
     risk = _mapping("risk", raw["risk"])
     _required(
