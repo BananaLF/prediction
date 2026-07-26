@@ -719,6 +719,10 @@ class MarketWebSocket:
             raise TypeError("connector and sleeper must be callable")
         if type(max_attempts) is not int or max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
+        if max_messages is not None and (
+            type(max_messages) is not int or max_messages <= 0
+        ):
+            raise ValueError("max_messages must be a positive integer or None")
         if (
             isinstance(base_backoff, bool)
             or isinstance(max_backoff, bool)
@@ -732,15 +736,26 @@ class MarketWebSocket:
             raise ValueError("backoff values must be finite and ordered")
 
         for attempt in range(max_attempts):
+            remaining = (
+                None if max_messages is None
+                else max_messages - self._metrics.received
+            )
+            if remaining is not None and remaining <= 0:
+                break
             try:
                 connection = await connector(MARKET_CHANNEL_URL)
                 await self.serve_connection(
-                    connection, max_messages=max_messages
+                    connection, max_messages=remaining
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.on_disconnect("connection_error")
+            if (
+                max_messages is not None
+                and self._metrics.received >= max_messages
+            ):
+                break
             if attempt + 1 < max_attempts:
                 self._metrics = replace(
                     self._metrics, reconnects=self._metrics.reconnects + 1

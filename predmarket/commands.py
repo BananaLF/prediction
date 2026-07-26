@@ -215,6 +215,8 @@ def catalog_snapshot(discovery: GammaDiscovery, fetched_at_ms: int) -> dict[str,
             })
     return {
         "fetched_at_ms": fetched_at_ms,
+        "complete": True,
+        "provenance": "gamma_keyset_pagination_exhausted",
         "markets": markets,
         "diagnostics": [asdict(item) for item in discovery.diagnostics],
         "relation_candidates": relation_candidates,
@@ -237,6 +239,9 @@ async def scan_catalog(
             market = binary_market_from_metadata(metadata)
             if relation_resolver is not None:
                 market = relation_resolver(market)
+                if market is None:
+                    skipped += 1
+                    continue
             results.append(await engine_factory(market).scan_binary(market))
         except asyncio.CancelledError:
             raise
@@ -326,8 +331,19 @@ async def _scan_runtime(
         )
         if args.relation_id and selected_relation is None:
             raise RelationValidationError("selected relation_id is unknown")
+        selected_matches = 0
 
-        def resolve_relation(market: BinaryMarket) -> BinaryMarket:
+        def resolve_relation(market: BinaryMarket) -> BinaryMarket | None:
+            nonlocal selected_matches
+            if selected_relation is not None:
+                if (
+                    {leg.token_id for leg in selected_relation.legs}
+                    == set(market.token_ids)
+                    and len(selected_relation.states) == 2
+                ):
+                    selected_matches += 1
+                    return replace(market, relation=selected_relation)
+                return None
             matched = selected_relation or registry.match(market.token_ids)
             if matched is None:
                 return market
@@ -363,6 +379,10 @@ async def _scan_runtime(
                 )
             market = targeted_binary_market(*explicit)
             market = resolve_relation(market)
+            if market is None:
+                raise RelationValidationError(
+                    "selected relation does not match targeted market tokens"
+                )
             result = await engine_for(market).scan_binary(market)
             return {"evaluated": 1, "skipped": 0, "failed": 0,
                     "results": [_result_payload(result)], "diagnostics": []}
@@ -408,6 +428,10 @@ async def _scan_runtime(
             or args.relation_id is None
         ]
         summary["research_candidates"] = research_outputs
+        if args.relation_id and not research_outputs and selected_matches == 0:
+            raise RelationValidationError(
+                "selected relation matched no catalog market or research path"
+            )
         summary["results"] = [_result_payload(item) for item in summary["results"]]
         return summary
 
@@ -476,12 +500,29 @@ async def _watch_runtime(
             for item in catalog.markets
             if item.is_tradeable and item.event is not None
         }
+        selected_binary_matches = 0
         for condition, market in tuple(markets.items()):
+            if selected_relation is not None:
+                if (
+                    {leg.token_id for leg in selected_relation.legs}
+                    != set(market.token_ids)
+                    or len(selected_relation.states) != 2
+                ):
+                    markets.pop(condition)
+                    continue
+                selected_binary_matches += 1
             matched = selected_relation or registry.match(market.token_ids)
             if matched is not None and len(matched.states) == 2:
                 markets[condition] = replace(market, relation=matched)
         if not markets:
-            return {"evaluated": 0, "markets": 0, "ws_metrics": None}
+            if args.relation_id and not research_outputs:
+                raise RelationValidationError(
+                    "selected relation matched no watch market or research path"
+                )
+            return {
+                "evaluated": 0, "markets": 0, "ws_metrics": None,
+                "research_candidates": research_outputs,
+            }
         book_metadata: dict[str, BookMetadata] = {}
         invalid_conditions: set[str] = set()
         for condition, market in markets.items():

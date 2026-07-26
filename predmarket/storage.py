@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -33,6 +34,18 @@ def _query_limit(value: object) -> int:
     if type(value) is not int or not 1 <= value <= 10_000:
         raise ValueError("limit must be an integer in 1..10000")
     return value
+
+
+@asynccontextmanager
+async def _immediate_transaction(connection: aiosqlite.Connection):
+    await connection.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        await connection.rollback()
+        raise
+    else:
+        await connection.commit()
 class EvidenceConflictError(ValueError):
     """An immutable evidence identifier already exists with different content."""
 
@@ -1081,6 +1094,13 @@ CREATE TABLE IF NOT EXISTS catalog_snapshots (
     fetched_at_ms INTEGER NOT NULL,
     canonical_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS catalog_sync_runs (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL REFERENCES catalog_snapshots(id),
+    fetched_at_ms INTEGER NOT NULL,
+    complete INTEGER NOT NULL,
+    provenance TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS catalog_markets (
     snapshot_id TEXT NOT NULL REFERENCES catalog_snapshots(id),
     market_id TEXT NOT NULL,
@@ -1608,7 +1628,13 @@ class OpportunityStore:
             raise TypeError("snapshot must be a mapping")
         data = dict(snapshot)
         _required(data, "fetched_at_ms", "markets", "diagnostics")
+        data.setdefault("complete", True)
+        data.setdefault("provenance", "unspecified")
         _integer("fetched_at_ms", data["fetched_at_ms"])
+        if type(data["complete"]) is not bool:
+            raise TypeError("complete must be bool")
+        if type(data["provenance"]) is not str or not data["provenance"]:
+            raise ValueError("provenance must be nonempty")
         _sequence("markets", data["markets"])
         _sequence("diagnostics", data["diagnostics"])
         canonical = _json(data)
@@ -1616,12 +1642,21 @@ class OpportunityStore:
         digest = hashlib.sha256(_json(content).encode("utf-8")).hexdigest()
         snapshot_id = f"catalog:{digest}"
         connection = self._require_connection()
-        async with self._write_lock:
+        async with self._write_lock, _immediate_transaction(connection):
             cursor = await connection.execute(
                 """INSERT OR IGNORE INTO catalog_snapshots
                    (id, content_hash, fetched_at_ms, canonical_json)
                    VALUES (?, ?, ?, ?)""",
                 (snapshot_id, digest, data["fetched_at_ms"], canonical),
+            )
+            await connection.execute(
+                """INSERT INTO catalog_sync_runs
+                   (snapshot_id, fetched_at_ms, complete, provenance)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    snapshot_id, data["fetched_at_ms"],
+                    int(data["complete"]), data["provenance"],
+                ),
             )
             if cursor.rowcount:
                 seen_markets: set[str] = set()
@@ -1713,14 +1748,14 @@ class OpportunityStore:
                     ("current_catalog_tokens", "token_id", seen_tokens),
                     ("current_catalog_events", "event_id", seen_events),
                 ):
-                    if seen:
+                    if seen and data["complete"]:
                         placeholders = ",".join("?" for _ in seen)
                         await connection.execute(
                             f"""UPDATE {table} SET presence='MISSING'
                                 WHERE {id_column} NOT IN ({placeholders})""",
                             tuple(sorted(seen)),
                         )
-                    else:
+                    elif data["complete"]:
                         await connection.execute(
                             f"UPDATE {table} SET presence='MISSING'"
                         )
@@ -1758,7 +1793,38 @@ class OpportunityStore:
                             _json(relation_record),
                         ),
                     )
-            await connection.commit()
+            else:
+                for market in data["markets"]:
+                    record = _mapping("catalog market", market)
+                    market_id = _identifier("market_id", record["id"])
+                    await connection.execute(
+                        """UPDATE current_catalog_markets SET
+                           last_seen_snapshot=?, fetched_at_ms=?,
+                           presence='SEEN', active=?, closed=?, tradeable=?
+                           WHERE market_id=?""",
+                        (
+                            snapshot_id, data["fetched_at_ms"],
+                            record.get("active"), record.get("closed"),
+                            int(bool(record["tradeable"])), market_id,
+                        ),
+                    )
+                    for token in record["tokens"]:
+                        await connection.execute(
+                            """UPDATE current_catalog_tokens SET
+                               last_seen_snapshot=?, fetched_at_ms=?,
+                               presence='SEEN' WHERE token_id=?""",
+                            (
+                                snapshot_id, data["fetched_at_ms"],
+                                _mapping("token", token)["id"],
+                            ),
+                        )
+                    for event_id in record.get("event_ids", []):
+                        await connection.execute(
+                            """UPDATE current_catalog_events SET
+                               last_seen_snapshot=?, fetched_at_ms=?,
+                               presence='SEEN' WHERE event_id=?""",
+                            (snapshot_id, data["fetched_at_ms"], event_id),
+                        )
         return snapshot_id
 
     async def list_catalog_snapshots(
@@ -1785,7 +1851,12 @@ class OpportunityStore:
         _query_limit(limit)
         rows = await self._require_connection().execute_fetchall(
             """SELECT market_id, condition_id, last_seen_snapshot,
-                      fetched_at_ms, presence, active, closed, tradeable
+                      fetched_at_ms, presence, active, closed, tradeable,
+                      (SELECT MAX(sequence) FROM catalog_sync_runs run
+                       WHERE run.snapshot_id =
+                             current_catalog_markets.last_seen_snapshot
+                         AND run.fetched_at_ms =
+                             current_catalog_markets.fetched_at_ms)
                FROM current_catalog_markets ORDER BY market_id LIMIT ?""",
             (limit,),
         )
@@ -1797,6 +1868,7 @@ class OpportunityStore:
                 "active": None if row[5] is None else bool(row[5]),
                 "closed": None if row[6] is None else bool(row[6]),
                 "tradeable": bool(row[7]),
+                "last_seen_run_id": f"sync:{int(row[8])}",
             }
             for row in rows
         ]

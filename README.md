@@ -25,7 +25,10 @@ and explicitly unaudited relation candidates. Repeated identical snapshots are
 idempotent; changed lifecycle data appends a new snapshot. Transactional
 current-state tables point to the last snapshot that saw each stable ID;
 markets missing from a newer snapshot become `MISSING`, inactive, and
-non-tradeable without altering historical snapshots.
+non-tradeable without altering historical snapshots. Missing-state transitions
+are allowed only after a complete, pagination-exhausted sync; bounded or partial
+observations refresh seen entries without deactivating unseen ones. Every sync
+has its own observation/run even when its immutable content hash is unchanged.
 
 A deterministic targeted confirmation can be requested when the exact
 condition and token IDs are already known:
@@ -42,6 +45,10 @@ authoritative CLOB market fee schedule before assigning a formal status:
 ```console
 .venv/bin/predmarket watch --max-connections 3 --max-events 500
 ```
+
+`--max-events` is one cumulative budget for the whole command, including all
+reconnections. Once reached, the command closes cleanly without opening another
+connection; `--max-connections` bounds total connection attempts.
 
 Audited logical rules are managed without silently replacing an existing
 ID/version:

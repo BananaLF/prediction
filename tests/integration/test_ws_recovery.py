@@ -281,6 +281,43 @@ async def test_bounded_reconnect_backoff_is_deterministic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_message_budget_is_cumulative_and_stops_without_extra_reconnect() -> None:
+    ws = scanner()
+    connections = [
+        Connection([fixture("ws_book_yes.json")]),
+        Connection([fixture("ws_book_no.json"), fixture("ws_delta.json")]),
+        Connection([fixture("ws_book_yes.json")]),
+    ]
+    calls = []
+
+    async def connect(_url):
+        calls.append(1)
+        return connections.pop(0)
+
+    async def sleep(_delay):
+        pass
+
+    await ws.run(
+        connect, max_attempts=3, sleeper=sleep, base_backoff=0,
+        max_backoff=0, max_messages=3,
+    )
+    assert len(calls) == 2
+    assert ws.metrics().received == 3
+    assert ws.metrics().reconnects == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [0, True])
+async def test_run_rejects_invalid_whole_command_message_budget(invalid) -> None:
+    ws = scanner()
+    with pytest.raises(ValueError):
+        await ws.run(
+            lambda _url: None, max_attempts=1, sleeper=asyncio.sleep,
+            base_backoff=0, max_backoff=0, max_messages=invalid,
+        )
+
+
+@pytest.mark.asyncio
 async def test_idle_time_based_heartbeat_timeout_closes_and_invalidates() -> None:
     sleeper = ControlledSleeper()
     ws = scanner(
