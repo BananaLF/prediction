@@ -367,6 +367,91 @@ async def test_explicit_lifecycle_is_idempotent_and_closed_operations_fail():
 
 
 @pytest.mark.asyncio
+async def test_watch_run_and_event_records_are_idempotent(tmp_path):
+    path = tmp_path / "watch.sqlite3"
+    async with OpportunityStore(path) as store:
+        run_id = await store.save_watch_run({
+            "run_id": "watch:run-1",
+            "started_at_ms": 1000,
+            "finished_at_ms": 1100,
+            "status": "SUCCEEDED",
+            "exit_reason": None,
+            "params_json": {"max_connections": 3},
+        })
+        assert run_id == "watch:run-1"
+        event_id = await store.save_watch_event({
+            "run_id": run_id,
+            "sequence": 1,
+            "event_type": "book",
+            "token_id": "yes",
+            "condition_id": "condition-1",
+            "canonical_json": "{\"event_type\":\"book\"}",
+            "raw_json": "{\"event_type\":\"book\"}",
+            "received_wall_ms": 1001,
+            "received_monotonic": 2.0,
+            "exchange_ts_ms": 1000,
+            "persisted_at_ms": 1002,
+        })
+        assert await store.save_watch_event({
+            "run_id": run_id,
+            "sequence": 1,
+            "event_type": "book",
+            "token_id": "yes",
+            "condition_id": "condition-1",
+            "canonical_json": "{\"event_type\":\"book\"}",
+            "raw_json": "{\"event_type\":\"book\"}",
+            "received_wall_ms": 1001,
+            "received_monotonic": 2.0,
+            "exchange_ts_ms": 1000,
+            "persisted_at_ms": 1002,
+        }) == event_id
+        runs = await store.list_watch_runs(limit=10)
+        events = await store.list_watch_events(run_id)
+        assert runs[0]["id"] == run_id
+        assert runs[0]["status"] == "SUCCEEDED"
+        assert events == [{
+            "id": event_id,
+            "run_id": run_id,
+            "sequence": 1,
+            "event_type": "book",
+            "token_id": "yes",
+            "condition_id": "condition-1",
+            "canonical_json": "{\"event_type\":\"book\"}",
+            "raw_json": "{\"event_type\":\"book\"}",
+            "received_wall_ms": 1001,
+            "received_monotonic": 2.0,
+            "exchange_ts_ms": 1000,
+            "persisted_at_ms": 1002,
+        }]
+
+
+@pytest.mark.asyncio
+async def test_watch_metrics_are_persisted_and_listed(tmp_path):
+    async with OpportunityStore(tmp_path / "watch-metrics.sqlite3") as store:
+        await store.save_watch_run({
+            "run_id": "watch:run-1",
+            "started_at_ms": 1000,
+            "finished_at_ms": 1100,
+            "status": "SUCCEEDED",
+            "exit_reason": None,
+            "params_json": {"max_connections": 3},
+        })
+        await store.save_watch_metrics("watch:run-1", {
+            "received": 3,
+            "dropped": 1,
+            "malformed": 0,
+            "queue_high_water": 2,
+        })
+        runs = await store.list_watch_runs(limit=10)
+        metrics = await store.list_watch_metrics(limit=10)
+    assert runs[0]["id"] == "watch:run-1"
+    assert runs[0]["status"] == "SUCCEEDED"
+    assert metrics[0]["id"] == "watch:run-1"
+    assert metrics[0]["received"] == 3
+    assert metrics[0]["dropped"] == 1
+
+
+@pytest.mark.asyncio
 async def test_failed_initialization_leaves_store_closed_and_retryable(monkeypatch):
     store = OpportunityStore(":memory:")
     original = storage_module._SCHEMA
@@ -410,6 +495,195 @@ async def test_serialized_concurrent_writes():
         )
         assert results == [True, True]
         assert len(await store.list_opportunities()) == 2
+
+
+@pytest.mark.asyncio
+async def test_validate_opportunity_detects_missing_chain():
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(bundle("bundle-validate", "opp_123")))
+        await store._connection.execute(
+            "DELETE FROM legs WHERE bundle_id = ?", ("bundle-validate",)
+        )
+        await store._connection.commit()
+
+        result = await store.validate_opportunity("opp_123")
+
+    assert result["status"] == "fail"
+    assert result["errors"][0]["code"] == "INCOMPLETE_CHAIN"
+
+
+@pytest.mark.asyncio
+async def test_validate_opportunity_detects_missing_notifications():
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(bundle("bundle-notify", "opp_notify")))
+        await store._connection.execute(
+            "DELETE FROM notifications WHERE bundle_id = ?", ("bundle-notify",)
+        )
+        await store._connection.commit()
+
+        result = await store.validate_opportunity("opp_notify")
+
+    assert result["status"] == "fail"
+    assert "notifications" in result["checks"]["completeness"]["missing"]
+    assert result["errors"][0]["code"] == "INCOMPLETE_CHAIN"
+
+
+@pytest.mark.asyncio
+async def test_validate_opportunity_detects_partial_notifications():
+    value = bundle("bundle-notify-2", "opp_notify_2")
+    value["notifications"].append(
+        {"id": "notice-2", "channel": "desktop", "status": "PENDING", "sent_at_ms": None}
+    )
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(value))
+        await store._connection.execute(
+            "DELETE FROM notifications WHERE id = ?", ("notice-2",)
+        )
+        await store._connection.commit()
+
+        result = await store.validate_opportunity("opp_notify_2")
+
+    assert result["status"] == "fail"
+    assert "notifications" in result["checks"]["completeness"]["missing"]
+    assert result["errors"][0]["code"] == "INCOMPLETE_CHAIN"
+
+
+@pytest.mark.asyncio
+async def test_validate_opportunity_detects_replay_mismatch(tmp_path):
+    path = tmp_path / "replay-mismatch.sqlite3"
+    async with OpportunityStore(path) as store:
+        await store.save(EvidenceBundle.from_mapping(bundle("bundle-mismatch", "opp_123")))
+        await store._connection.execute(
+            "UPDATE legs SET payload = ? WHERE bundle_id = ? AND id = ?",
+            (
+                storage_module._json({
+                    "id": "leg-1",
+                    "token_id": "yes-1",
+                    "side": "BUY",
+                    "quantity": Decimal("9"),
+                    "notional": Decimal("4.5"),
+                }),
+                "bundle-mismatch",
+                "leg-1",
+            ),
+        )
+        await store._connection.commit()
+
+        result = await store.validate_opportunity("opp_123")
+
+    assert result["checks"]["consistency"]["status"] == "fail"
+    assert result["errors"][0]["code"] == "REPLAY_MISMATCH"
+
+
+@pytest.mark.asyncio
+async def test_validate_opportunity_rejects_ambiguous_opportunity_id():
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(bundle("bundle-one", "opp_123")))
+        await store.save(EvidenceBundle.from_mapping(bundle("bundle-two", "opp_123")))
+
+        result = await store.validate_opportunity("opp_123")
+
+    assert result["status"] == "fail"
+    assert result["errors"][0]["code"] == "AMBIGUOUS_OPPORTUNITY"
+
+
+@pytest.mark.asyncio
+async def test_validate_opportunity_detects_corrupted_canonical_json():
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(bundle("bundle-canonical", "opp_canonical")))
+        await store._connection.execute(
+            "UPDATE evidence_bundles SET canonical_json = ? WHERE id = ?",
+            (
+                json.dumps(
+                    json.loads((await store._connection.execute_fetchall(
+                        "SELECT canonical_json FROM evidence_bundles WHERE id = ?",
+                        ("bundle-canonical",),
+                    ))[0][0]),
+                    ensure_ascii=False,
+                    sort_keys=False,
+                    indent=2,
+                ),
+                "bundle-canonical",
+            ),
+        )
+        await store._connection.commit()
+
+        result = await store.validate_opportunity("opp_canonical")
+
+    assert result["status"] == "fail"
+    assert result["errors"][0]["code"] == "CORRUPTED_CANONICAL_JSON"
+
+
+@pytest.mark.asyncio
+async def test_validate_opportunity_reports_corrupted_canonical_json():
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(bundle("bundle-corrupt", "opp_123")))
+        await store._connection.execute(
+            "UPDATE evidence_bundles SET canonical_json = ? WHERE id = ?",
+            ("{not-json", "bundle-corrupt"),
+        )
+        await store._connection.commit()
+
+        result = await store.validate_opportunity("opp_123")
+
+    assert result["status"] == "fail"
+    assert result["errors"][0]["code"] == "CORRUPTED_CANONICAL_JSON"
+
+
+@pytest.mark.asyncio
+async def test_validate_opportunity_reports_schema_corrupted_canonical_json():
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(bundle("bundle-schema", "opp_schema")))
+        await store._connection.execute(
+            "UPDATE evidence_bundles SET canonical_json = ? WHERE id = ?",
+            ("{}", "bundle-schema"),
+        )
+        await store._connection.commit()
+
+        result = await store.validate_opportunity("opp_schema")
+
+    assert result["status"] == "fail"
+    assert result["errors"][0]["code"] == "CORRUPTED_CANONICAL_JSON"
+
+
+@pytest.mark.asyncio
+async def test_validate_opportunity_reports_nested_schema_corrupted_canonical_json():
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(bundle("bundle-nested", "opp_nested")))
+        await store._connection.execute(
+            "UPDATE evidence_bundles SET canonical_json = ? WHERE id = ?",
+            (
+                json.dumps(
+                    {
+                        **json.loads(
+                            (await store._connection.execute_fetchall(
+                                "SELECT canonical_json FROM evidence_bundles WHERE id = ?",
+                                ("bundle-nested",),
+                            ))[0][0]
+                        ),
+                        "evaluation": [],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                "bundle-nested",
+            ),
+        )
+        await store._connection.commit()
+
+        result = await store.validate_opportunity("opp_nested")
+
+    assert result["status"] == "fail"
+    assert result["errors"][0]["code"] == "CORRUPTED_CANONICAL_JSON"
+
+
+@pytest.mark.asyncio
+async def test_validate_opportunity_reports_invalid_input():
+    async with OpportunityStore(":memory:") as store:
+        result = await store.validate_opportunity("not a safe identifier")
+
+    assert result["status"] == "fail"
+    assert result["errors"][0]["code"] == "INVALID_INPUT"
 
 
 @pytest.mark.asyncio

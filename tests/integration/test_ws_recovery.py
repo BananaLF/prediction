@@ -216,6 +216,15 @@ def side_only_book(token: str, *, bid: str | None, ask: str | None) -> str:
     })
 
 
+async def wait_for_state(predicate, *, timeout: float = 1.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError("timed out waiting for websocket test state")
+        await asyncio.sleep(min(0.01, remaining))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("bid", "ask"),
@@ -507,14 +516,12 @@ async def test_slow_callback_does_not_block_receiver_and_overflow_forces_resync(
     connection = QueuedConnection()
     task = asyncio.create_task(ws.serve_connection(connection))
     await connection.incoming.put(fixture("ws_book_yes.json"))
-    while ws.epochs["yes"].state is not EpochState.LIVE:
-        await asyncio.sleep(0)
+    await wait_for_state(lambda: ws.epochs["yes"].state is EpochState.LIVE)
     await connection.incoming.put(fixture("ws_book_no.json"))
     await callback_started.wait()
     await connection.incoming.put(fixture("ws_delta.json"))
     await connection.incoming.put(fixture("ws_delta.json"))
-    while ws.metrics().dropped == 0:
-        await asyncio.sleep(0)
+    await wait_for_state(lambda: ws.metrics().dropped > 0)
     assert all(epoch.state is EpochState.RESYNC for epoch in ws.epochs.values())
     callback_release.set()
     task.cancel()

@@ -2064,7 +2064,7 @@ async def dispatch(args) -> int:
 Add `predmarket/runtime.py` to Task 12 files. It must create `Settings`, one shared
 `httpx.AsyncClient`, `GammaClient`, `ClobRestClient`, `Store`,
 `NotificationRouter`, and `ScannerEngine`, and expose methods named
-`sync_markets`, `scan_once`, `watch`, `replay`, and `report`. No runtime method may
+`sync-markets`, `scan-once`, `watch`, `replay`, and `report`. No runtime method may
 construct or import an authenticated trading client.
 
 - [ ] **Step 4: Implement side-effect-isolated notification routing**

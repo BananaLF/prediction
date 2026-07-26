@@ -68,6 +68,11 @@ def _reject_credential_headers(http: httpx.AsyncClient) -> None:
         )
 
 
+def _clear_public_cookie_jar(http: httpx.AsyncClient) -> None:
+    if len(http.cookies):
+        http.cookies.clear()
+
+
 def _required_string(raw: dict[str, Any], key: str) -> str:
     value = raw.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -326,6 +331,7 @@ class GammaClient:
     async def _get_page(self, *, limit: int, cursor: str | None) -> dict[str, Any]:
         if self._closed:
             raise RuntimeError("client is closed")
+        _clear_public_cookie_jar(self.http)
         _reject_credential_headers(self.http)
         params: dict[str, str | int] = {"limit": limit, "closed": "false"}
         if cursor is not None:

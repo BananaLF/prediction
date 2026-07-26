@@ -1,0 +1,30 @@
+#!/usr/bin/env sh
+
+set -eu
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+python_bin="$repo_dir/.venv/bin/python"
+
+if [ ! -x "$python_bin" ]; then
+  printf '%s\n' "error: missing .venv/bin/python; create .venv first" >&2
+  exit 1
+fi
+
+for script in \
+  "$repo_dir/bin/help" \
+  "$repo_dir/bin/predmarket" \
+  "$repo_dir/bin/sync-markets" \
+  "$repo_dir/bin/scan-once" \
+  "$repo_dir/bin/watch" \
+  "$repo_dir/bin/report" \
+  "$repo_dir/bin/replay" \
+  "$repo_dir/bin/validate-opportunity"
+do
+  if [ ! -x "$script" ]; then
+    printf '%s\n' "error: not executable: $script" >&2
+    exit 1
+  fi
+done
+
+"$repo_dir/bin/predmarket" --help >/dev/null
+printf '%s\n' "ok: launcher and environment look healthy"

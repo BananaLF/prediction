@@ -1,3 +1,6 @@
+import asyncio
+import contextlib
+import io
 from pathlib import Path
 from decimal import Decimal
 
@@ -57,6 +60,31 @@ def test_parser_exposes_expected_commands_and_rejects_credentials():
 def test_main_has_stable_input_and_operational_exit_codes(tmp_path, capsys):
     assert main(["--config", str(tmp_path / "missing.yaml"), "report"]) == 2
     assert "error:" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_validate_opportunity_cli_returns_json(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8").replace(
+            "data/predmarket.sqlite3", str(tmp_path / "validation.sqlite3")
+        ),
+        encoding="utf-8",
+    )
+
+    async def run_cli(arguments):
+        def invoke():
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                returncode = main(["--config", str(config), *arguments])
+            return SimpleNamespace(stdout=stdout.getvalue(), returncode=returncode)
+
+        return await asyncio.to_thread(invoke)
+
+    result = await run_cli(["--json", "validate-opportunity", "opp_123"])
+    payload = json.loads(result.stdout)
+    assert payload["opportunity_id"] == "opp_123"
+    assert "checks" in payload
 
 
 def _relation(path: Path, *, source_hash: str = "sha256:one") -> None:
@@ -552,7 +580,7 @@ async def test_sync_command_offline_persists_normalized_catalog(tmp_path):
         async def active_markets(self, **bounds):
             assert bounds == {
                 "limit": 10, "max_pages": 1, "max_markets": 10,
-                "allow_partial": True,
+                "allow_partial": False,
             }
             return GammaDiscovery((market(),), ())
 
@@ -576,6 +604,47 @@ async def test_sync_command_offline_persists_normalized_catalog(tmp_path):
         current = await store.list_current_catalog_markets(limit=10)
     assert current[0]["presence"] == "SEEN"
     assert current[0]["tradeable"] is True
+
+
+@pytest.mark.asyncio
+async def test_sync_command_is_idempotent_for_same_catalog_snapshot(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8").replace(
+            "data/predmarket.sqlite3", str(tmp_path / "catalog.sqlite3")
+        ),
+        encoding="utf-8",
+    )
+
+    class Gamma:
+        async def active_markets(self, **bounds):
+            assert bounds["allow_partial"] is False
+            return GammaDiscovery((market(),), ())
+
+    class FakeRuntime:
+        gamma = Gamma()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    args = build_parser().parse_args([
+        "--config", str(config), "--json", "sync-markets",
+        "--rules-dir", str(tmp_path / "rules"),
+    ])
+    first = await dispatch(
+        args, runtime_factory=FakeRuntime, wall_clock_ms=lambda: 123
+    )
+    second = await dispatch(
+        args, runtime_factory=FakeRuntime, wall_clock_ms=lambda: 124
+    )
+    assert first["markets"] == 1
+    assert second["markets"] == 1
+    async with OpportunityStore(tmp_path / "catalog.sqlite3") as store:
+        snapshots = await store.list_catalog_snapshots(limit=10)
+        current = await store.list_current_catalog_markets(limit=10)
+    assert len(snapshots) == 1
+    assert len(current) == 1
 
 
 def test_json_mode_keeps_terminal_audit_off_stdout(capsys):
@@ -815,6 +884,12 @@ async def test_watch_command_offline_success_reconfirms_with_two_rest_books(
     assert connection.closed is True
     async with OpportunityStore(tmp_path / "watch-ok.sqlite3") as store:
         assert len(await store.list_opportunities(limit=10)) == 1
+        runs = await store.list_watch_runs(limit=10)
+        events = await store.list_watch_events(runs[0]["id"])
+        assert runs[0]["status"] == "SUCCEEDED"
+        assert runs[0]["finished_at_ms"] >= runs[0]["started_at_ms"]
+        assert events
+        assert events[0]["event_type"] == "book"
         assert (await store.list_watch_metrics(limit=1))[0]["received"] == 3
 
     report_args = build_parser().parse_args([
@@ -915,7 +990,8 @@ async def test_relation_commands_flow_through_parser_and_dispatch(tmp_path):
     ]
 
 
-def test_targeted_scan_replay_and_report_flow_through_main_json(
+@pytest.mark.asyncio
+async def test_targeted_scan_replay_and_report_flow_through_main_json(
     tmp_path, monkeypatch, capsys
 ):
     config = tmp_path / "config.yaml"
@@ -968,26 +1044,28 @@ def test_targeted_scan_replay_and_report_flow_through_main_json(
             wall_clock_ms=lambda: 2000, monotonic=lambda: 1.25,
         )
 
-    monkeypatch.setattr("predmarket.commands.sys.platform", "linux")
-    assert main([
+    scan_args = build_parser().parse_args([
         "--config", str(config), "--json", "scan-once",
         "--condition", "condition", "--yes-token", "yes",
         "--no-token", "no", "--rules-dir", str(tmp_path / "rules"),
-    ], dispatcher=bound) == 0
-    scan_output = json.loads(capsys.readouterr().out)
+    ])
+    scan_output = await bound(scan_args)
     assert scan_output["results"][0]["status"] == "RESEARCH_CANDIDATE"
+    async with OpportunityStore(tmp_path / "flow.sqlite3") as store:
+        runs = await store.list_scan_runs(limit=10)
+        candidates = await store.list_scan_candidates(limit=10)
+    assert runs[0]["status"] == "SUCCEEDED"
+    assert candidates[0]["status"] == "RESEARCH_CANDIDATE"
 
-    assert main([
+    replay_output = await bound(build_parser().parse_args([
         "--config", str(config), "--json", "replay", "opp:condition",
-    ], dispatcher=bound) == 0
-    replay_output = json.loads(capsys.readouterr().out)
+    ]))
     assert replay_output["core_evidence"]["opportunity"]["id"] == "opp:condition"
     assert "notification_audit" in replay_output
 
-    assert main([
+    report_output = await bound(build_parser().parse_args([
         "--config", str(config), "--json", "report", "--limit", "10",
-    ], dispatcher=bound) == 0
-    report_output = json.loads(capsys.readouterr().out)
+    ]))
     assert report_output["by_status"]["RESEARCH_CANDIDATE"] == 1
     assert report_output["by_path"]["IMMEDIATE_CONVERSION"] == 1
     assert report_output["by_pipeline_reason"]["release_date_unknown"] == 1

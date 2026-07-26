@@ -11,6 +11,7 @@ import inspect
 import os
 from pathlib import Path
 import re
+import json
 import sys
 import time
 from typing import Any
@@ -26,6 +27,7 @@ from predmarket.notifier import MacOSNotifier, NotificationRouter, TerminalNotif
 from predmarket.polymarket.clob import ClobRestClient
 from predmarket.polymarket.gamma import GammaClient, GammaDiscovery, MarketMetadata
 from predmarket.runtime import Runtime
+from predmarket.storage import OpportunityStore
 from predmarket.relations import (
     Relation,
     RelationLeg,
@@ -350,6 +352,21 @@ async def _scan_runtime(
         confirmation_clob = runtime.confirmation_clob
         fee_clob = runtime.fee_clob
         store = await stack.enter_async_context(OpportunityStore(settings.database_path))
+        scan_run_id = f"scan:{uuid.uuid4().hex}"
+        started_at_ms = wall_clock_ms()
+        await store.save_scan_run({
+            "run_id": scan_run_id,
+            "started_at_ms": started_at_ms,
+            "status": "RUNNING",
+            "reason": None,
+            "params_json": {
+                "limit": args.limit,
+                "condition": args.condition,
+                "yes_token": args.yes_token,
+                "no_token": args.no_token,
+                "relation_id": args.relation_id,
+            },
+        })
         terminal = TerminalNotifier(
             stream=sys.stderr if args.json_output else sys.stdout
         )
@@ -414,8 +431,33 @@ async def _scan_runtime(
                     "selected relation does not match targeted market tokens"
                 )
             result = await engine_for(market).scan_binary(market)
+            payload = _result_payload(result)
+            await store.save_scan_candidate({
+                "run_id": scan_run_id,
+                "result_index": 0,
+                "status": str(payload["status"]),
+                "reason": str(payload["reason"]),
+                "canonical_json": json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+                ),
+                "observed_at_ms": wall_clock_ms(),
+            })
+            await store.save_scan_run({
+                "run_id": scan_run_id,
+                "started_at_ms": started_at_ms,
+                "finished_at_ms": wall_clock_ms(),
+                "status": "SUCCEEDED",
+                "reason": None,
+                "params_json": {
+                    "limit": args.limit,
+                    "condition": args.condition,
+                    "yes_token": args.yes_token,
+                    "no_token": args.no_token,
+                    "relation_id": args.relation_id,
+                },
+            })
             return {"evaluated": 1, "skipped": 0, "failed": 0,
-                    "results": [_result_payload(result)], "diagnostics": []}
+                    "results": [payload], "diagnostics": []}
         discovery = await gamma.active_markets(
             limit=min(args.limit, 100),
             max_pages=max(1, (args.limit + 99) // 100),
@@ -464,6 +506,31 @@ async def _scan_runtime(
                 "selected relation matched no catalog market or research path"
             )
         summary["results"] = [_result_payload(item) for item in summary["results"]]
+        for index, item in enumerate(summary["results"]):
+            await store.save_scan_candidate({
+                "run_id": scan_run_id,
+                "result_index": index,
+                "status": str(item["status"]),
+                "reason": str(item["reason"]),
+                "canonical_json": json.dumps(
+                    item, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+                ),
+                "observed_at_ms": wall_clock_ms(),
+            })
+        await store.save_scan_run({
+            "run_id": scan_run_id,
+            "started_at_ms": started_at_ms,
+            "finished_at_ms": wall_clock_ms(),
+            "status": "SUCCEEDED",
+            "reason": None,
+            "params_json": {
+                "limit": args.limit,
+                "condition": args.condition,
+                "yes_token": args.yes_token,
+                "no_token": args.no_token,
+                "relation_id": args.relation_id,
+            },
+        })
         return summary
 
 
@@ -477,7 +544,7 @@ async def _watch_runtime(
     """Bounded public-WS discovery whose callback always reconfirms by REST."""
     import websockets
     from predmarket.polymarket.ws import (
-        MARKET_CHANNEL_URL, BookMetadata, MarketWebSocket,
+        MARKET_CHANNEL_URL, BookMetadata, MAX_SUBSCRIPTION_TOKENS, MarketWebSocket,
     )
     from predmarket.storage import OpportunityStore
 
@@ -492,6 +559,12 @@ async def _watch_runtime(
             limit=100, max_pages=5, max_markets=500,
             allow_partial=True,
         )
+        catalog_record = catalog_snapshot(catalog, wall_clock_ms())
+        catalog_record["audited_relation_registry"] = [
+            {**item, "execution_support": "RESEARCH_ONLY"}
+            for item in RelationRegistry(args.rules_dir).list()
+        ]
+        await store.save_catalog_snapshot(catalog_record)
         registry = RelationRegistry(args.rules_dir)
         selected_relation = (
             registry.by_id(args.relation_id) if args.relation_id else None
@@ -620,44 +693,91 @@ async def _watch_runtime(
             status_counts[result.status.value] += 1
             reason_counts[result.reason] += 1
 
-        watcher = MarketWebSocket(
-            token_conditions,
-            queue_capacity=settings.queue_capacity,
-            wall_clock_ms=wall_clock_ms,
-            monotonic=monotonic,
-            candidate_callback=candidate,
-            book_metadata=book_metadata,
-        )
         watch_run_id = f"watch:{uuid.uuid4().hex}"
         started_at_ms = wall_clock_ms()
-        connector = websocket_connector or (
-            lambda url: websockets.connect(url, open_timeout=10)
-        )
-        reconciliation = asyncio.create_task(
-            _reconcile_loop(
-                watcher,
-                discovery_clob,
-                tuple(sorted(token_conditions)),
-                settings.reconcile_interval_seconds,
-                sleeper,
+        event_sequence = iter(range(1, 1_000_000_000))
+        final_status = "FAILED"
+        final_exit_reason = "not_started"
+        await store.save_watch_run({
+            "run_id": watch_run_id,
+            "started_at_ms": started_at_ms,
+            "status": "RUNNING",
+            "exit_reason": None,
+            "params_json": {
+                "max_connections": args.max_connections,
+                "max_events": args.max_events,
+                "reconcile_interval_seconds": settings.reconcile_interval_seconds,
+            },
+        })
+        connector = websocket_connector or (lambda url: websockets.connect(url, open_timeout=10))
+        chunks: list[tuple[str, ...]] = []
+        ordered_tokens = tuple(sorted(token_conditions))
+        for start in range(0, len(ordered_tokens), MAX_SUBSCRIPTION_TOKENS):
+            chunks.append(ordered_tokens[start:start + MAX_SUBSCRIPTION_TOKENS])
+        watchers = []
+        reconciliations = []
+        for chunk in chunks:
+            chunk_conditions = {token: token_conditions[token] for token in chunk}
+            chunk_metadata = {token: book_metadata[token] for token in chunk if token in book_metadata}
+            chunk_watcher = MarketWebSocket(
+                chunk_conditions,
+                queue_capacity=settings.queue_capacity,
+                wall_clock_ms=wall_clock_ms,
+                monotonic=monotonic,
+                candidate_callback=candidate,
+                event_callback=lambda message: store.save_watch_event({
+                    "run_id": watch_run_id,
+                    "sequence": event_sequence.__next__(),
+                    "event_type": message.event_type,
+                    "token_id": message.token_id,
+                    "condition_id": message.condition_id,
+                    "canonical_json": message.raw,
+                    "raw_json": message.raw,
+                    "received_wall_ms": message.received_wall_ms,
+                    "received_monotonic": message.received_monotonic,
+                    "exchange_ts_ms": message.exchange_ts_ms,
+                    "persisted_at_ms": wall_clock_ms(),
+                }),
+                book_metadata=chunk_metadata,
             )
-        )
+            watchers.append(chunk_watcher)
+            reconciliations.append(asyncio.create_task(
+                _reconcile_loop(
+                    chunk_watcher,
+                    discovery_clob,
+                    chunk,
+                    settings.reconcile_interval_seconds,
+                    sleeper,
+                )
+            ))
+        first_watcher = watchers[0] if watchers else None
         try:
-            await watcher.run(
-                connector,
-                max_attempts=args.max_connections,
-                sleeper=sleeper,
-                base_backoff=1,
-                max_backoff=30,
-                max_messages=args.max_events,
-            )
+            await asyncio.gather(*[
+                watcher.run(
+                    connector,
+                    max_attempts=args.max_connections,
+                    sleeper=sleeper,
+                    base_backoff=1,
+                    max_backoff=30,
+                    max_messages=args.max_events,
+                )
+                for watcher in watchers
+            ])
+            final_status = "SUCCEEDED"
+            final_exit_reason = None
+        except Exception as error:
+            final_status = "FAILED"
+            final_exit_reason = type(error).__name__
+            raise
         finally:
-            reconciliation.cancel()
-            try:
-                await reconciliation
-            except asyncio.CancelledError:
-                pass
-            metrics = asdict(watcher.metrics())
+            for reconciliation in reconciliations:
+                reconciliation.cancel()
+            for reconciliation in reconciliations:
+                try:
+                    await reconciliation
+                except asyncio.CancelledError:
+                    pass
+            metrics = asdict(first_watcher.metrics()) if first_watcher is not None else {}
             metrics["reconciliation_interval_seconds"] = (
                 settings.reconcile_interval_seconds
             )
@@ -670,13 +790,27 @@ async def _watch_runtime(
             ):
                 if metrics[field] is not None:
                     metrics[field] = str(metrics[field])
+            await store.save_watch_run({
+                "run_id": watch_run_id,
+                "started_at_ms": started_at_ms,
+                "finished_at_ms": wall_clock_ms(),
+                "status": final_status,
+                "exit_reason": final_exit_reason,
+                "params_json": {
+                    "max_connections": args.max_connections,
+                    "max_events": args.max_events,
+                    "reconcile_interval_seconds": settings.reconcile_interval_seconds,
+                },
+            })
             await store.save_watch_metrics(
                 watch_run_id, started_at_ms,
                 {
                     **metrics,
                     "epoch_states": {
                         token: epoch.state.value
-                        for token, epoch in watcher.epochs.items()
+                        for token, epoch in (
+                            first_watcher.epochs.items() if first_watcher is not None else []
+                        )
                     },
                 },
             )
@@ -718,7 +852,7 @@ async def dispatch(
             discovery = await runtime.gamma.active_markets(
                 limit=args.limit, max_pages=args.max_pages,
                 max_markets=args.max_markets,
-                allow_partial=True,
+                allow_partial=False,
             )
         snapshot = catalog_snapshot(
             discovery, wall_clock_ms()
@@ -736,18 +870,21 @@ async def dispatch(
             "diagnostics": [asdict(item) for item in discovery.diagnostics],
         }
     if args.command == "scan-once":
-        return await _scan_runtime(
+        result = await _scan_runtime(
             args, settings, runtime_factory=runtime_factory,
             wall_clock_ms=wall_clock_ms, monotonic=monotonic,
         )
+        return result
     if args.command == "watch":
         return await _watch_runtime(
             args, settings, runtime_factory=runtime_factory,
             websocket_connector=websocket_connector, sleeper=sleeper,
             wall_clock_ms=wall_clock_ms, monotonic=monotonic,
         )
-    if args.command in {"replay", "report"}:
+    if args.command in {"replay", "report", "validate-opportunity"}:
         async with OpportunityStore(settings.database_path) as store:
+            if args.command == "validate-opportunity":
+                return await store.validate_opportunity(args.opportunity_id)
             if args.command == "replay":
                 if bool(args.opportunity_id) == bool(args.bundle_id):
                     raise ValueError(

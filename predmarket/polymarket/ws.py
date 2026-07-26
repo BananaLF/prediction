@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from collections import deque
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 import inspect
@@ -155,6 +156,7 @@ class MarketWebSocket:
             [tuple[str, ...], str], Awaitable[None] | None
         ]
         | None = None,
+        event_callback: Callable[[ReceivedMessage], Awaitable[None] | None] | None = None,
         sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         heartbeat_interval_seconds: int | float = 10,
         heartbeat_timeout_seconds: int | float = 3,
@@ -212,10 +214,12 @@ class MarketWebSocket:
         self._wall_clock_ms = wall_clock_ms
         self._monotonic = monotonic
         self._callback = candidate_callback
+        self._event_callback = event_callback
         self._sleeper = sleeper
         self._heartbeat_interval_seconds = float(heartbeat_interval_seconds)
         self._heartbeat_timeout_seconds = float(heartbeat_timeout_seconds)
         self._metrics = WsMetrics()
+        self._processing_latencies = deque(maxlen=LATENCY_SAMPLE_CAPACITY)
         self._trigger_keys: set[tuple[tuple[str, str | None], ...]] = set()
         self._tick_sizes: dict[str, Decimal] = {}
         self._state_lock = asyncio.Lock()
@@ -232,7 +236,14 @@ class MarketWebSocket:
         }
 
     def metrics(self) -> WsMetrics:
-        return self._metrics
+        return replace(
+            self._metrics,
+            processing_latencies_ms=tuple(self._processing_latencies),
+            processing_latency_sample_truncated=(
+                self._metrics.processing_latency_count
+                > LATENCY_SAMPLE_CAPACITY
+            ),
+        )
 
     def depth(self, token_id: str) -> BookDepth:
         return self._depth[token_id]
@@ -371,13 +382,9 @@ class MarketWebSocket:
             latency = (self._monotonic() - message.received_monotonic) * 1000
             if not math.isfinite(latency) or latency < 0:
                 raise ValueError("processing clock regressed")
+            self._processing_latencies.append(latency)
             self._metrics = replace(
                 self._metrics,
-                processing_latencies_ms=(
-                    (*self._metrics.processing_latencies_ms, latency)[
-                        -LATENCY_SAMPLE_CAPACITY:
-                    ]
-                ),
                 processing_latency_count=(
                     self._metrics.processing_latency_count + 1
                 ),
@@ -392,11 +399,11 @@ class MarketWebSocket:
                     latency if self._metrics.processing_latency_max_ms is None
                     else max(self._metrics.processing_latency_max_ms, latency)
                 ),
-                processing_latency_sample_truncated=(
-                    self._metrics.processing_latency_count + 1
-                    > LATENCY_SAMPLE_CAPACITY
-                ),
             )
+            if self._event_callback is not None:
+                result = self._event_callback(message)
+                if inspect.isawaitable(result):
+                    await result
             return message
         except WsProtocolError as error:
             self._metrics = replace(

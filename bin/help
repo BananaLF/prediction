@@ -1,0 +1,52 @@
+#!/usr/bin/env sh
+
+set -eu
+
+verbose=false
+if [ "${1:-}" = "--verbose" ]; then
+  verbose=true
+fi
+
+if [ "$verbose" = true ]; then
+  cat <<'EOF'
+predmarket local scripts (verbose)
+
+Core entrypoints:
+  ./bin/help              show this index
+  ./bin/predmarket        generic CLI entrypoint
+  ./bin/sync-markets      synchronize the public market catalog
+  ./bin/scan-once         confirm candidates with REST
+  ./bin/watch             discover via public WebSocket
+  ./bin/report            bounded evidence summary
+  ./bin/replay            replay immutable evidence
+  ./bin/validate-opportunity  validate one opportunity in SQLite
+
+Examples:
+  ./bin/sync-markets --limit 100 --max-pages 2
+  ./bin/scan-once --limit 100
+  ./bin/watch --max-connections 3 --max-events 500
+  ./bin/report --limit 100
+  ./bin/replay OPPORTUNITY_ID
+  ./bin/validate-opportunity OPPORTUNITY_ID
+
+Doctor:
+  ./bin/doctor            check local launcher and environment
+EOF
+  exit 0
+fi
+
+cat <<'EOF'
+predmarket local scripts
+
+Core entrypoints:
+  ./bin/help
+  ./bin/predmarket
+  ./bin/sync-markets
+  ./bin/scan-once
+  ./bin/watch
+  ./bin/report
+  ./bin/replay
+  ./bin/validate-opportunity
+
+Run `./bin/help --verbose` for examples.
+EOF

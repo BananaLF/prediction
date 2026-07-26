@@ -29,7 +29,7 @@ sha256sum /absolute/soak/soak.yaml
 
 ```console
 timeout --signal=INT --kill-after=60s 24h \
-  .venv/bin/python -m predmarket \
+  ./bin/predmarket \
   --config /absolute/soak/soak.yaml --json \
   watch --max-connections 1000000 --max-events 100000000 \
   > /absolute/soak/logs/watch.stdout.jsonl \
@@ -44,7 +44,7 @@ date -u +%FT%TZ
 ps -o pid,rss,vsz,%cpu,etime -p PROCESS_ID
 df -k /absolute/soak
 du -k /absolute/soak/data/predmarket.sqlite3*
-.venv/bin/python -m predmarket \
+./bin/predmarket \
   --config /absolute/soak/soak.yaml --json report --limit 100
 ```
 
@@ -65,10 +65,10 @@ du -k /absolute/soak/data/predmarket.sqlite3*
 在 24 小时验收后才开始。每天固定时间执行：
 
 ```console
-.venv/bin/python -m predmarket \
+./bin/predmarket \
   --config /absolute/soak/soak.yaml \
   sync-markets --limit 100 --max-pages 100 --max-markets 10000
-.venv/bin/python -m predmarket \
+./bin/predmarket \
   --config /absolute/soak/soak.yaml --json report --limit 100 \
   > /absolute/soak/logs/report-DAY.json
 sqlite3 /absolute/soak/data/predmarket.sqlite3 "PRAGMA integrity_check;"

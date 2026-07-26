@@ -20,7 +20,7 @@ from predmarket.exact_math import decimal_ratio
 from predmarket.risk import RiskInputs, assess_risk, worst_partial_fill
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 EVIDENCE_SCHEMA_VERSION = 2
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OPPORTUNITY_STATUSES = {
@@ -1227,6 +1227,43 @@ CREATE TABLE IF NOT EXISTS watch_runs (
     started_at_ms INTEGER NOT NULL,
     canonical_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS watch_metrics (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    started_at_ms INTEGER NOT NULL,
+    canonical_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS watch_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    run_id TEXT NOT NULL,
+    event_index INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    token_id TEXT,
+    condition_id TEXT,
+    canonical_json TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    received_wall_ms INTEGER NOT NULL,
+    received_monotonic REAL NOT NULL,
+    exchange_ts_ms INTEGER NOT NULL,
+    persisted_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scan_runs (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    started_at_ms INTEGER NOT NULL,
+    canonical_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scan_candidates (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    run_id TEXT NOT NULL,
+    result_index INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    canonical_json TEXT NOT NULL,
+    observed_at_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS research_observations (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE,
@@ -1243,6 +1280,22 @@ def _json(value: object) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _normalize_validation_view(value: object) -> object:
+    """Normalize semantic validation values across SQLite and replay views."""
+    if value is None or type(value) in (str, bool, int):
+        return value
+    if type(value) is Decimal:
+        return _canonical_decimal(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _normalize_validation_view(child)
+            for key, child in sorted(value.items())
+        }
+    if type(value) in (list, tuple):
+        return [_normalize_validation_view(child) for child in value]
+    raise TypeError(f"unsupported validation value: {type(value).__name__}")
 
 
 class OpportunityStore:
@@ -1334,6 +1387,48 @@ class OpportunityStore:
                                   0
                                 ) END"""
                     )
+            if existing_version < 5:
+                await connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS watch_metrics (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        id TEXT NOT NULL UNIQUE,
+                        started_at_ms INTEGER NOT NULL,
+                        canonical_json TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS watch_events (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        id TEXT NOT NULL UNIQUE,
+                        run_id TEXT NOT NULL,
+                        event_index INTEGER NOT NULL,
+                        event_type TEXT NOT NULL,
+                        token_id TEXT,
+                        condition_id TEXT,
+                        canonical_json TEXT NOT NULL,
+                        raw_json TEXT NOT NULL,
+                        received_wall_ms INTEGER NOT NULL,
+                        received_monotonic REAL NOT NULL,
+                        exchange_ts_ms INTEGER NOT NULL,
+                        persisted_at_ms INTEGER NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS scan_runs (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        id TEXT NOT NULL UNIQUE,
+                        started_at_ms INTEGER NOT NULL,
+                        canonical_json TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS scan_candidates (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        id TEXT NOT NULL UNIQUE,
+                        run_id TEXT NOT NULL,
+                        result_index INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        canonical_json TEXT NOT NULL,
+                        observed_at_ms INTEGER NOT NULL
+                    );
+                    """
+                )
             await connection.executescript(_SCHEMA)
             await connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
@@ -1733,6 +1828,279 @@ class OpportunityStore:
             raise KeyError(opportunity_id)
         return await self.replay_with_notification_audit(str(rows[0][0]))
 
+    async def validate_opportunity(self, opportunity_id: str) -> dict[str, object]:
+        """Return completeness and replay-consistency checks for one opportunity."""
+        def failure(
+            code: str,
+            message: str,
+            *,
+            context: dict[str, object] | None = None,
+            selection_reason: str,
+        ) -> dict[str, object]:
+            return {
+                "opportunity_id": opportunity_id if type(opportunity_id) is str else None,
+                "status": "fail",
+                "checks": {"completeness": {"status": "fail", "missing": []}},
+                "evidence": {},
+                "errors": [{
+                    "code": code,
+                    "message": message,
+                    "context": context or {},
+                }],
+                "selection": {
+                    "strategy": "latest_run_for_opportunity",
+                    "reason": selection_reason,
+                },
+            }
+
+        try:
+            _identifier("opportunity_id", opportunity_id)
+        except (TypeError, ValueError) as exc:
+            return failure(
+                "INVALID_INPUT",
+                "opportunity_id is invalid",
+                context={"reason": str(exc)},
+                selection_reason="input validation failed",
+            )
+        connection = self._require_connection()
+        rows = await connection.execute_fetchall(
+            """SELECT o.bundle_id, o.run_id, r.started_at_ms,
+                      EXISTS(
+                          SELECT 1 FROM evidence_bundles b
+                          WHERE b.id = o.bundle_id
+                      )
+               FROM opportunities o
+               LEFT JOIN runs r ON r.bundle_id = o.bundle_id AND r.id = o.run_id
+               WHERE o.id = ?
+               ORDER BY r.started_at_ms DESC, o.rowid DESC""",
+            (opportunity_id,),
+        )
+        if not rows:
+            result = failure(
+                "NOT_FOUND",
+                "opportunity was not found",
+                context={"opportunity_id": opportunity_id},
+                selection_reason="no opportunity row found",
+            )
+            result["checks"] = {"completeness": {"status": "fail", "missing": ["opportunity"]}}
+            return result
+        if len(rows) > 1:
+            return failure(
+                "AMBIGUOUS_OPPORTUNITY",
+                "multiple evidence chains match the opportunity_id",
+                context={
+                    "opportunity_id": opportunity_id,
+                    "bundle_ids": [str(row[0]) for row in rows],
+                },
+                selection_reason="multiple opportunity rows found",
+            )
+
+        bundle_id, run_id, started_at_ms, has_bundle = rows[0]
+        bundle_rows = await connection.execute_fetchall(
+            "SELECT canonical_json FROM evidence_bundles WHERE id = ?",
+            (bundle_id,),
+        )
+        try:
+            canonical_json = str(bundle_rows[0][0]) if bundle_rows else ""
+            bundle_data = json.loads(canonical_json) if bundle_rows else {}
+            if bundle_rows:
+                expected_canonical = EvidenceBundle.from_mapping(
+                    _restore_schema_decimals(bundle_data)
+                ).canonical_json
+                if expected_canonical != canonical_json:
+                    raise ValueError("stored evidence is not canonical")
+        except (
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+            InvalidOperation,
+            KeyError,
+            AttributeError,
+        ) as exc:
+            return failure(
+                "CORRUPTED_CANONICAL_JSON",
+                "stored evidence JSON is corrupted or non-canonical",
+                context={"bundle_id": str(bundle_id), "reason": str(exc)},
+                selection_reason="canonical evidence validation failed",
+            )
+        expected_notifications = bundle_data.get("notifications", [])
+        required_members = {
+            "bundle": bool(has_bundle),
+            "run": started_at_ms is not None,
+        }
+        for name, table in (
+            ("legs", "legs"),
+            ("actions", "actions"),
+            ("risk_assessment", "risk_assessments"),
+            ("latency_metrics", "latency_metrics"),
+            ("notifications", "notifications"),
+        ):
+            count = await connection.execute_fetchall(
+                f"SELECT COUNT(*) FROM {table} WHERE bundle_id = ? AND opportunity_id = ?",
+                (bundle_id, opportunity_id),
+            )
+            required_members[name] = bool(count[0][0])
+        notification_rows = await connection.execute_fetchall(
+            """SELECT id, payload FROM notifications
+               WHERE bundle_id = ? AND opportunity_id = ? ORDER BY id""",
+            (bundle_id, opportunity_id),
+        )
+        expected_notification_rows = [
+            (item["id"], _json(item))
+            for item in sorted(expected_notifications, key=lambda item: item["id"])
+        ]
+        required_members["notifications"] = (
+            len(notification_rows) == len(expected_notification_rows)
+            and all(
+                str(actual_id) == expected_id and str(actual_json) == expected_json
+                for (actual_id, actual_json), (expected_id, expected_json) in zip(
+                    notification_rows, expected_notification_rows
+                )
+            )
+        )
+        missing = [name for name, exists in required_members.items() if not exists]
+        completeness_status = "pass" if not missing else "fail"
+        evidence = {
+            "bundle_id": str(bundle_id),
+            "opportunity_id": opportunity_id,
+            "run_id": str(run_id),
+        }
+        result: dict[str, object] = {
+            "opportunity_id": opportunity_id,
+            "status": completeness_status,
+            "checks": {
+                "completeness": {
+                    "status": completeness_status,
+                    **evidence,
+                    "missing": missing,
+                },
+            },
+            "evidence": evidence,
+            "errors": [],
+            "selection": {
+                "strategy": "latest_run_for_opportunity",
+                "reason": "opportunity row selected by newest run timestamp",
+            },
+        }
+        if missing:
+            result["errors"] = [{
+                "code": "INCOMPLETE_CHAIN",
+                "message": "opportunity evidence chain is incomplete",
+                "context": {"opportunity_id": opportunity_id, "missing": missing},
+            }]
+            result["checks"]["consistency"] = {
+                "status": "skipped",
+                "reason": "completeness check failed",
+            }
+            return result
+
+        async def payloads(table: str, order_by: str) -> list[object]:
+            rows = await connection.execute_fetchall(
+                f"""SELECT payload FROM {table}
+                    WHERE bundle_id = ? AND opportunity_id = ? ORDER BY {order_by}""",
+                (bundle_id, opportunity_id),
+            )
+            return [json.loads(row[0]) for row in rows]
+
+        risk_rows = await connection.execute_fetchall(
+            """SELECT payload FROM risk_assessments
+               WHERE bundle_id = ? AND opportunity_id = ?""",
+            (bundle_id, opportunity_id),
+        )
+        notification_payloads = await payloads("notifications", "id")
+        claim_rows = await connection.execute_fetchall(
+            """SELECT e.fingerprint, c.bundle_id, c.state, c.claimed_at_ms,
+                      c.lease_expires_at_ms, c.attempt_count
+               FROM notification_events e
+               JOIN notification_claims c ON c.fingerprint = e.fingerprint
+               WHERE e.bundle_id = ?
+               GROUP BY e.fingerprint
+               ORDER BY e.fingerprint""",
+            (bundle_id,),
+        )
+        attempts = await connection.execute_fetchall(
+            """SELECT fingerprint, status, attempted_at_ms, error
+               FROM notification_attempts WHERE bundle_id = ? ORDER BY id""",
+            (bundle_id,),
+        )
+        events = await connection.execute_fetchall(
+            """SELECT fingerprint, event, occurred_at_ms, detail
+               FROM notification_events WHERE bundle_id = ? ORDER BY id""",
+            (bundle_id,),
+        )
+        stored_view = {
+            **evidence,
+            "legs": await payloads("legs", "id"),
+            "actions": await payloads("actions", "sequence, id"),
+            "risk_assessment": json.loads(risk_rows[0][0]),
+            "latency_metrics": await payloads("latency_metrics", "id"),
+            "notification_audit": {
+                "notifications": notification_payloads,
+                "claims": [
+                    {
+                        "fingerprint": str(row[0]),
+                        "owner_bundle_id": str(row[1]),
+                        "state": str(row[2]),
+                        "claimed_at_ms": int(row[3]),
+                        "lease_expires_at_ms": int(row[4]),
+                        "attempt_count": int(row[5]),
+                    }
+                    for row in claim_rows
+                ],
+                "attempts": [list(row) for row in attempts],
+                "events": [list(row) for row in events],
+            },
+        }
+        replayed = await self.replay_opportunity(opportunity_id)
+        replay_data = replayed.evidence.data
+        replay_view = {
+            "bundle_id": replayed.evidence.id,
+            "opportunity_id": replay_data["opportunity"]["id"],
+            "run_id": replay_data["run"]["id"],
+            "legs": replay_data["legs"],
+            "actions": replay_data["actions"],
+            "risk_assessment": replay_data["risk"],
+            "latency_metrics": replay_data["latency_metrics"],
+            "notification_audit": {
+                "notifications": replay_data["notifications"],
+                "claims": [
+                    {
+                        "fingerprint": claim.fingerprint,
+                        "owner_bundle_id": claim.owner_bundle_id,
+                        "state": claim.state,
+                        "claimed_at_ms": claim.claimed_at_ms,
+                        "lease_expires_at_ms": claim.lease_expires_at_ms,
+                        "attempt_count": claim.attempt_count,
+                    }
+                    for claim in replayed.current_claims
+                ],
+                "attempts": [list(attempt) for attempt in replayed.attempts],
+                "events": [list(event) for event in replayed.events],
+            },
+        }
+        normalized_stored = _normalize_validation_view(stored_view)
+        normalized_replayed = _normalize_validation_view(replay_view)
+        mismatches = [
+            name for name in stored_view
+            if normalized_stored[name] != normalized_replayed[name]
+        ]
+        consistency_status = "pass" if not mismatches else "fail"
+        result["checks"]["consistency"] = {
+            "status": consistency_status,
+            "mismatches": mismatches,
+        }
+        if mismatches:
+            result["status"] = "fail"
+            result["errors"] = [{
+                "code": "REPLAY_MISMATCH",
+                "message": "stored opportunity facts differ from replayed evidence",
+                "context": {
+                    "opportunity_id": opportunity_id,
+                    "mismatches": mismatches,
+                },
+            }]
+        return result
+
     async def save_catalog_snapshot(self, snapshot: Mapping[str, object]) -> str:
         if not isinstance(snapshot, Mapping):
             raise TypeError("snapshot must be a mapping")
@@ -2095,23 +2463,227 @@ class OpportunityStore:
             for row in rows
         ]
 
-    async def save_watch_metrics(
-        self, run_id: str, started_at_ms: int, metrics: Mapping[str, object]
-    ) -> None:
-        _identifier("run_id", run_id)
-        _integer("started_at_ms", started_at_ms)
-        canonical = _json(dict(metrics))
+    async def save_watch_run(self, record: Mapping[str, object]) -> str:
+        data = dict(record)
+        _required(data, "run_id", "started_at_ms", "status")
+        run_id = _identifier("run_id", data["run_id"])
+        started_at_ms = _integer("started_at_ms", data["started_at_ms"])
+        finished_at_ms = _integer("finished_at_ms", data.get("finished_at_ms"), nullable=True)
+        if finished_at_ms is not None and finished_at_ms < started_at_ms:
+            raise ValueError("finished_at_ms must not precede started_at_ms")
+        status = _identifier("status", data["status"])
+        exit_reason = data.get("exit_reason")
+        if exit_reason is not None and type(exit_reason) is not str:
+            raise TypeError("exit_reason must be str or None")
+        params = data.get("params_json", {})
+        _validate_opaque_json("params_json", params)
+        canonical = _json(
+            {
+                "run_id": run_id,
+                "started_at_ms": started_at_ms,
+                "finished_at_ms": finished_at_ms,
+                "status": status,
+                "exit_reason": exit_reason,
+                "params_json": params,
+            }
+        )
         connection = self._require_connection()
         async with self._write_lock:
             await connection.execute(
                 """INSERT INTO watch_runs(id, started_at_ms, canonical_json)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET canonical_json=excluded.canonical_json,
+                   started_at_ms=excluded.started_at_ms""",
+                (run_id, started_at_ms, canonical),
+            )
+            await connection.commit()
+        return run_id
+
+    async def save_watch_event(self, record: Mapping[str, object]) -> str:
+        data = dict(record)
+        _required(
+            data, "run_id", "sequence", "event_type", "canonical_json", "raw_json",
+            "received_wall_ms", "received_monotonic", "exchange_ts_ms",
+            "persisted_at_ms",
+        )
+        run_id = _identifier("run_id", data["run_id"])
+        sequence = _integer("sequence", data["sequence"])
+        event_type = _identifier("event_type", data["event_type"])
+        canonical_json = data["canonical_json"]
+        raw_json = data["raw_json"]
+        if type(canonical_json) is not str or type(raw_json) is not str:
+            raise TypeError("event json payloads must be strings")
+        received_wall_ms = _integer("received_wall_ms", data["received_wall_ms"])
+        received_monotonic = _nonnegative_decimal(
+            "received_monotonic", Decimal(str(data["received_monotonic"]))
+        )
+        exchange_ts_ms = _integer("exchange_ts_ms", data["exchange_ts_ms"])
+        persisted_at_ms = _integer("persisted_at_ms", data["persisted_at_ms"])
+        token_id = data.get("token_id")
+        condition_id = data.get("condition_id")
+        if token_id is not None:
+            _identifier("token_id", token_id)
+        if condition_id is not None:
+            _identifier("condition_id", condition_id)
+        event_id = str(
+            data.get("id")
+            or f"watch-event:{hashlib.sha256((run_id + ':' + str(sequence) + ':' + canonical_json).encode('utf-8')).hexdigest()}"
+        )
+        connection = self._require_connection()
+        async with self._write_lock:
+            await connection.execute(
+                """INSERT INTO watch_events
+                   (id, run_id, event_index, event_type, token_id, condition_id,
+                    canonical_json, raw_json,
+                    received_wall_ms, received_monotonic, exchange_ts_ms,
+                    persisted_at_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    event_index=excluded.event_index,
+                    event_type=excluded.event_type,
+                    token_id=excluded.token_id,
+                    condition_id=excluded.condition_id,
+                    canonical_json=excluded.canonical_json,
+                    raw_json=excluded.raw_json,
+                    received_wall_ms=excluded.received_wall_ms,
+                    received_monotonic=excluded.received_monotonic,
+                    exchange_ts_ms=excluded.exchange_ts_ms,
+                    persisted_at_ms=excluded.persisted_at_ms""",
+                (
+                    event_id,
+                    run_id,
+                    sequence,
+                    event_type,
+                    token_id,
+                    condition_id,
+                    canonical_json,
+                    raw_json,
+                    received_wall_ms,
+                    float(received_monotonic),
+                    exchange_ts_ms,
+                    persisted_at_ms,
+                ),
+            )
+            await connection.commit()
+        return event_id
+
+    async def save_watch_metrics(
+        self, run_id: str, started_at_ms_or_metrics: int | Mapping[str, object],
+        metrics: Mapping[str, object] | None = None,
+    ) -> None:
+        if metrics is None:
+            started_at_ms = 0
+            metrics_map = started_at_ms_or_metrics
+        else:
+            started_at_ms = _integer("started_at_ms", started_at_ms_or_metrics)
+            metrics_map = metrics
+        _identifier("run_id", run_id)
+        _validate_opaque_json("metrics", metrics_map)
+        canonical = _json(dict(metrics_map))
+        connection = self._require_connection()
+        async with self._write_lock:
+            await connection.execute(
+                """INSERT INTO watch_metrics(id, started_at_ms, canonical_json)
                    VALUES (?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET canonical_json=excluded.canonical_json""",
                 (run_id, started_at_ms, canonical),
             )
             await connection.commit()
 
+    async def save_scan_run(self, record: Mapping[str, object]) -> str:
+        data = dict(record)
+        _required(data, "run_id", "started_at_ms", "status")
+        run_id = _identifier("run_id", data["run_id"])
+        started_at_ms = _integer("started_at_ms", data["started_at_ms"])
+        status = _identifier("status", data["status"])
+        finished_at_ms = _integer("finished_at_ms", data.get("finished_at_ms"), nullable=True)
+        if finished_at_ms is not None and finished_at_ms < started_at_ms:
+            raise ValueError("finished_at_ms must not precede started_at_ms")
+        reason = data.get("reason")
+        if reason is not None and type(reason) is not str:
+            raise TypeError("reason must be str or None")
+        params = data.get("params_json", {})
+        _validate_opaque_json("params_json", params)
+        canonical = _json(
+            {
+                "run_id": run_id,
+                "started_at_ms": started_at_ms,
+                "finished_at_ms": finished_at_ms,
+                "status": status,
+                "reason": reason,
+                "params_json": params,
+            }
+        )
+        connection = self._require_connection()
+        async with self._write_lock:
+            await connection.execute(
+                """INSERT INTO scan_runs(id, started_at_ms, canonical_json)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET canonical_json=excluded.canonical_json,
+                   started_at_ms=excluded.started_at_ms""",
+                (run_id, started_at_ms, canonical),
+            )
+            await connection.commit()
+        return run_id
+
+    async def save_scan_candidate(self, record: Mapping[str, object]) -> str:
+        data = dict(record)
+        _required(
+            data, "run_id", "result_index", "status", "reason", "canonical_json",
+            "observed_at_ms",
+        )
+        run_id = _identifier("run_id", data["run_id"])
+        result_index = _integer("result_index", data["result_index"])
+        status = _identifier("status", data["status"])
+        reason = _identifier("reason", data["reason"])
+        canonical_json = data["canonical_json"]
+        if type(canonical_json) is not str:
+            raise TypeError("canonical_json must be a string")
+        observed_at_ms = _integer("observed_at_ms", data["observed_at_ms"])
+        candidate_id = str(
+            data.get("id")
+            or f"scan-candidate:{hashlib.sha256((run_id + ':' + str(result_index) + ':' + canonical_json).encode('utf-8')).hexdigest()}"
+        )
+        connection = self._require_connection()
+        async with self._write_lock:
+            await connection.execute(
+                """INSERT INTO scan_candidates
+                   (id, run_id, result_index, status, reason, canonical_json, observed_at_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    result_index=excluded.result_index,
+                    status=excluded.status,
+                    reason=excluded.reason,
+                    canonical_json=excluded.canonical_json,
+                    observed_at_ms=excluded.observed_at_ms""",
+                (
+                    candidate_id,
+                    run_id,
+                    result_index,
+                    status,
+                    reason,
+                    canonical_json,
+                    observed_at_ms,
+                ),
+            )
+            await connection.commit()
+        return candidate_id
+
     async def list_watch_metrics(self, *, limit: int = 100) -> list[dict[str, object]]:
+        _query_limit(limit)
+        rows = await self._require_connection().execute_fetchall(
+            """SELECT id, started_at_ms, canonical_json FROM watch_metrics
+               ORDER BY sequence DESC LIMIT ?""",
+            (limit,),
+        )
+        return [
+            {"id": str(run_id), "started_at_ms": int(started), **json.loads(canonical)}
+            for run_id, started, canonical in rows
+        ]
+
+    async def list_watch_runs(self, *, limit: int = 100) -> list[dict[str, object]]:
         _query_limit(limit)
         rows = await self._require_connection().execute_fetchall(
             """SELECT id, started_at_ms, canonical_json FROM watch_runs
@@ -2119,9 +2691,69 @@ class OpportunityStore:
             (limit,),
         )
         return [
-            {"id": str(run_id), "started_at_ms": int(started),
-             **json.loads(canonical)}
+            {"id": str(run_id), "started_at_ms": int(started), **json.loads(canonical)}
             for run_id, started, canonical in rows
+        ]
+
+    async def list_scan_runs(self, *, limit: int = 100) -> list[dict[str, object]]:
+        _query_limit(limit)
+        rows = await self._require_connection().execute_fetchall(
+            """SELECT id, started_at_ms, canonical_json FROM scan_runs
+               ORDER BY sequence DESC LIMIT ?""",
+            (limit,),
+        )
+        return [
+            {"id": str(run_id), "started_at_ms": int(started), **json.loads(canonical)}
+            for run_id, started, canonical in rows
+        ]
+
+    async def list_scan_candidates(self, *, limit: int = 100) -> list[dict[str, object]]:
+        _query_limit(limit)
+        rows = await self._require_connection().execute_fetchall(
+            """SELECT id, run_id, result_index, status, reason, canonical_json,
+                      observed_at_ms
+               FROM scan_candidates ORDER BY sequence DESC LIMIT ?""",
+            (limit,),
+        )
+        return [
+            {
+                "id": str(row[0]),
+                "run_id": str(row[1]),
+                "result_index": int(row[2]),
+                "status": str(row[3]),
+                "reason": str(row[4]),
+                "canonical_json": str(row[5]),
+                "observed_at_ms": int(row[6]),
+                **json.loads(row[5]),
+            }
+            for row in rows
+        ]
+
+    async def list_watch_events(self, run_id: str) -> list[dict[str, object]]:
+        _identifier("run_id", run_id)
+        rows = await self._require_connection().execute_fetchall(
+            """SELECT id, run_id, event_index, event_type, token_id, condition_id,
+                      canonical_json, raw_json, received_wall_ms, received_monotonic,
+                      exchange_ts_ms, persisted_at_ms
+               FROM watch_events WHERE run_id = ? ORDER BY event_index, sequence""",
+            (run_id,),
+        )
+        return [
+            {
+                "id": str(row[0]),
+                "run_id": str(row[1]),
+                "sequence": int(row[2]),
+                "event_type": str(row[3]),
+                "token_id": None if row[4] is None else str(row[4]),
+                "condition_id": None if row[5] is None else str(row[5]),
+                "canonical_json": str(row[6]),
+                "raw_json": str(row[7]),
+                "received_wall_ms": int(row[8]),
+                "received_monotonic": float(row[9]),
+                "exchange_ts_ms": int(row[10]),
+                "persisted_at_ms": int(row[11]),
+            }
+            for row in rows
         ]
 
     async def save_research_observation(

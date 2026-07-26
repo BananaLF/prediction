@@ -34,10 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", dest="json_output")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    sync = commands.add_parser("sync-markets", help="summarize public market catalog")
+    sync = commands.add_parser("sync-markets", help="synchronize the public market catalog")
     sync.add_argument("--limit", type=_positive, default=100)
-    sync.add_argument("--max-pages", type=_positive, default=10)
-    sync.add_argument("--max-markets", type=_positive, default=1000)
+    sync.add_argument("--max-pages", type=_positive, default=1000)
+    sync.add_argument("--max-markets", type=_positive, default=100_000)
     sync.add_argument("--rules-dir", default="rules")
 
     scan = commands.add_parser("scan-once", help="confirm candidates with REST")
@@ -71,6 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
     replay = commands.add_parser("replay", help="replay immutable evidence")
     replay.add_argument("opportunity_id", nargs="?")
     replay.add_argument("--bundle-id")
+    validate_opportunity = commands.add_parser(
+        "validate-opportunity", help="validate one opportunity in SQLite"
+    )
+    validate_opportunity.add_argument("opportunity_id", nargs="?")
     report = commands.add_parser("report", help="bounded evidence summary")
     report.add_argument("--limit", type=_positive, default=100)
     return parser
@@ -96,17 +100,73 @@ def main(
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code)
+    validation_command = args.command == "validate-opportunity"
+    if validation_command and not args.opportunity_id:
+        result = {
+            "opportunity_id": None,
+            "status": "fail",
+            "checks": {"completeness": {"status": "fail", "missing": []}},
+            "evidence": {},
+            "errors": [{
+                "code": "INVALID_INPUT",
+                "message": "opportunity_id is required",
+                "context": {"reason": "missing opportunity_id"},
+            }],
+            "selection": {
+                "strategy": "latest_run_for_opportunity",
+                "reason": "input validation failed",
+            },
+        }
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=_json_default))
+        return 0
     try:
         result = asyncio.run(dispatcher(args))
+    except KeyError:
+        if validation_command:
+            result = {
+                "opportunity_id": args.opportunity_id,
+                "status": "fail",
+                "checks": {"completeness": {"status": "fail", "missing": ["opportunity"]}},
+                "evidence": {},
+                "errors": [{
+                    "code": "NOT_FOUND",
+                    "message": "opportunity was not found",
+                    "context": {"opportunity_id": args.opportunity_id},
+                }],
+                "selection": {
+                    "strategy": "latest_run_for_opportunity",
+                    "reason": "no opportunity row found",
+                },
+            }
+        else:
+            print("operational error: KeyError", file=sys.stderr)
+            return 1
     except (FileNotFoundError, ValueError, TypeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        if validation_command:
+            result = {
+                "opportunity_id": args.opportunity_id,
+                "status": "fail",
+                "checks": {"completeness": {"status": "fail", "missing": []}},
+                "evidence": {},
+                "errors": [{
+                    "code": "INVALID_INPUT",
+                    "message": "opportunity validation input is invalid",
+                    "context": {"reason": str(exc)},
+                }],
+                "selection": {
+                    "strategy": "latest_run_for_opportunity",
+                    "reason": "input validation failed",
+                },
+            }
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     except KeyboardInterrupt:
         return 1
     except Exception as exc:
         print(f"operational error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-    if args.json_output:
+    if args.json_output or validation_command:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=_json_default))
     elif result is not None:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=_json_default, indent=2))

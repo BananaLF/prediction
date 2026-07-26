@@ -20,6 +20,7 @@ from predmarket.polymarket import (
     AdapterTransportError,
 )
 from predmarket.polymarket.gamma import _reject_credential_headers, _validate_base_url
+from predmarket.polymarket.gamma import _clear_public_cookie_jar
 
 
 CLOB_PUBLIC_ORIGIN = "https://clob.polymarket.com"
@@ -206,6 +207,7 @@ class ClobRestClient:
     ) -> tuple[Any, int, float, str]:
         if self._closed:
             raise RuntimeError("client is closed")
+        _clear_public_cookie_jar(self.http)
         _reject_credential_headers(self.http)
         try:
             response = await self.http.request(method, f"{self.base_url}{path}", **kwargs)

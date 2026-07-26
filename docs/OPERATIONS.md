@@ -7,7 +7,7 @@
 ```console
 python -m venv .venv
 .venv/bin/pip install -e '.[test]'
-.venv/bin/python -m predmarket --help
+./bin/help
 ```
 
 默认配置位于 `config/default.yaml`。金额和比率必须写成十进制字符串；`minimum_return: "0.0075"` 表示 0.75%。数据库默认是 `data/predmarket.sqlite3`。生产运行前复制配置并使用 `--config PATH`，不要直接覆盖可审计的默认值。
@@ -16,28 +16,28 @@ python -m venv .venv
 
 ```console
 # 有界同步公开市场目录
-.venv/bin/python -m predmarket --config config/default.yaml \
-  sync-markets --limit 100 --max-pages 2 --max-markets 1000
+./bin/predmarket sync-markets --limit 100 --max-pages 2 --max-markets 1000
 
 # 目录发现后用 REST 确认
-.venv/bin/python -m predmarket scan-once --limit 100
+./bin/scan-once --limit 100
 
 # 已知 condition/token 时做确定性确认
-.venv/bin/python -m predmarket scan-once \
+./bin/scan-once \
   --condition CONDITION --yes-token YES_TOKEN --no-token NO_TOKEN
 
 # 有界观察；max-events 是整个命令跨重连累计预算
-.venv/bin/python -m predmarket watch --max-connections 3 --max-events 500
+./bin/watch --max-connections 3 --max-events 500
 
 # 规则
-.venv/bin/python -m predmarket relations validate rules/example-implication.yaml
-.venv/bin/python -m predmarket relations import reviewed.yaml
-.venv/bin/python -m predmarket relations list
+./bin/predmarket relations validate rules/example-implication.yaml
+./bin/predmarket relations import reviewed.yaml
+./bin/predmarket relations list
 
 # 证据和汇总
-.venv/bin/python -m predmarket replay OPPORTUNITY_ID
-.venv/bin/python -m predmarket replay --bundle-id BUNDLE_ID
-.venv/bin/python -m predmarket report --limit 100
+./bin/predmarket replay OPPORTUNITY_ID
+./bin/predmarket replay --bundle-id BUNDLE_ID
+./bin/predmarket validate-opportunity OPPORTUNITY_ID
+./bin/predmarket --json report --limit 100
 ```
 
 全局参数必须放在子命令之前，例如 `--json report`。JSON 模式的 stdout 恰好输出一个 JSON 文档；通知审计等人类提示写到 stderr。退出码：`0` 成功，`1` 网络、数据库或运行期故障，`2` 参数、配置、规则或输入错误。
@@ -54,9 +54,17 @@ sqlite3 /absolute/backup/predmarket-YYYYMMDD.sqlite3 "PRAGMA integrity_check;"
 
 恢复时先保留当前数据库及同名 `-wal`、`-shm`，再把校验成功的备份放到新的显式路径，通过新配置验证 `report` 和 `replay`，最后再切换。不要对运行中的数据库做文件级覆盖。
 
-当前代码的 schema 版本为 4。打开数据库时自动建表；v3 有受控迁移，v1 明确拒绝，未来版本数据库也会拒绝降级打开。升级前备份并记录当前提交、`PRAGMA user_version` 和文件哈希。迁移失败不要手工改 `user_version`；恢复备份，在副本上复现。
+当前代码的 schema 版本为 6。打开数据库时自动建表；v3 有受控迁移，v1 明确拒绝，未来版本数据库也会拒绝降级打开。升级前备份并记录当前提交、`PRAGMA user_version` 和文件哈希。迁移失败不要手工改 `user_version`；恢复备份，在副本上复现。
 
 `replay` 返回不可变核心证据以及单独的通知审计。报告默认有界，避免把完整历史载入内存。
+
+`validate-opportunity` 是一个单机会精确核验命令：它先检查 SQLite 中的证据链是否完整，再把存储事实与 replay 结果做语义一致性比较。该命令只输出 JSON，失败时通过 JSON `errors[].code` 区分 `NOT_FOUND`、`AMBIGUOUS_OPPORTUNITY`、`INCOMPLETE_CHAIN`、`REPLAY_MISMATCH`、`CORRUPTED_CANONICAL_JSON` 和 `INVALID_INPUT`。
+
+`watch` 和 `scan-once` 现在都会把运行事实写入 SQLite：
+
+- `watch` 记录运行元数据、每条接受的市场域事件，以及最终 WS 指标快照；
+- `scan-once` 记录运行元数据以及每条扫描结果候选；
+- 这两类记录是后续分析和复核的事实来源，不能只依赖 stdout/stderr。
 
 ## 规则审计与导入
 

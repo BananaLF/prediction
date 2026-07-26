@@ -16,13 +16,13 @@
 
 | 命令 | 观察结果 |
 |---|---|
-| `.venv/bin/python -m pytest` | Task 13 初始轮 629 passed in 1.17s；质量复审修复后的最终轮见下方 |
+| `.venv/bin/python -m pytest` | Task 13 初始轮 629 passed in 1.17s；SQLite 监控采集补丁的局部轮次见下方 |
 | `.venv/bin/python -m pytest tests/integration/test_read_only_surface.py -q` | 4 passed |
 | `.venv/bin/python -m compileall -q predmarket` | exit 0 |
-| `.venv/bin/python -m predmarket --help` | exit 0；显示 6 个只读子命令和 `0.75%=0.0075` |
-| `.venv/bin/python -m predmarket relations validate rules/example-implication.yaml` | exit 0；audited=true，minimum_units_received=1 |
+| `./bin/predmarket --help` | exit 0；显示 6 个只读子命令和 `0.75%=0.0075` |
+| `./bin/predmarket relations validate rules/example-implication.yaml` | exit 0；audited=true，minimum_units_received=1 |
 | 临时配置 + `--json report --limit 5` | exit 0；空库 total=0，p50/p95/p99=null |
-| `sqlite3 ... "PRAGMA integrity_check; PRAGMA user_version;"` | `ok`，schema 4 |
+| `sqlite3 ... "PRAGMA integrity_check; PRAGMA user_version;"` | `ok`，schema 6 |
 | 旧文件存在性检查 | `core.py`、`api.py`、`ledger.py`、`tests/test_core.py` 均不存在 |
 
 临时数据库是 `/tmp/predmarket-task13-smoke.sqlite3`，未保存进仓库。JSON stdout 保持单一文档。
@@ -34,7 +34,7 @@
 1. Gamma：
 
    ```console
-   .venv/bin/python -m predmarket \
+   ./bin/predmarket \
      --config /tmp/predmarket-task13-smoke.yaml --json \
      sync-markets --limit 5 --max-pages 1 --max-markets 5
    ```
@@ -90,6 +90,20 @@ bounded public rerun: exit 0, evaluated=1, failed=0, REJECTED/no_candidate
 ```
 
 新增覆盖包括：CLOB condition 与 Gamma market ID 分离、`exchange_after_receive` 因果时间门、二元高估 `SPLIT/SELL/SELL` 的完整深度/风险/回放、以及采用配置周期的 REST epoch reconciliation。没有执行订单、认证、钱包或交易端点。
+
+## SQLite 监控采集补充验证
+
+```text
+storage watch facts: 2 passed
+watch command persistence: 1 passed
+scan-once command persistence: 1 passed
+sqlite py_compile: exit 0
+validate-opportunity JSON-only and error-classification tests: passed
+```
+
+新增覆盖包括：`watch_runs`/`watch_events`/`watch_metrics` 的持久化、`scan_runs`/`scan_candidates` 的持久化，以及 `watch` 与 `scan-once` 在 SQLite 中留下的运行事实。`backtest` 仍在后续计划中，不在本轮验证范围内。
+
+`validate-opportunity` 追加覆盖了机会完整性、回放一致性、`NOT_FOUND` / `AMBIGUOUS_OPPORTUNITY` / `INCOMPLETE_CHAIN` / `REPLAY_MISMATCH` / `CORRUPTED_CANONICAL_JSON` / `INVALID_INPUT` 的 JSON 结构化返回，以及缺少 `opportunity_id` 时仍保持 JSON-only 输出。
 
 ## 限制
 
