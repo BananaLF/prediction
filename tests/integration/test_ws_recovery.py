@@ -7,6 +7,9 @@ from types import MappingProxyType
 import pytest
 
 from predmarket.epochs import EpochState
+from predmarket.domain import BookLevel
+from predmarket.orderbook import OrderBook
+from predmarket.polymarket.clob import BookSnapshot
 from predmarket.polymarket.ws import (
     BookMetadata,
     MARKET_CHANNEL_URL,
@@ -56,6 +59,39 @@ def scanner(*, capacity: int = 4, callback=None, **kwargs) -> MarketWebSocket:
         candidate_callback=callback,
         **kwargs,
     )
+
+
+def rest_snapshot(token: str, timestamp: int = 1002) -> BookSnapshot:
+    return BookSnapshot(
+        OrderBook(
+            token,
+            (BookLevel(Decimal("0.44"), Decimal("5")),),
+            (BookLevel(Decimal("0.45"), Decimal("5")),),
+            Decimal("0.01"), Decimal("1"), timestamp, f"rest-{token}-{timestamp}",
+        ),
+        "condition", False, None, 2000, 2.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_rest_reconciliation_atomically_restores_corrupt_epochs() -> None:
+    ws = scanner()
+    ws.epochs["yes"].invalidate("corrupt")
+    assert await ws.reconcile_rest(
+        (rest_snapshot("yes"), rest_snapshot("no"))
+    ) is True
+    assert all(epoch.state is EpochState.LIVE for epoch in ws.epochs.values())
+    assert ws.depth("yes").asks == (("0.45", "5"),)
+    assert ws.metrics().reconciliation_attempts == 1
+    assert ws.metrics().reconciliation_successes == 1
+
+
+@pytest.mark.asyncio
+async def test_rest_reconciliation_mismatch_invalidates_everything() -> None:
+    ws = scanner()
+    assert await ws.reconcile_rest((rest_snapshot("yes"),)) is False
+    assert all(epoch.state is EpochState.RESYNC for epoch in ws.epochs.values())
+    assert ws.metrics().reconciliation_failures == 1
 
 
 def test_public_subscription_is_exact_and_contains_no_credentials() -> None:

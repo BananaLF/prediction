@@ -35,7 +35,8 @@ CI 的 `tests/integration/test_read_only_surface.py` 只扫描生产 Python 包�
 | 环境中意外存在凭据/代理 | HTTP 不信任环境；构造和每次请求前拒绝凭据头、cookie 和 auth |
 | 恶意 condition/token 注入 URL | condition 严格校验并 URL 编码；token 仅作为 JSON/查询参数 |
 | 上游超大或畸形响应 | 响应大小上限、严格 JSON/类型/唯一性/映射验证、精确 Decimal |
-| WS 丢包或乱序 | 有界队列；溢出/时序回退使 epoch 失效；完整同步后恢复 |
+| WS 丢包或乱序 | 有界队列；溢出/时序回退使 epoch 失效；周期公开 REST 批次按 condition/token/tick/最小量原子校准，失败继续失效；正式结论仍重新获取两次独立 REST |
+| Gamma/CLOB 标识符混淆 | Gamma 数字 `market_id` 只作目录身份；CLOB `/books.market` 明确解析为 `condition_id`，引擎只按 condition 绑定盘口 |
 | 供应链加入交易能力 | 依赖版本范围、锁定/审计安装物、只读静态测试；禁止钱包和签名依赖 |
 | 通知命令注入 | 使用参数数组调用固定 `/usr/bin/osascript`，不使用 shell；文本清理和长度限制 |
 | 把桌面通知误当可靠事件流 | SQLite/report 轮询是事实来源；持久单次尝试不保证送达；仅对过期不确定租约做崩溃回收，可能产生可审计重复 |

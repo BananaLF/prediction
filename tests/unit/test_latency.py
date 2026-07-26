@@ -34,9 +34,9 @@ def test_valid_timings_and_equal_boundaries_pass() -> None:
     ("items", "expected"),
     [
         ((timing(exchange=899),), ("stale",)),
-        ((timing(exchange=1001),), ("future_exchange_ts",)),
+        ((timing(exchange=1001, received=1001),), ("future_exchange_ts",)),
         (
-            (timing(exchange=900), timing(exchange=951)),
+            (timing(exchange=900), timing(exchange=951, received=951)),
             ("leg_skew",),
         ),
         ((timing(evaluated_mono=1.010001),), ("processing_latency",)),
@@ -54,9 +54,20 @@ def test_all_applicable_reasons_have_stable_order() -> None:
     assert assess(items).reasons == (
         "stale",
         "future_exchange_ts",
+        "exchange_after_receive",
         "leg_skew",
         "processing_latency",
     )
+
+
+def test_exchange_after_receive_fails_closed_even_when_exchange_is_not_future() -> None:
+    assert assess((timing(exchange=999, received=998),)).reasons == (
+        "exchange_after_receive",
+    )
+
+
+def test_exchange_equal_to_receive_is_valid() -> None:
+    assert assess((timing(exchange=999, received=999),)).valid
 
 
 def test_empty_timings_fail_closed() -> None:
@@ -128,4 +139,3 @@ def test_validator_does_not_mutate_input() -> None:
     before = list(items)
     assess(items)
     assert items == before
-

@@ -54,8 +54,11 @@ condition and token IDs are already known:
 ```
 
 `watch` uses the public WebSocket only to discover a possible price movement.
-Every callback then obtains two independent REST book snapshots and the
-authoritative CLOB market fee schedule before assigning a formal status:
+Every `reconcile_interval_seconds` (30 seconds by default), an independent
+public REST batch atomically checks/restores local WS epochs; mismatch,
+regression, or fetch failure invalidates them. Reconciled books remain hints
+only. Every callback still obtains two new independent REST book snapshots and
+the authoritative CLOB market fee schedule before assigning a formal status:
 
 ```console
 .venv/bin/predmarket watch --max-connections 3 --max-events 500
@@ -93,10 +96,10 @@ silently reinterpret them as executable binary arbitrage.
 The pipeline is:
 
 1. Gamma discovers exact binary YES/NO markets.
-2. One CLOB REST client finds a cheap complete set.
+2. One CLOB REST client finds either a cheap complete set or an overpriced pair.
 3. An independent CLOB REST client confirms full executable depth.
 4. Market-info binds the authoritative fee curve to both legs.
-5. Simulation walks depth using exact decimals; latency, partial-fill, rule,
+5. Simulation walks depth for `BUY/BUY/MERGE` or `SPLIT/SELL/SELL` using exact decimals; latency, partial-fill, rule,
    conversion, settlement, bankroll, and return gates then classify the result.
 6. SQLite stores canonical evidence before a notification can be claimed.
 

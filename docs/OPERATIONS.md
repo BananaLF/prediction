@@ -104,6 +104,7 @@ SQLite 通知 outbox 使用**持久单次尝试 + 租约式崩溃回收**，不�
 - `reconnects`、`disconnects`：重连次数和断开次数。实现不输出 `connection_attempts`；需要尝试次数时由外部监管器独立记录，不能用不存在的键。
 - `overflows`、`resyncs`：队列溢出次数和强制重新同步次数；任何 overflow 都必须导致相关 epoch 失效。
 - `malformed`、`unknown`、`heartbeats`、`callback_failures`：畸形帧、未知事件、心跳和回调失败累计数。
+- `reconciliation_attempts`、`reconciliation_successes`、`reconciliation_failures`：周期公开 REST 本地 epoch 校准；失败必须使 epoch 失效。`reconciliation_interval_seconds` 记录实际采用的配置。
 - 延迟 `p50/p95/p99`：最近有界样本的 nearest-rank 分位数；空样本为 `null`。
 - `status_counts` / `reason_counts`：分类结果与拒绝原因；大量 stale/leg_skew/processing_latency 指向数据链路问题。
 - `notification_claims` / `notification_attempts`：积压、成功和失败；长期 CLAIMED 可能等待租约恢复。
@@ -127,6 +128,10 @@ SQLite 通知 outbox 使用**持久单次尝试 + 租约式崩溃回收**，不�
     "resyncs": 0,
     "overflows": 0,
     "callback_failures": 0,
+    "reconciliation_attempts": 0,
+    "reconciliation_successes": 0,
+    "reconciliation_failures": 0,
+    "reconciliation_interval_seconds": 30,
     "queue_high_water": 0,
     "processing_latencies_ms": [],
     "processing_latency_count": 0,
@@ -143,7 +148,7 @@ SQLite 通知 outbox 使用**持久单次尝试 + 租约式崩溃回收**，不�
 
 ### WebSocket 断线
 
-确认 `reconnects`、`disconnects` 和最后事件时间；让程序按上限重连。连接尝试次数由外部监管器记录。重连后必须先取得完整快照/REST 确认，不能沿用旧 epoch。反复失败时停止依赖 WS，运行有界 `scan-once` 并保留指标。
+确认 `reconnects`、`disconnects`、REST reconciliation 成败和最后事件时间；让程序按上限重连。连接尝试次数由外部监管器记录。重连后必须先取得完整快照或周期 REST 校准，不能沿用旧 epoch；任何正式机会仍须重新取得两次独立 REST 证据。反复失败时停止依赖 WS，运行有界 `scan-once` 并保留指标。
 
 ### 队列溢出
 

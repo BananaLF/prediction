@@ -62,7 +62,7 @@ def _clock_values(wall_clock_ms: Callable[[], int], monotonic: Callable[[], floa
 @dataclass(frozen=True)
 class BookSnapshot:
     book: OrderBook
-    market_id: str
+    condition_id: str
     neg_risk: bool
     last_trade_price: Decimal | None
     received_at_ms: int
@@ -71,6 +71,11 @@ class BookSnapshot:
     @property
     def token_id(self) -> str:
         return self.book.token_id
+
+    @property
+    def market_id(self) -> str:
+        """Deprecated compatibility alias for the CLOB condition identifier."""
+        return self.condition_id
 
 
 @dataclass(frozen=True)
@@ -281,7 +286,7 @@ class ClobRestClient:
             raise AdapterInvariantError(f"invalid order book: {exc}") from exc
         return BookSnapshot(
             book=book,
-            market_id=_string(raw, "market"),
+            condition_id=_string(raw, "market"),
             neg_risk=neg_risk,
             last_trade_price=last_trade,
             received_at_ms=received_at_ms,

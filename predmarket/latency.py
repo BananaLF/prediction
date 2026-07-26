@@ -100,6 +100,10 @@ def validate_timings(
         reasons.append("stale")
     if any(exchange_ts > now_ms for exchange_ts in exchange_times):
         reasons.append("future_exchange_ts")
+    if any(
+        item.exchange_ts_ms > item.received_ts_ms for item in snapshot
+    ):
+        reasons.append("exchange_after_receive")
     if max(exchange_times) - min(exchange_times) > max_skew_ms:
         reasons.append("leg_skew")
     if any(

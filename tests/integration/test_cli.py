@@ -6,6 +6,7 @@ import pytest
 from predmarket.cli import build_parser, main
 from predmarket.commands import (
     RelationRegistry,
+    _reconcile_loop,
     binary_market_from_metadata,
     dispatch,
     relation_payload,
@@ -30,7 +31,7 @@ from predmarket.fees import FeeSchedule
 from predmarket.orderbook import OrderBook
 from predmarket.domain import BookLevel, OpportunityStatus
 from predmarket.polymarket.clob import BookSnapshot
-from predmarket.polymarket.ws import WatchOperationalError
+from predmarket.polymarket.ws import BookMetadata, MarketWebSocket, WatchOperationalError
 
 
 def test_help_states_read_only_and_return_semantics(capsys):
@@ -659,6 +660,59 @@ def test_main_maps_exhausted_watch_to_operational_exit(capsys):
 
 
 @pytest.mark.asyncio
+async def test_reconcile_loop_consumes_configured_interval_and_is_cancellable():
+    import asyncio
+
+    calls = []
+    fetched = asyncio.Event()
+
+    class Provider:
+        async def books(self, token_ids):
+            calls.append(("books", token_ids))
+            fetched.set()
+            return tuple(
+                BookSnapshot(
+                    OrderBook(
+                        token, (BookLevel(Decimal("0.44"), Decimal("2")),),
+                        (BookLevel(Decimal("0.45"), Decimal("2")),),
+                        Decimal("0.01"), Decimal("1"), 1000, f"rest-{token}",
+                    ),
+                    "condition", False, None, 1000, 1.0,
+                )
+                for token in token_ids
+            )
+
+    first = True
+    async def scheduler(delay):
+        nonlocal first
+        calls.append(("sleep", delay))
+        if first:
+            first = False
+            return
+        await asyncio.Future()
+
+    watcher = MarketWebSocket(
+        {"yes": "condition", "no": "condition"},
+        queue_capacity=2,
+        wall_clock_ms=lambda: 1000,
+        monotonic=lambda: 1.0,
+        book_metadata={
+            token: BookMetadata("condition", Decimal("0.01"), Decimal("1"))
+            for token in ("yes", "no")
+        },
+    )
+    task = asyncio.create_task(
+        _reconcile_loop(watcher, Provider(), ("yes", "no"), 17, scheduler)
+    )
+    await fetched.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls[:2] == [("sleep", 17), ("books", ("yes", "no"))]
+    assert watcher.metrics().reconciliation_successes == 1
+
+
+@pytest.mark.asyncio
 async def test_watch_command_offline_success_reconfirms_with_two_rest_books(
     tmp_path, monkeypatch
 ):
@@ -679,7 +733,7 @@ async def test_watch_command_offline_success_reconfirms_with_two_rest_books(
                     (BookLevel(Decimal("0.45"), Decimal("10")),),
                     Decimal("0.01"), Decimal("1"), 1000, f"{token}-{received_ms}",
                 ),
-                "market", False, None, received_ms, received_mono,
+                "condition", False, None, received_ms, received_mono,
             )
             for token in ("yes", "no")
         )
@@ -737,6 +791,9 @@ async def test_watch_command_offline_success_reconfirms_with_two_rest_books(
     connection = Connection()
     async def connector(_url):
         return connection
+    async def idle_scheduler(_delay):
+        import asyncio
+        await asyncio.Future()
 
     monkeypatch.setattr("predmarket.commands.sys.platform", "linux")
     args = build_parser().parse_args([
@@ -746,7 +803,7 @@ async def test_watch_command_offline_success_reconfirms_with_two_rest_books(
     ])
     output = await dispatch(
         args, runtime_factory=FakeRuntime, websocket_connector=connector,
-        sleeper=lambda _delay: None, wall_clock_ms=lambda: 2000,
+        sleeper=idle_scheduler, wall_clock_ms=lambda: 2000,
         monotonic=lambda: 1.3,
     )
     assert output["evaluated"] == 1
@@ -877,7 +934,7 @@ def test_targeted_scan_replay_and_report_flow_through_main_json(
                     (BookLevel(Decimal("0.45"), Decimal("10")),),
                     Decimal("0.01"), Decimal("1"), 1000, f"{token}-{received_ms}",
                 ),
-                "target:condition", False, None, received_ms, mono,
+                "condition", False, None, received_ms, mono,
             )
             for token in ("yes", "no")
         )
@@ -962,7 +1019,7 @@ def test_catalog_scan_command_continues_provider_failure_and_outputs_json(
                     (BookLevel(Decimal("0.45"), Decimal("10")),),
                     Decimal("0.01"), Decimal("1"), 1000, f"{token}-{received_ms}",
                 ),
-                "market", False, None, received_ms, mono,
+                "condition", False, None, received_ms, mono,
             )
             for token in ("yes", "no")
         )

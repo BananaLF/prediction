@@ -48,7 +48,7 @@ du -k /absolute/soak/data/predmarket.sqlite3*
   --config /absolute/soak/soak.yaml --json report --limit 100
 ```
 
-从 `report.ws_metrics` 收集 `received`、`dropped`、`queue_high_water`、`reconnects`、`disconnects`、`overflows`、`resyncs`、`malformed`、`unknown`、`heartbeats`、`callback_failures`、`processing_latency_count`、`processing_latency_sum_ms`、`processing_latency_min_ms`、`processing_latency_max_ms`、`processing_latency_sample_truncated` 和 `epoch_states`。另收集顶层 `results_truncated`（watch 输出）、延迟 p50/p95/p99、状态/原因计数、通知 claims/attempts、目录同步完整/截断信息。实现不输出 `connection_attempts`；如需该数值，由外部监管器直接记录每次进程/连接尝试，不能从不存在的 JSON 键采集。
+从 `report.ws_metrics` 收集 `received`、`dropped`、`queue_high_water`、`reconnects`、`disconnects`、`overflows`、`resyncs`、`malformed`、`unknown`、`heartbeats`、`callback_failures`、`reconciliation_attempts`、`reconciliation_successes`、`reconciliation_failures`、`reconciliation_interval_seconds`、`processing_latency_count`、`processing_latency_sum_ms`、`processing_latency_min_ms`、`processing_latency_max_ms`、`processing_latency_sample_truncated` 和 `epoch_states`。另收集顶层 `results_truncated`（watch 输出）、延迟 p50/p95/p99、状态/原因计数、通知 claims/attempts、目录同步完整/截断信息。实现不输出 `connection_attempts`；如需该数值，由外部监管器直接记录每次进程/连接尝试，不能从不存在的 JSON 键采集。
 
 ### 中断和重启检查
 

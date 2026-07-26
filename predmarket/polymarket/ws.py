@@ -17,6 +17,7 @@ from types import MappingProxyType
 from typing import Any
 
 from predmarket.epochs import EpochBook, EpochState
+from predmarket.polymarket.clob import BookSnapshot
 
 
 MARKET_CHANNEL_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -87,6 +88,9 @@ class WsMetrics:
     resyncs: int = 0
     overflows: int = 0
     callback_failures: int = 0
+    reconciliation_attempts: int = 0
+    reconciliation_successes: int = 0
+    reconciliation_failures: int = 0
     queue_high_water: int = 0
     processing_latencies_ms: tuple[float, ...] = ()
     processing_latency_count: int = 0
@@ -214,6 +218,7 @@ class MarketWebSocket:
         self._metrics = WsMetrics()
         self._trigger_keys: set[tuple[tuple[str, str | None], ...]] = set()
         self._tick_sizes: dict[str, Decimal] = {}
+        self._state_lock = asyncio.Lock()
 
     @property
     def queue_size(self) -> int:
@@ -361,7 +366,8 @@ class MarketWebSocket:
     async def process_one(self) -> ReceivedMessage:
         message = await self._queue.get()
         try:
-            await self._process(message)
+            async with self._state_lock:
+                await self._process(message)
             latency = (self._monotonic() - message.received_monotonic) * 1000
             if not math.isfinite(latency) or latency < 0:
                 raise ValueError("processing clock regressed")
@@ -400,6 +406,74 @@ class MarketWebSocket:
             raise
         finally:
             self._queue.task_done()
+
+    async def reconcile_rest(
+        self, snapshots: tuple[BookSnapshot, ...]
+    ) -> bool:
+        """Atomically replace local hint books from a complete REST batch."""
+        self._metrics = replace(
+            self._metrics,
+            reconciliation_attempts=self._metrics.reconciliation_attempts + 1,
+        )
+        try:
+            if (
+                type(snapshots) is not tuple
+                or any(not isinstance(item, BookSnapshot) for item in snapshots)
+            ):
+                raise ValueError("REST reconciliation requires BookSnapshot tuple")
+            by_token = {item.token_id: item for item in snapshots}
+            if len(by_token) != len(snapshots) or set(by_token) != set(self.epochs):
+                raise ValueError("REST reconciliation token coverage mismatch")
+            staged: dict[str, BookDepth] = {}
+            for token, item in by_token.items():
+                metadata = self._book_metadata[token]
+                if item.condition_id != self._conditions[token]:
+                    raise ValueError("REST reconciliation condition mismatch")
+                book = item.book
+                if (
+                    book.tick_size != metadata.tick_size
+                    or book.minimum_order_size != metadata.minimum_order_size
+                ):
+                    raise ValueError("REST reconciliation metadata mismatch")
+                previous = self.epochs[token].exchange_ts_ms
+                if previous is not None and book.exchange_ts_ms < previous:
+                    raise ValueError("REST reconciliation timestamp regression")
+                staged[token] = BookDepth(
+                    tuple(
+                        (_canonical_decimal(level.price), _canonical_decimal(level.size))
+                        for level in book.bids
+                    ),
+                    tuple(
+                        (_canonical_decimal(level.price), _canonical_decimal(level.size))
+                        for level in book.asks
+                    ),
+                )
+            async with self._state_lock:
+                for token, item in by_token.items():
+                    if not self.epochs[token].replace_snapshot(
+                        item.book.book_hash, item.book.exchange_ts_ms
+                    ):
+                        raise ValueError("REST reconciliation commit regression")
+                for token, depth in staged.items():
+                    self._depth[token] = depth
+                    self._tick_sizes[token] = self._book_metadata[token].tick_size
+                self._trigger_keys.clear()
+            self._metrics = replace(
+                self._metrics,
+                reconciliation_successes=self._metrics.reconciliation_successes + 1,
+            )
+            for condition in sorted(set(self._conditions.values())):
+                await self._maybe_trigger(condition)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._invalidate_all("rest_reconciliation_failure")
+            self._metrics = replace(
+                self._metrics,
+                reconciliation_failures=self._metrics.reconciliation_failures + 1,
+            )
+            return False
 
     async def _process(self, message: ReceivedMessage) -> None:
         if message.event_type == "book":

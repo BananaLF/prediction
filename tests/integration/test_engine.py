@@ -35,7 +35,7 @@ def book(token, ask, bid="0.20", *, now=10_000, received=10_001, mono=10.0, size
         now,
         f"hash-{token}-{ask}",
     )
-    return BookSnapshot(value, "market-1", False, None, received, mono)
+    return BookSnapshot(value, "condition-1", False, None, received, mono)
 
 
 def copies(snapshots):
@@ -313,7 +313,7 @@ async def test_confirmation_receipt_equality_and_exchange_regression_fail_closed
         old_book.minimum_order_size, old_book.exchange_ts_ms - 1, "regressed-hash",
     )
     regressed[0] = BookSnapshot(
-        regressed_book, "market-1", False, None, 10_002, 10.001
+        regressed_book, "condition-1", False, None, 10_002, 10.001
     )
     subject2, store2, _ = engine(Books(discovery), Books(tuple(regressed)))
     await subject2.evaluate_binary(market())
@@ -346,12 +346,12 @@ async def test_full_depth_and_all_costs_can_reject_profitable_top_level():
         OrderBook("yes-1", yes_d.book.bids,
                   (BookLevel(Decimal("0.40"), Decimal("1")), BookLevel(Decimal("0.70"), Decimal("99"))),
                   Decimal("0.01"), Decimal("1"), 10_000, "yes-depth"),
-        "market-1", False, None, 10_002, 10.001)
+        "condition-1", False, None, 10_002, 10.001)
     no = BookSnapshot(
         OrderBook("no-1", no_d.book.bids,
                   (BookLevel(Decimal("0.40"), Decimal("1")), BookLevel(Decimal("0.70"), Decimal("99"))),
                   Decimal("0.01"), Decimal("1"), 10_000, "no-depth"),
-        "market-1", False, None, 10_002, 10.001)
+        "condition-1", False, None, 10_002, 10.001)
     subject, store, _ = engine(Books((yes_d, no_d)), Books((yes, no)), conversion_cost=Decimal("0.30"))
     result = await subject.evaluate_binary(market())
     assert result.status is OpportunityStatus.REJECTED
@@ -514,6 +514,30 @@ async def test_market_identity_mismatch_is_persisted_and_rejected():
     result = await subject.evaluate_binary(market())
     assert result.reason == "invalid_confirmation"
     assert len(store.items) == 1
+
+
+@pytest.mark.asyncio
+async def test_gamma_market_id_is_not_compared_with_clob_condition_id():
+    subject, _store, _notice = engine(
+        Books((book("yes-1", "0.45"), book("no-1", "0.45"))),
+        Books(copies((book("yes-1", "0.45"), book("no-1", "0.45")))),
+    )
+    result = await subject.evaluate_binary(market(market_id="101"))
+    assert result.reason != "invalid_discovery"
+
+
+@pytest.mark.asyncio
+async def test_exchange_after_receive_is_evidenced_and_never_notified():
+    snapshots = (
+        book("yes-1", "0.45", now=10_000, received=9_998),
+        book("no-1", "0.45", now=10_000, received=9_998),
+    )
+    subject, store, notice = engine(Books(snapshots), Books(copies(snapshots)))
+    result = await subject.evaluate_binary(market())
+    assert result.status is OpportunityStatus.REJECTED
+    assert "exchange_after_receive" in result.risk_reasons
+    assert "exchange_after_receive" in store.items[0].data["risk"]["timing_reasons"]
+    assert notice.calls == []
 
 
 @pytest.mark.asyncio
@@ -742,7 +766,7 @@ async def test_material_notification_dedupe_survives_restart_and_hash_change(tmp
                 changed_book.tick_size, changed_book.minimum_order_size,
                 changed_book.exchange_ts_ms, "materially-new-hash",
             ),
-            "market-1", False, None, 10_002, 10.001,
+            "condition-1", False, None, 10_002, 10.001,
         ),
         copies((snapshots[1],))[0],
     )
@@ -778,7 +802,7 @@ async def test_return_or_quantity_change_with_same_hash_notifies(tmp_path):
                 source.exchange_ts_ms, source.book_hash,
             )
             rows.append(
-                BookSnapshot(rebuilt, "market-1", False, None, 10_002, 10.001)
+                BookSnapshot(rebuilt, "condition-1", False, None, 10_002, 10.001)
             )
         return tuple(rows)
 

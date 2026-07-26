@@ -276,7 +276,7 @@ def _snapshots(
     by_token = {value.token_id: value for value in values}
     if len(by_token) != len(values) or set(by_token) != set(market.token_ids):
         raise ValueError("book response token coverage mismatch")
-    if any(value.market_id != market.market_id for value in values):
+    if any(value.condition_id != market.condition_id for value in values):
         raise ValueError("book response market mismatch")
     return by_token
 

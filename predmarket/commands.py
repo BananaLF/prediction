@@ -7,6 +7,7 @@ from collections import Counter, deque
 from dataclasses import asdict, replace
 from contextlib import AsyncExitStack
 import hashlib
+import inspect
 import os
 from pathlib import Path
 import re
@@ -35,6 +36,34 @@ from predmarket.relations import (
     load_relation,
 )
 from types import MappingProxyType
+
+
+async def _reconcile_loop(
+    watcher: object,
+    provider: object,
+    token_ids: tuple[str, ...],
+    interval_seconds: int,
+    sleeper=asyncio.sleep,
+) -> None:
+    """Periodically refresh WS hint state; formal evidence remains REST-independent."""
+    if type(interval_seconds) is not int or interval_seconds <= 0:
+        raise ValueError("reconciliation interval must be a positive integer")
+    while True:
+        delay = sleeper(interval_seconds)
+        if inspect.isawaitable(delay):
+            await delay
+        else:
+            # Test/embedded schedulers may be synchronous; still yield so the
+            # reconciliation loop cannot starve the WS receiver/processor.
+            await asyncio.sleep(0)
+        try:
+            snapshots = await provider.books(token_ids)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await watcher.reconcile_rest(())
+            continue
+        await watcher.reconcile_rest(snapshots)
 
 
 def relation_payload(path: str | Path) -> dict[str, object]:
@@ -604,6 +633,15 @@ async def _watch_runtime(
         connector = websocket_connector or (
             lambda url: websockets.connect(url, open_timeout=10)
         )
+        reconciliation = asyncio.create_task(
+            _reconcile_loop(
+                watcher,
+                discovery_clob,
+                tuple(sorted(token_conditions)),
+                settings.reconcile_interval_seconds,
+                sleeper,
+            )
+        )
         try:
             await watcher.run(
                 connector,
@@ -614,7 +652,15 @@ async def _watch_runtime(
                 max_messages=args.max_events,
             )
         finally:
+            reconciliation.cancel()
+            try:
+                await reconciliation
+            except asyncio.CancelledError:
+                pass
             metrics = asdict(watcher.metrics())
+            metrics["reconciliation_interval_seconds"] = (
+                settings.reconcile_interval_seconds
+            )
             metrics["processing_latencies_ms"] = [
                 str(value) for value in metrics["processing_latencies_ms"]
             ]

@@ -45,11 +45,13 @@
 
    - condition：`0x1fad72fae204143ff1c3035e99e7c0f65ea8d5cd9bd1070987bd1a3316f772be`
    - `POST /books` 仅用于这一市场的 YES/NO 公开盘口。
-   - targeted `scan-once`：exit 0，evaluated=1，安全拒绝为 `invalid_discovery`，没有通知；拒绝证据已写临时库。
+   - 修复前 targeted `scan-once`：exit 0，evaluated=1，拒绝为 `invalid_discovery`。复审确认这是把 CLOB `market`（condition ID）错误地与 Gamma 数字 market ID 比较造成的标识符集成缺陷，不是“不盈利”结论。
    - `GET /clob-markets/{condition}`：exit 0，确认 2 个 token，正式 fee rate=`0.05`、tick size=`0.01`。
    - replay：exit 0，状态 `REJECTED`，无通知 claim/attempt/event。
 
-`invalid_discovery` 表示当时公开盘口未形成模拟器接受的便宜完整集候选，不是网络失败，也不能被解释成没有市场机会。
+修复后盘口快照以 `condition_id` 绑定，Gamma `market_id` 仅保留为目录/证据身份。旧 smoke 结果已撤销，不能用于判断盈利性；修复后的有界重跑结果记录在下方。
+
+2026-07-26 修复后使用同一个 condition 和同一对 token 重新运行一次公开只读 targeted scan：exit 0、evaluated=1、failed=0，分类为 `REJECTED/no_candidate`，没有通知。它成功通过 CLOB condition/token 标识符接缝，随后才在发现阶段判断该快照同时不存在低估或高估候选；该单点结果不代表其他时刻或市场。
 
 ## 最终提交前验证
 
@@ -76,6 +78,18 @@ read-only AST surface: 4 passed
 ```
 
 联网 smoke 未因本轮变更重新扩大范围；仍以本文件前述最多 5 个 Gamma 市场和一个 CLOB 二元市场结果为准。
+
+## 最终集成修复追加验证
+
+```text
+full pytest: 650 passed in 1.47s
+identifier seam (actual ClobRestClient + MockTransport): 3 passed
+read-only AST surface: 4 passed
+compileall / CLI help / git diff --check: exit 0
+bounded public rerun: exit 0, evaluated=1, failed=0, REJECTED/no_candidate
+```
+
+新增覆盖包括：CLOB condition 与 Gamma market ID 分离、`exchange_after_receive` 因果时间门、二元高估 `SPLIT/SELL/SELL` 的完整深度/风险/回放、以及采用配置周期的 REST epoch reconciliation。没有执行订单、认证、钱包或交易端点。
 
 ## 限制
 
