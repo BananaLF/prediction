@@ -20,7 +20,7 @@ from predmarket.exact_math import decimal_ratio
 from predmarket.risk import RiskInputs, assess_risk, worst_partial_fill
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 EVIDENCE_SCHEMA_VERSION = 2
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OPPORTUNITY_STATUSES = {
@@ -1140,6 +1140,8 @@ CREATE TABLE IF NOT EXISTS current_catalog_markets (
     condition_id TEXT NOT NULL,
     last_seen_snapshot TEXT NOT NULL REFERENCES catalog_snapshots(id),
     fetched_at_ms INTEGER NOT NULL,
+    state_updated_at_ms INTEGER NOT NULL,
+    state_update_sequence INTEGER NOT NULL,
     presence TEXT NOT NULL CHECK(presence IN ('SEEN', 'MISSING')),
     active INTEGER,
     closed INTEGER,
@@ -1151,6 +1153,8 @@ CREATE TABLE IF NOT EXISTS current_catalog_tokens (
     market_id TEXT NOT NULL,
     last_seen_snapshot TEXT NOT NULL REFERENCES catalog_snapshots(id),
     fetched_at_ms INTEGER NOT NULL,
+    state_updated_at_ms INTEGER NOT NULL,
+    state_update_sequence INTEGER NOT NULL,
     presence TEXT NOT NULL CHECK(presence IN ('SEEN', 'MISSING')),
     canonical_json TEXT NOT NULL
 );
@@ -1158,6 +1162,8 @@ CREATE TABLE IF NOT EXISTS current_catalog_events (
     event_id TEXT PRIMARY KEY,
     last_seen_snapshot TEXT NOT NULL REFERENCES catalog_snapshots(id),
     fetched_at_ms INTEGER NOT NULL,
+    state_updated_at_ms INTEGER NOT NULL,
+    state_update_sequence INTEGER NOT NULL,
     presence TEXT NOT NULL CHECK(presence IN ('SEEN', 'MISSING')),
     canonical_json TEXT NOT NULL
 );
@@ -1224,6 +1230,26 @@ class OpportunityStore:
                     f"database schema {existing_version} is newer than supported "
                     f"schema {SCHEMA_VERSION}"
                 )
+            if existing_version == 3:
+                for table in (
+                    "current_catalog_markets",
+                    "current_catalog_tokens",
+                    "current_catalog_events",
+                ):
+                    await connection.execute(
+                        f"""ALTER TABLE {table}
+                            ADD COLUMN state_updated_at_ms INTEGER NOT NULL
+                            DEFAULT 0"""
+                    )
+                    await connection.execute(
+                        f"""ALTER TABLE {table}
+                            ADD COLUMN state_update_sequence INTEGER NOT NULL
+                            DEFAULT 0"""
+                    )
+                    await connection.execute(
+                        f"""UPDATE {table}
+                            SET state_updated_at_ms=fetched_at_ms"""
+                    )
             await connection.executescript(_SCHEMA)
             await connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
@@ -1649,7 +1675,7 @@ class OpportunityStore:
                    VALUES (?, ?, ?, ?)""",
                 (snapshot_id, digest, data["fetched_at_ms"], canonical),
             )
-            await connection.execute(
+            sync_cursor = await connection.execute(
                 """INSERT INTO catalog_sync_runs
                    (snapshot_id, fetched_at_ms, complete, provenance)
                    VALUES (?, ?, ?, ?)""",
@@ -1658,6 +1684,7 @@ class OpportunityStore:
                     int(data["complete"]), data["provenance"],
                 ),
             )
+            sync_sequence = int(sync_cursor.lastrowid)
             if cursor.rowcount:
                 seen_markets: set[str] = set()
                 seen_tokens: set[str] = set()
@@ -1699,36 +1726,50 @@ class OpportunityStore:
                         )
                         await connection.execute(
                             """INSERT INTO current_catalog_tokens VALUES
-                               (?, ?, ?, ?, 'SEEN', ?)
+                               (?, ?, ?, ?, ?, ?, 'SEEN', ?)
                                ON CONFLICT(token_id) DO UPDATE SET
                                market_id=excluded.market_id,
                                last_seen_snapshot=excluded.last_seen_snapshot,
                                fetched_at_ms=excluded.fetched_at_ms,
+                               state_updated_at_ms=excluded.state_updated_at_ms,
+                               state_update_sequence=excluded.state_update_sequence,
                                presence='SEEN',
                                canonical_json=excluded.canonical_json
-                               WHERE excluded.fetched_at_ms >=
-                                     current_catalog_tokens.fetched_at_ms""",
+                               WHERE excluded.state_updated_at_ms >
+                                     current_catalog_tokens.state_updated_at_ms
+                                  OR (excluded.state_updated_at_ms =
+                                      current_catalog_tokens.state_updated_at_ms
+                                      AND excluded.state_update_sequence >=
+                                      current_catalog_tokens.state_update_sequence)""",
                             (
                                 token_id, market_id, snapshot_id,
-                                data["fetched_at_ms"], _json(token_record),
+                                data["fetched_at_ms"], data["fetched_at_ms"],
+                                sync_sequence, _json(token_record),
                             ),
                         )
                     await connection.execute(
                         """INSERT INTO current_catalog_markets VALUES
-                           (?, ?, ?, ?, 'SEEN', ?, ?, ?, ?)
+                           (?, ?, ?, ?, ?, ?, 'SEEN', ?, ?, ?, ?)
                            ON CONFLICT(market_id) DO UPDATE SET
                            condition_id=excluded.condition_id,
                            last_seen_snapshot=excluded.last_seen_snapshot,
                            fetched_at_ms=excluded.fetched_at_ms,
+                           state_updated_at_ms=excluded.state_updated_at_ms,
+                           state_update_sequence=excluded.state_update_sequence,
                            presence='SEEN', active=excluded.active,
                            closed=excluded.closed,
                            tradeable=excluded.tradeable,
                            canonical_json=excluded.canonical_json
-                           WHERE excluded.fetched_at_ms >=
-                                 current_catalog_markets.fetched_at_ms""",
+                           WHERE excluded.state_updated_at_ms >
+                                 current_catalog_markets.state_updated_at_ms
+                              OR (excluded.state_updated_at_ms =
+                                  current_catalog_markets.state_updated_at_ms
+                                  AND excluded.state_update_sequence >=
+                                  current_catalog_markets.state_update_sequence)""",
                         (
                             market_id, condition_id, snapshot_id,
-                            data["fetched_at_ms"], record.get("active"),
+                            data["fetched_at_ms"], data["fetched_at_ms"],
+                            sync_sequence, record.get("active"),
                             record.get("closed"), int(bool(record["tradeable"])),
                             _json(record),
                         ),
@@ -1736,16 +1777,23 @@ class OpportunityStore:
                 for event in seen_events:
                     await connection.execute(
                         """INSERT INTO current_catalog_events VALUES
-                           (?, ?, ?, 'SEEN', ?)
+                           (?, ?, ?, ?, ?, 'SEEN', ?)
                            ON CONFLICT(event_id) DO UPDATE SET
                            last_seen_snapshot=excluded.last_seen_snapshot,
                            fetched_at_ms=excluded.fetched_at_ms,
+                           state_updated_at_ms=excluded.state_updated_at_ms,
+                           state_update_sequence=excluded.state_update_sequence,
                            presence='SEEN',
                            canonical_json=excluded.canonical_json
-                           WHERE excluded.fetched_at_ms >=
-                                 current_catalog_events.fetched_at_ms""",
+                           WHERE excluded.state_updated_at_ms >
+                                 current_catalog_events.state_updated_at_ms
+                              OR (excluded.state_updated_at_ms =
+                                  current_catalog_events.state_updated_at_ms
+                                  AND excluded.state_update_sequence >=
+                                  current_catalog_events.state_update_sequence)""",
                         (
                             event, snapshot_id, data["fetched_at_ms"],
+                            data["fetched_at_ms"], sync_sequence,
                             _json({"id": event}),
                         ),
                     )
@@ -1757,22 +1805,39 @@ class OpportunityStore:
                     if seen and data["complete"]:
                         placeholders = ",".join("?" for _ in seen)
                         await connection.execute(
-                            f"""UPDATE {table} SET presence='MISSING'
+                            f"""UPDATE {table} SET presence='MISSING',
+                                    state_updated_at_ms=?,
+                                    state_update_sequence=?
                                 WHERE {id_column} NOT IN ({placeholders})
-                                  AND fetched_at_ms <= ?""",
-                            (*tuple(sorted(seen)), data["fetched_at_ms"]),
+                                  AND (state_updated_at_ms < ?
+                                    OR (state_updated_at_ms = ?
+                                      AND state_update_sequence <= ?))""",
+                            (
+                                data["fetched_at_ms"], sync_sequence,
+                                *tuple(sorted(seen)), data["fetched_at_ms"],
+                                data["fetched_at_ms"], sync_sequence,
+                            ),
                         )
                     elif data["complete"]:
                         await connection.execute(
-                            f"""UPDATE {table} SET presence='MISSING'
-                                WHERE fetched_at_ms <= ?""",
-                            (data["fetched_at_ms"],),
+                            f"""UPDATE {table} SET presence='MISSING',
+                                    state_updated_at_ms=?,
+                                    state_update_sequence=?
+                                WHERE state_updated_at_ms < ?
+                                   OR (state_updated_at_ms = ?
+                                     AND state_update_sequence <= ?)""",
+                            (
+                                data["fetched_at_ms"], sync_sequence,
+                                data["fetched_at_ms"], data["fetched_at_ms"],
+                                sync_sequence,
+                            ),
                         )
                 await connection.execute(
                     """UPDATE current_catalog_markets
                        SET active=0, tradeable=0 WHERE presence='MISSING'
-                         AND fetched_at_ms <= ?""",
-                    (data["fetched_at_ms"],),
+                         AND state_updated_at_ms = ?
+                         AND state_update_sequence = ?""",
+                    (data["fetched_at_ms"], sync_sequence),
                 )
                 for position, diagnostic in enumerate(data["diagnostics"]):
                     await connection.execute(
@@ -1811,36 +1876,54 @@ class OpportunityStore:
                     await connection.execute(
                         """UPDATE current_catalog_markets SET
                            last_seen_snapshot=?, fetched_at_ms=?,
+                           state_updated_at_ms=?, state_update_sequence=?,
                            presence='SEEN', active=?, closed=?, tradeable=?
-                           WHERE market_id=? AND fetched_at_ms <= ?""",
+                           WHERE market_id=? AND
+                             (state_updated_at_ms < ? OR
+                              (state_updated_at_ms = ?
+                               AND state_update_sequence <= ?))""",
                         (
                             snapshot_id, data["fetched_at_ms"],
+                            data["fetched_at_ms"], sync_sequence,
                             record.get("active"), record.get("closed"),
                             int(bool(record["tradeable"])), market_id,
-                            data["fetched_at_ms"],
+                            data["fetched_at_ms"], data["fetched_at_ms"],
+                            sync_sequence,
                         ),
                     )
                     for token in record["tokens"]:
                         await connection.execute(
                             """UPDATE current_catalog_tokens SET
                                last_seen_snapshot=?, fetched_at_ms=?,
+                               state_updated_at_ms=?, state_update_sequence=?,
                                presence='SEEN'
-                               WHERE token_id=? AND fetched_at_ms <= ?""",
+                               WHERE token_id=? AND
+                                 (state_updated_at_ms < ? OR
+                                  (state_updated_at_ms = ?
+                                   AND state_update_sequence <= ?))""",
                             (
                                 snapshot_id, data["fetched_at_ms"],
+                                data["fetched_at_ms"], sync_sequence,
                                 _mapping("token", token)["id"],
-                                data["fetched_at_ms"],
+                                data["fetched_at_ms"], data["fetched_at_ms"],
+                                sync_sequence,
                             ),
                         )
                     for event_id in record.get("event_ids", []):
                         await connection.execute(
                             """UPDATE current_catalog_events SET
                                last_seen_snapshot=?, fetched_at_ms=?,
+                               state_updated_at_ms=?, state_update_sequence=?,
                                presence='SEEN'
-                               WHERE event_id=? AND fetched_at_ms <= ?""",
+                               WHERE event_id=? AND
+                                 (state_updated_at_ms < ? OR
+                                  (state_updated_at_ms = ?
+                                   AND state_update_sequence <= ?))""",
                             (
-                                snapshot_id, data["fetched_at_ms"], event_id,
-                                data["fetched_at_ms"],
+                                snapshot_id, data["fetched_at_ms"],
+                                data["fetched_at_ms"], sync_sequence, event_id,
+                                data["fetched_at_ms"], data["fetched_at_ms"],
+                                sync_sequence,
                             ),
                         )
         return snapshot_id
@@ -1869,7 +1952,8 @@ class OpportunityStore:
         _query_limit(limit)
         rows = await self._require_connection().execute_fetchall(
             """SELECT market_id, condition_id, last_seen_snapshot,
-                      fetched_at_ms, presence, active, closed, tradeable,
+                      fetched_at_ms, state_updated_at_ms,
+                      state_update_sequence, presence, active, closed, tradeable,
                       (SELECT MAX(sequence) FROM catalog_sync_runs run
                        WHERE run.snapshot_id =
                              current_catalog_markets.last_seen_snapshot
@@ -1882,11 +1966,14 @@ class OpportunityStore:
             {
                 "market_id": str(row[0]), "condition_id": str(row[1]),
                 "last_seen_snapshot": str(row[2]), "fetched_at_ms": int(row[3]),
-                "presence": str(row[4]),
-                "active": None if row[5] is None else bool(row[5]),
-                "closed": None if row[6] is None else bool(row[6]),
-                "tradeable": bool(row[7]),
-                "last_seen_run_id": f"sync:{int(row[8])}",
+                "last_seen_at_ms": int(row[3]),
+                "state_updated_at_ms": int(row[4]),
+                "state_update_sequence": int(row[5]),
+                "presence": str(row[6]),
+                "active": None if row[7] is None else bool(row[7]),
+                "closed": None if row[8] is None else bool(row[8]),
+                "tradeable": bool(row[9]),
+                "last_seen_run_id": f"sync:{int(row[10])}",
             }
             for row in rows
         ]

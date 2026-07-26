@@ -29,6 +29,9 @@ non-tradeable without altering historical snapshots. Missing-state transitions
 are allowed only after a complete, pagination-exhausted sync; bounded or partial
 observations refresh seen entries without deactivating unseen ones. Every sync
 has its own observation/run even when its immutable content hash is unchanged.
+Current rows track `last_seen_at_ms` separately from their state-update
+timestamp/sequence, so a delayed older SEEN cannot revive a newer MISSING row
+and a delayed older MISSING cannot hide a newer SEEN row.
 When a caller intentionally reaches its page or market bound, the returned
 catalog is explicitly marked incomplete with its continuation cursor and
 truncation reason; scan/watch may process that deterministic prefix, but it can

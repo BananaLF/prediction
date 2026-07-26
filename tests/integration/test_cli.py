@@ -225,7 +225,9 @@ async def test_catalog_current_lifecycle_marks_missing_inactive(tmp_path):
     assert current == [{
         "market_id": "m", "condition_id": "c",
         "last_seen_snapshot": current[0]["last_seen_snapshot"],
-        "fetched_at_ms": 10, "presence": "MISSING", "active": False,
+        "fetched_at_ms": 10, "last_seen_at_ms": 10,
+        "state_updated_at_ms": 20, "state_update_sequence": 2,
+        "presence": "MISSING", "active": False,
         "closed": False, "tradeable": False,
         "last_seen_run_id": current[0]["last_seen_run_id"],
     }]
@@ -307,6 +309,37 @@ async def test_delayed_older_catalog_sync_cannot_regress_newer_current_state(tmp
         assert current["active"] is False
         assert current["closed"] is True
         assert len(await store.list_catalog_snapshots(limit=10)) == 3
+
+
+@pytest.mark.asyncio
+async def test_delayed_seen_cannot_override_newer_missing_state(tmp_path):
+    path = tmp_path / "missing-watermark.sqlite3"
+    seen = {
+        "complete": True, "provenance": "exhausted",
+        "markets": [{
+            "id": "m", "condition_id": "c", "event_ids": ["e"],
+            "tokens": [{"id": "yes", "outcome": "YES"}],
+            "active": True, "closed": False, "tradeable": True,
+        }],
+        "diagnostics": [],
+    }
+    async with OpportunityStore(path) as store:
+        await store.save_catalog_snapshot({**seen, "fetched_at_ms": 10})
+        await store.save_catalog_snapshot({
+            "fetched_at_ms": 20, "complete": True,
+            "provenance": "exhausted", "markets": [], "diagnostics": [],
+        })
+        await store.save_catalog_snapshot({
+            **seen, "fetched_at_ms": 15, "complete": False,
+            "provenance": "delayed_partial",
+        })
+    async with OpportunityStore(path) as store:
+        current = (await store.list_current_catalog_markets(limit=10))[0]
+    assert current["presence"] == "MISSING"
+    assert current["last_seen_at_ms"] == 10
+    assert current["state_updated_at_ms"] == 20
+    assert current["active"] is False
+    assert current["tradeable"] is False
 
 
 @pytest.mark.asyncio
