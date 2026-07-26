@@ -24,6 +24,7 @@ import httpx
 import json
 import sys
 from types import SimpleNamespace
+from dataclasses import replace
 from predmarket.fees import FeeSchedule
 from predmarket.orderbook import OrderBook
 from predmarket.domain import BookLevel, OpportunityStatus
@@ -521,6 +522,44 @@ async def test_watch_command_offline_success_reconfirms_with_two_rest_books(
         assert len(await store.list_opportunities(limit=10)) == 1
         assert (await store.list_watch_metrics(limit=1))[0]["received"] == 3
 
+    report_args = build_parser().parse_args([
+        "--config", str(config), "--json", "report", "--limit", "10",
+    ])
+    report = await dispatch(report_args)
+    assert report["by_status"]["SNAPSHOT_EXECUTABLE"] == 1
+    assert report["by_path"]["IMMEDIATE_CONVERSION"] == 1
+    assert report["by_pipeline_reason"]["all_gates_passed"] == 1
+    economics = report["executable_economics"][0]
+    assert set(economics) == {
+        "quantity", "total_investment", "minimum_proceeds",
+        "net_profit", "net_return",
+    }
+    assert all(type(value) is str for value in economics.values())
+    assert all(report["latency_ms"][key] is not None for key in ("p50", "p95", "p99"))
+    assert report["notification_attempts"]["FAILED"] == 1
+    assert report["notification_claims"]["FAILED"] == 1
+    assert report["delivery_uncertain"] == 0
+    assert report["ws_metrics"]["queue_high_water"] >= 1
+    assert report["ws_metrics"]["received"] == 3
+
+    evidence_id = output["results"][0]["evidence_id"]
+    latest = await dispatch(build_parser().parse_args([
+        "--config", str(config), "--json", "replay", "opp:condition",
+    ]))
+    exact = await dispatch(build_parser().parse_args([
+        "--config", str(config), "--json", "replay", "--bundle-id", evidence_id,
+    ]))
+    assert latest["core_evidence"]["id"] == evidence_id
+    assert exact["core_evidence"]["id"] == evidence_id
+    audit = exact["notification_audit"]
+    assert audit["claims"][0]["state"] == "FAILED"
+    assert audit["attempts"][0][1] == "FAILED"
+    assert [event[1] for event in audit["events"]] == ["CLAIMED", "FAILED"]
+    with pytest.raises(KeyError):
+        await dispatch(build_parser().parse_args([
+            "--config", str(config), "replay", "unknown",
+        ]))
+
 
 @pytest.mark.asyncio
 async def test_targeted_scan_rejects_selected_relation_token_mismatch(tmp_path):
@@ -657,3 +696,97 @@ def test_targeted_scan_replay_and_report_flow_through_main_json(
     assert report_output["by_status"]["RESEARCH_CANDIDATE"] == 1
     assert report_output["by_path"]["IMMEDIATE_CONVERSION"] == 1
     assert report_output["by_pipeline_reason"]["release_date_unknown"] == 1
+
+
+def test_catalog_scan_command_continues_provider_failure_and_outputs_json(
+    tmp_path, monkeypatch, capsys
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        Path("config/default.yaml").read_text(encoding="utf-8").replace(
+            "data/predmarket.sqlite3", str(tmp_path / "catalog-scan.sqlite3")
+        ),
+        encoding="utf-8",
+    )
+    first = market()
+    second = replace(
+        market(), market_id="market2", condition_id="condition2",
+        events=(EventMetadata("event2", None, None, "{}"),),
+        tokens=(TokenMetadata("yes2", "YES"), TokenMetadata("no2", "NO")),
+    )
+    calls = []
+
+    def snapshots(received_ms, mono):
+        return tuple(
+            BookSnapshot(
+                OrderBook(
+                    token, (BookLevel(Decimal("0.44"), Decimal("10")),),
+                    (BookLevel(Decimal("0.45"), Decimal("10")),),
+                    Decimal("0.01"), Decimal("1"), 1000, f"{token}-{received_ms}",
+                ),
+                "market", False, None, received_ms, mono,
+            )
+            for token in ("yes", "no")
+        )
+
+    class Gamma:
+        async def active_markets(self, **_bounds):
+            return GammaDiscovery((first, second), ())
+
+    class Books:
+        def __init__(self, stage, values):
+            self.stage, self.values = stage, values
+        async def books(self, tokens):
+            calls.append((self.stage, tokens))
+            if "yes2" in tokens:
+                raise ConnectionError("second market offline")
+            return self.values
+
+    schedule = FeeSchedule(Decimal("0"), 1, True, 1000)
+    class Fees:
+        async def market_info(self, condition, *, expected_token_ids):
+            calls.append(("fees", condition))
+            return SimpleNamespace(bound_fee_schedules=lambda: tuple(
+                (token, schedule) for token in expected_token_ids
+            ))
+
+    class FakeRuntime:
+        gamma = Gamma()
+        discovery_clob = Books("discovery", snapshots(1100, 1.1))
+        confirmation_clob = Books("confirmation", snapshots(1200, 1.2))
+        fee_clob = Fees()
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    async def bound(args):
+        return await dispatch(
+            args, runtime_factory=FakeRuntime,
+            wall_clock_ms=lambda: 2000, monotonic=lambda: 1.25,
+        )
+
+    monkeypatch.setattr("predmarket.commands.sys.platform", "linux")
+    argv = [
+        "--config", str(config), "--json", "scan-once", "--limit", "2",
+        "--rules-dir", str(tmp_path / "rules"),
+    ]
+    assert main(argv, dispatcher=bound) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["evaluated"] == 2
+    assert [item["status"] for item in output["results"]] == [
+        "SNAPSHOT_EXECUTABLE", "REJECTED",
+    ]
+    assert output["results"][1]["reason"] == "discovery_provider_failure"
+    assert calls == [
+        ("discovery", ("yes", "no")),
+        ("confirmation", ("yes", "no")),
+        ("fees", "condition"),
+        ("discovery", ("yes2", "no2")),
+    ]
+
+    human_argv = [item for item in argv if item != "--json"]
+    assert main(human_argv, dispatcher=bound) == 0
+    human = capsys.readouterr()
+    assert '"status": "SNAPSHOT_EXECUTABLE"' in human.out
+    assert '"evaluated": 2' in human.out
