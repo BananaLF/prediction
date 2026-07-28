@@ -114,7 +114,19 @@ cp config/default.yaml config/local.yaml
 
 ## 7. 数据与证据
 
-默认数据库会在首次需要时创建。核心数据包括：
+当前 SQLite schema 版本为 7，共 30 张项目表。Schema v6 及更旧数据库不迁移；程序会在修改前拒绝打开。升级时必须停止进程，删除旧数据库及匹配的 WAL/SHM，或把 `database_path` 指向一个新的空文件。
+
+默认数据库会在首次需要时创建。30 张项目表按职责分为：
+
+| 类别 | 表 |
+|---|---|
+| Schema 与评估证据（13） | `schema_migrations`、`evidence_bundles`、`evaluations`、`events`、`markets`、`tokens`、`fee_schedules`、`relation_evidence`、`book_snapshots`、`levels`、`legs`、`actions`、`latency_metrics` |
+| 通知审计（3） | `notification_claims`、`notification_attempts`、`notification_events` |
+| 市场目录历史与当前状态（9） | `catalog_snapshots`、`catalog_sync_runs`、`catalog_markets`、`catalog_events`、`catalog_tokens`、`catalog_relation_candidates`、`current_catalog_markets`、`current_catalog_tokens`、`current_catalog_events` |
+| Watch 与扫描运行事实（4） | `watch_runs`、`watch_events`、`scan_runs`、`scan_candidates` |
+| 研究观察（1） | `research_observations` |
+
+`sqlite_sequence` 等 SQLite 内部表不属于项目表，不计入以上 30 张。核心数据包括：
 
 - 版本化市场目录快照和当前市场状态；
 - 每次机会判断的运行、盘口、费率、动作、成本、风险和延迟证据；

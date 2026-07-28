@@ -54,7 +54,19 @@ sqlite3 /absolute/backup/predmarket-YYYYMMDD.sqlite3 "PRAGMA integrity_check;"
 
 恢复时先保留当前数据库及同名 `-wal`、`-shm`，再把校验成功的备份放到新的显式路径，通过新配置验证 `report` 和 `replay`，最后再切换。不要对运行中的数据库做文件级覆盖。
 
-当前代码的 schema 版本为 6。打开数据库时自动建表；v3 有受控迁移，v1 明确拒绝，未来版本数据库也会拒绝降级打开。升级前备份并记录当前提交、`PRAGMA user_version` 和文件哈希。迁移失败不要手工改 `user_version`；恢复备份，在副本上复现。
+当前 SQLite schema 版本为 7，共 30 张项目表。Schema v6 及更旧数据库不迁移；程序会在修改前拒绝打开。升级时必须停止进程，删除旧数据库及匹配的 WAL/SHM，或把 `database_path` 指向一个新的空文件。不要手工修改 `PRAGMA user_version`。
+
+从旧 schema 替换为 v7：
+
+1. 停止所有 `sync-markets`、`scan-once`、`watch` 和其他使用该数据库的进程，并确认没有连接仍在写入。
+2. 记录旧 `database_path`，备份主数据库及匹配的 `-wal`、`-shm`；需要保留历史证据时不要删除这些文件。
+3. 选择一种方式：
+   - 推荐：把配置中的 `database_path` 改为一个不存在的新路径；
+   - 确认不保留旧数据：从使用路径中删除或移走旧主数据库及同名 `-wal`、`-shm`，确保目标路径为空。
+4. 用新配置运行 `report --limit 1` 或下一次写命令，让程序自动创建 schema v7；不需要手工建表。
+5. 检查 `PRAGMA user_version` 为 `7`、项目表数为 `30`、`PRAGMA integrity_check` 返回 `ok`，并确认 `PRAGMA foreign_key_check` 无结果后再恢复长期进程。
+
+删除旧数据库不会迁移其中的证据，也不可撤销；需要留档时始终选择新的 `database_path`。未来版本数据库同样会被拒绝降级打开。
 
 `replay` 返回不可变核心证据以及单独的通知审计。报告默认有界，避免把完整历史载入内存。
 

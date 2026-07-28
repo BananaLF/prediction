@@ -1,11 +1,18 @@
+import asyncio
 from decimal import Decimal
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 import json
 from pathlib import Path
 
 import httpx
 import pytest
 
-from predmarket.polymarket import AdapterHTTPError, AdapterInvariantError, AdapterPayloadError
+from predmarket.polymarket import (
+    AdapterHTTPError,
+    AdapterInvariantError,
+    AdapterPayloadError,
+    AdapterTransportError,
+)
 from predmarket.polymarket.clob import ClobRestClient
 
 
@@ -89,6 +96,134 @@ async def test_fee_zero_is_safe_but_nonzero_does_not_invent_exponent():
     assert not hasattr(zero, "schedule") and not hasattr(nonzero, "schedule")
     assert nonzero.rate == Decimal("0.05")
     assert nonzero.provenance == "GET /fee-rate"
+
+
+@pytest.mark.asyncio
+async def test_response_cookies_are_cleared_before_the_next_public_request():
+    requests = []
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        headers = {"Set-Cookie": "session=upstream; Path=/"} if len(requests) == 1 else {}
+        return httpx.Response(200, headers=headers, json={"base_fee": 0})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = ClobRestClient(http, "https://clob.polymarket.com")
+        await client.fee_rate("token")
+        assert len(http.cookies) == 0
+        await client.fee_rate("token")
+
+    assert len(requests) == 2
+    assert "cookie" not in requests[1].headers
+
+
+@pytest.mark.asyncio
+async def test_rejected_response_cookie_policy_does_not_break_success():
+    class RejectAll(DefaultCookiePolicy):
+        def set_ok(self, cookie, request):
+            return False
+
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(
+            200,
+            headers={"Set-Cookie": "session=upstream; Path=/"},
+            json={"base_fee": 0},
+        )
+    )
+    cookie_jar = CookieJar(policy=RejectAll())
+    async with httpx.AsyncClient(transport=transport, cookies=cookie_jar) as http:
+        result = await ClobRestClient(
+            http, "https://clob.polymarket.com"
+        ).fee_rate("token")
+
+        assert len(http.cookies) == 0
+
+    assert result.base_fee_bps == 0
+
+
+@pytest.mark.asyncio
+async def test_midflight_caller_cookie_is_preserved_when_response_sets_none():
+    request_started = asyncio.Event()
+    release_response = asyncio.Event()
+    requests = []
+
+    async def handler(request: httpx.Request):
+        requests.append(request)
+        request_started.set()
+        await release_response.wait()
+        return httpx.Response(200, json={"base_fee": 0})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = ClobRestClient(http, "https://clob.polymarket.com")
+        request_task = asyncio.create_task(client.fee_rate("token"))
+        await request_started.wait()
+        http.cookies.set("caller", "secret")
+        release_response.set()
+        result = await request_task
+
+        assert http.cookies.get("caller") == "secret"
+
+    assert result.base_fee_bps == 0
+    assert len(requests) == 1
+    assert "cookie" not in requests[0].headers
+
+
+@pytest.mark.asyncio
+async def test_redirect_response_cookie_is_not_followed_or_sent():
+    requests = []
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                302,
+                headers={
+                    "Location": "/redirected",
+                    "Set-Cookie": "session=upstream; Path=/",
+                },
+            )
+        return httpx.Response(200, json={"base_fee": 0})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=True
+    ) as http:
+        with pytest.raises(AdapterHTTPError):
+            await ClobRestClient(http, "https://clob.polymarket.com").fee_rate("token")
+        assert len(http.cookies) == 0
+
+    assert len(requests) == 1
+    assert "cookie" not in requests[0].headers
+
+
+@pytest.mark.asyncio
+async def test_read_error_clears_response_cookie_and_client_remains_usable():
+    requests = []
+
+    class ReadErrorStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise httpx.ReadError("body read failed")
+            yield b""
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"Set-Cookie": "session=upstream; Path=/"},
+                stream=ReadErrorStream(),
+            )
+        return httpx.Response(200, json={"base_fee": 0})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = ClobRestClient(http, "https://clob.polymarket.com")
+        with pytest.raises(AdapterTransportError):
+            await client.fee_rate("token")
+        assert len(http.cookies) == 0
+        result = await client.fee_rate("token")
+
+    assert result.base_fee_bps == 0
+    assert len(requests) == 2
+    assert "cookie" not in requests[1].headers
 
 
 @pytest.mark.asyncio

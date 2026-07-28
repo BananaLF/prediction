@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 import json
 import sqlite3
@@ -280,6 +281,31 @@ def test_bundle_canonicalizes_exact_decimals_and_unicode():
     assert ": " not in evidence.canonical_json
 
 
+EXPECTED_V7_TABLES = {
+    "schema_migrations", "evidence_bundles", "evaluations", "events",
+    "markets", "tokens", "fee_schedules", "relation_evidence",
+    "book_snapshots", "levels", "legs", "actions", "latency_metrics",
+    "notification_claims", "notification_attempts", "notification_events",
+    "catalog_snapshots", "catalog_sync_runs", "catalog_markets",
+    "catalog_events", "catalog_tokens", "catalog_relation_candidates",
+    "current_catalog_markets", "current_catalog_tokens",
+    "current_catalog_events", "watch_runs", "watch_events", "scan_runs",
+    "scan_candidates", "research_observations",
+}
+
+
+def _sqlite_file_state(path):
+    connection = sqlite3.connect(path)
+    journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
+    connection.close()
+    sidecars = {
+        suffix: sidecar.read_bytes() if sidecar.exists() else None
+        for suffix in ("-wal", "-shm")
+        for sidecar in (path.with_name(path.name + suffix),)
+    }
+    return path.read_bytes(), journal_mode, sidecars
+
+
 @pytest.mark.asyncio
 async def test_schema_wal_foreign_keys_and_all_required_tables(tmp_path):
     path = tmp_path / "evidence.sqlite3"
@@ -294,34 +320,73 @@ async def test_schema_wal_foreign_keys_and_all_required_tables(tmp_path):
         }
     assert journal[0][0].lower() == "wal"
     assert foreign_keys == [(1,)]
-    assert {
-        "events", "markets", "tokens", "fee_schedules", "relation_sets",
-        "relations", "relation_states", "relation_payoffs", "book_epochs",
-        "snapshots", "levels", "opportunities", "legs", "actions",
-        "risk_assessments", "runs", "latency_metrics", "notifications",
-    } <= tables
+    assert EXPECTED_V7_TABLES == tables - {"sqlite_sequence"}
 
 
 @pytest.mark.asyncio
-async def test_schema_v1_is_rejected_without_mutation(tmp_path):
-    path = tmp_path / "legacy-v1.sqlite3"
+async def test_schema_v7_has_exact_project_tables(tmp_path):
+    path = tmp_path / "evidence.sqlite3"
+    async with OpportunityStore(path) as store:
+        tables = {
+            row[0]
+            for row in await store._connection.execute_fetchall(
+                """SELECT name FROM sqlite_schema
+                   WHERE type='table' AND name NOT LIKE 'sqlite_%'"""
+            )
+        }
+        version = await store._connection.execute_fetchall("PRAGMA user_version")
+    assert tables == EXPECTED_V7_TABLES
+    assert version == [(7,)]
+
+
+@pytest.mark.asyncio
+async def test_schema_v6_is_rejected_without_mutation(tmp_path):
+    path = tmp_path / "legacy-v6.sqlite3"
     connection = sqlite3.connect(path)
     connection.execute("CREATE TABLE legacy_payload(value TEXT)")
     connection.execute("INSERT INTO legacy_payload VALUES ('untouched')")
-    connection.execute("PRAGMA user_version = 1")
+    connection.execute("PRAGMA user_version = 6")
     connection.commit()
     connection.close()
+    before = _sqlite_file_state(path)
 
-    with pytest.raises(RuntimeError, match="schema 1.*no supported migration"):
+    with pytest.raises(RuntimeError, match="schema 6.*unsupported.*new database"):
         await OpportunityStore(path).open()
 
+    assert _sqlite_file_state(path) == before
     check = sqlite3.connect(path)
-    assert check.execute("PRAGMA user_version").fetchone() == (1,)
+    assert check.execute("PRAGMA user_version").fetchone() == (6,)
     assert check.execute("SELECT value FROM legacy_payload").fetchall() == [
         ("untouched",)
     ]
     assert check.execute(
-        "SELECT name FROM sqlite_master WHERE name = 'evidence_bundles'"
+        "SELECT name FROM sqlite_schema WHERE name='evidence_bundles'"
+    ).fetchall() == []
+    check.close()
+
+
+@pytest.mark.asyncio
+async def test_schema_v8_is_rejected_without_mutation(tmp_path):
+    path = tmp_path / "future-v8.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE future_payload(value TEXT)")
+    connection.execute("INSERT INTO future_payload VALUES ('untouched')")
+    connection.execute("PRAGMA user_version = 8")
+    connection.commit()
+    connection.close()
+    before = _sqlite_file_state(path)
+
+    with pytest.raises(RuntimeError, match="schema 8.*unsupported.*new database"):
+        await OpportunityStore(path).open()
+
+    assert _sqlite_file_state(path) == before
+    check = sqlite3.connect(path)
+    assert check.execute("PRAGMA user_version").fetchone() == (8,)
+    assert check.execute("SELECT value FROM future_payload").fetchall() == [
+        ("untouched",)
+    ]
+    assert check.execute(
+        "SELECT name FROM sqlite_schema WHERE name='evidence_bundles'"
     ).fetchall() == []
     check.close()
 
@@ -339,6 +404,40 @@ async def test_round_trip_reopen_is_byte_identical(tmp_path):
             ("opp-1", "SNAPSHOT_EXECUTABLE", "bundle-1")
         ]
         assert await store.list_runs() == [("run-1", "COMPLETED")]
+
+
+@pytest.mark.asyncio
+async def test_save_writes_merged_schema_rows():
+    async with OpportunityStore(":memory:") as store:
+        assert await store.save(EvidenceBundle.from_mapping(bundle())) is True
+        evaluation = (
+            await store._connection.execute_fetchall(
+                """SELECT run_id, opportunity_id, run_status,
+                          opportunity_status, run_json, opportunity_json,
+                          risk_json, notification_intent_json
+                   FROM evaluations"""
+            )
+        )[0]
+        relation = (
+            await store._connection.execute_fetchall(
+                "SELECT relation_set_id, canonical_json FROM relation_evidence"
+            )
+        )[0]
+        books = await store._connection.execute_fetchall(
+            """SELECT id, epoch_id, token_id, book_position, epoch_json,
+                      snapshot_json
+               FROM book_snapshots ORDER BY book_position"""
+        )
+    assert evaluation[:4] == (
+        "run-1", "opp-1", "COMPLETED", "SNAPSHOT_EXECUTABLE"
+    )
+    assert json.loads(evaluation[4])["id"] == "run-1"
+    assert json.loads(evaluation[5])["id"] == "opp-1"
+    assert json.loads(evaluation[6])["status"] == "SNAPSHOT_EXECUTABLE"
+    assert isinstance(json.loads(evaluation[7]), list)
+    assert relation[0] == "set-1"
+    assert len(books) == 2
+    assert [row[3] for row in books] == [0, 1]
 
 
 @pytest.mark.asyncio
@@ -452,6 +551,91 @@ async def test_watch_metrics_are_persisted_and_listed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_watch_metrics_update_existing_watch_run():
+    async with OpportunityStore(":memory:") as store:
+        await store.save_watch_run({
+            "run_id": "watch:1",
+            "started_at_ms": 1000,
+            "finished_at_ms": 1100,
+            "status": "SUCCEEDED",
+            "exit_reason": "max_events",
+            "params_json": {"max_events": 3, "source": "test"},
+        })
+        await store.save_watch_metrics("watch:1", 1000, {"received": 3})
+        rows = await store._connection.execute_fetchall(
+            "SELECT id, canonical_json FROM watch_runs"
+        )
+        metrics = await store.list_watch_metrics(limit=1)
+
+    assert len(rows) == 1
+    assert json.loads(rows[0][1]) == {
+        "run_id": "watch:1",
+        "started_at_ms": 1000,
+        "finished_at_ms": 1100,
+        "status": "SUCCEEDED",
+        "exit_reason": "max_events",
+        "params_json": {"max_events": 3, "source": "test"},
+        "metrics": {"received": 3},
+    }
+    assert metrics[0]["received"] == 3
+
+
+@pytest.mark.asyncio
+async def test_watch_run_update_preserves_metrics_written_first():
+    async with OpportunityStore(":memory:") as store:
+        await store.save_watch_metrics("watch:1", 1000, {"received": 3})
+        await store.save_watch_run({
+            "run_id": "watch:1",
+            "started_at_ms": 1000,
+            "finished_at_ms": 1100,
+            "status": "SUCCEEDED",
+            "exit_reason": "max_events",
+            "params_json": {"max_events": 3, "source": "test"},
+        })
+        rows = await store._connection.execute_fetchall(
+            "SELECT id, canonical_json FROM watch_runs"
+        )
+        metrics = await store.list_watch_metrics(limit=1)
+
+    assert len(rows) == 1
+    assert json.loads(rows[0][1]) == {
+        "run_id": "watch:1",
+        "started_at_ms": 1000,
+        "finished_at_ms": 1100,
+        "status": "SUCCEEDED",
+        "exit_reason": "max_events",
+        "params_json": {"max_events": 3, "source": "test"},
+        "metrics": {"received": 3},
+    }
+    assert metrics == [{
+        "id": "watch:1",
+        "started_at_ms": 1000,
+        "received": 3,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_list_watch_metrics_limit_ignores_newer_run_without_metrics():
+    async with OpportunityStore(":memory:") as store:
+        await store.save_watch_metrics("watch:final", 1000, {"received": 3})
+        await store.save_watch_run({
+            "run_id": "watch:running",
+            "started_at_ms": 2000,
+            "finished_at_ms": None,
+            "status": "RUNNING",
+            "exit_reason": None,
+            "params_json": {},
+        })
+        metrics = await store.list_watch_metrics(limit=1)
+
+    assert metrics == [{
+        "id": "watch:final",
+        "started_at_ms": 1000,
+        "received": 3,
+    }]
+
+
+@pytest.mark.asyncio
 async def test_failed_initialization_leaves_store_closed_and_retryable(monkeypatch):
     store = OpportunityStore(":memory:")
     original = storage_module._SCHEMA
@@ -465,6 +649,105 @@ async def test_failed_initialization_leaves_store_closed_and_retryable(monkeypat
     assert await store.open() is store
     assert await store.list_runs() == []
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_initialization_preserves_original_error_and_closes_when_rollback_fails(
+    monkeypatch,
+):
+    connect = aiosqlite.connect
+    rollback = aiosqlite.Connection.rollback
+    close = aiosqlite.Connection.close
+    connections = []
+    close_calls = 0
+
+    async def tracking_connect(*args, **kwargs):
+        connection = await connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    async def failing_rollback(connection):
+        await rollback(connection)
+        raise RuntimeError("forced rollback failure")
+
+    async def tracking_close(connection):
+        nonlocal close_calls
+        close_calls += 1
+        await close(connection)
+
+    monkeypatch.setattr(storage_module, "_SCHEMA", "THIS IS NOT SQL")
+    monkeypatch.setattr(aiosqlite, "connect", tracking_connect)
+    monkeypatch.setattr(aiosqlite.Connection, "rollback", failing_rollback)
+    monkeypatch.setattr(aiosqlite.Connection, "close", tracking_close)
+
+    try:
+        with pytest.raises(aiosqlite.OperationalError):
+            await OpportunityStore(":memory:").open()
+    finally:
+        if close_calls == 0 and connections:
+            await close(connections[0])
+
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_initialization_cleanup_propagates_cancellation_after_closing(
+    monkeypatch,
+):
+    rollback_entered = asyncio.Event()
+    rollback_barrier = asyncio.Event()
+    close = aiosqlite.Connection.close
+    close_calls = 0
+
+    async def blocked_rollback(_connection):
+        rollback_entered.set()
+        await rollback_barrier.wait()
+
+    async def tracking_close(connection):
+        nonlocal close_calls
+        close_calls += 1
+        await close(connection)
+
+    monkeypatch.setattr(storage_module, "_SCHEMA", "THIS IS NOT SQL")
+    monkeypatch.setattr(aiosqlite.Connection, "rollback", blocked_rollback)
+    monkeypatch.setattr(aiosqlite.Connection, "close", tracking_close)
+
+    task = asyncio.create_task(OpportunityStore(":memory:").open())
+    await asyncio.wait_for(rollback_entered.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_schema_initialization_leaves_no_persistent_state(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "failed-initialization.sqlite3"
+    monkeypatch.setattr(
+        storage_module,
+        "_SCHEMA",
+        storage_module._SCHEMA + "\nTHIS IS NOT SQL;\n",
+    )
+
+    with pytest.raises(aiosqlite.OperationalError):
+        await OpportunityStore(path).open()
+
+    connection = sqlite3.connect(path)
+    try:
+        tables = connection.execute(
+            """SELECT name FROM sqlite_schema
+               WHERE type='table' AND name NOT LIKE 'sqlite_%'"""
+        ).fetchall()
+        version = connection.execute("PRAGMA user_version").fetchone()
+    finally:
+        connection.close()
+
+    assert tables == []
+    assert version == (0,)
 
 
 @pytest.mark.asyncio
@@ -483,6 +766,27 @@ async def test_invalid_child_rolls_back_every_row():
 
 
 @pytest.mark.asyncio
+async def test_merged_bundle_insert_rolls_back_on_child_failure():
+    async with OpportunityStore(":memory:") as store:
+        await store._connection.executescript(
+            """CREATE TRIGGER force_level_failure
+               BEFORE INSERT ON levels
+               BEGIN
+                 SELECT RAISE(ABORT, 'forced level failure');
+               END;"""
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="forced level failure"):
+            await store.save(EvidenceBundle.from_mapping(bundle()))
+
+        assert await store._connection.execute_fetchall(
+            "SELECT id FROM evidence_bundles"
+        ) == []
+        assert await store._connection.execute_fetchall(
+            "SELECT bundle_id FROM evaluations"
+        ) == []
+
+
+@pytest.mark.asyncio
 async def test_serialized_concurrent_writes():
     async with OpportunityStore(":memory:") as store:
         import asyncio
@@ -495,6 +799,117 @@ async def test_serialized_concurrent_writes():
         )
         assert results == [True, True]
         assert len(await store.list_opportunities()) == 2
+
+
+@pytest.mark.asyncio
+async def test_v7_latest_opportunity_and_report_use_evaluations(tmp_path):
+    path = tmp_path / "report.sqlite3"
+    first = bundle("bundle-old", "opp-shared")
+    first["run"]["id"] = "run-old"
+    first["run"]["started_at_ms"] = 1000
+    second = bundle("bundle-new", "opp-shared")
+    second["run"]["id"] = "run-new"
+    second["run"]["started_at_ms"] = 2000
+
+    async with OpportunityStore(path) as store:
+        await store.save(EvidenceBundle.from_mapping(first))
+        await store.save(EvidenceBundle.from_mapping(second))
+        replayed = await store.replay_opportunity("opp-shared")
+        report = await store.report(limit=10)
+        opportunities = await store.list_opportunities(limit=10)
+        runs = await store.list_runs(limit=10)
+
+    assert replayed.evidence.id == "bundle-new"
+    assert report["total"] == 2
+    assert opportunities[0][0] == "opp-shared"
+    assert {row[0] for row in runs} == {"run-old", "run-new"}
+
+
+@pytest.mark.asyncio
+async def test_validate_detects_corrupt_merged_evaluation():
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(bundle()))
+        await store._connection.execute(
+            "UPDATE evaluations SET risk_json='{}' WHERE bundle_id='bundle-1'"
+        )
+        await store._connection.commit()
+        result = await store.validate_opportunity("opp-1")
+
+    assert result["status"] == "fail"
+    assert result["checks"]["consistency"]["mismatches"] == [
+        "risk_assessment"
+    ]
+    assert any(
+        error["code"] == "REPLAY_MISMATCH" for error in result["errors"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_v7_clean_multi_book_bundle_validates():
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(bundle()))
+        result = await store.validate_opportunity("opp-1")
+
+    assert result["status"] == "pass"
+    assert result["checks"]["consistency"] == {
+        "status": "pass",
+        "mismatches": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_corrupt_merged_evaluation():
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(bundle()))
+        await store._connection.execute(
+            "UPDATE evaluations SET risk_json='{}' WHERE bundle_id='bundle-1'"
+        )
+        await store._connection.commit()
+
+        with pytest.raises(ValueError, match="normalized evidence"):
+            await store.replay("bundle-1")
+        with pytest.raises(ValueError, match="normalized evidence"):
+            await store.replay_opportunity("opp-1")
+
+
+@pytest.mark.asyncio
+async def test_replay_and_validate_reject_corrupt_event_payload():
+    async with OpportunityStore(":memory:") as store:
+        await store.save(EvidenceBundle.from_mapping(bundle()))
+        await store._connection.execute(
+            "UPDATE events SET payload='{}' WHERE bundle_id='bundle-1'"
+        )
+        await store._connection.commit()
+
+        with pytest.raises(ValueError, match="normalized evidence"):
+            await store.replay("bundle-1")
+        result = await store.validate_opportunity("opp-1")
+
+    assert result["status"] == "fail"
+    assert result["checks"]["consistency"]["mismatches"] == ["events"]
+    assert result["errors"][0]["code"] == "REPLAY_MISMATCH"
+
+
+@pytest.mark.asyncio
+async def test_report_uses_watch_metrics_compatibility_shape(monkeypatch):
+    expected = {
+        "id": "watch:run-1",
+        "started_at_ms": 1000,
+        "received": 3,
+        "queue_high_water": 2,
+    }
+
+    async def list_watch_metrics(_store, *, limit=100):
+        assert limit == 1
+        return [expected]
+
+    monkeypatch.setattr(
+        OpportunityStore, "list_watch_metrics", list_watch_metrics
+    )
+    async with OpportunityStore(":memory:") as store:
+        report = await store.report(limit=10)
+
+    assert report["ws_metrics"] == expected
 
 
 @pytest.mark.asyncio
@@ -517,7 +932,9 @@ async def test_validate_opportunity_detects_missing_notifications():
     async with OpportunityStore(":memory:") as store:
         await store.save(EvidenceBundle.from_mapping(bundle("bundle-notify", "opp_notify")))
         await store._connection.execute(
-            "DELETE FROM notifications WHERE bundle_id = ?", ("bundle-notify",)
+            """UPDATE evaluations SET notification_intent_json = '[]'
+               WHERE bundle_id = ?""",
+            ("bundle-notify",),
         )
         await store._connection.commit()
 
@@ -537,7 +954,9 @@ async def test_validate_opportunity_detects_partial_notifications():
     async with OpportunityStore(":memory:") as store:
         await store.save(EvidenceBundle.from_mapping(value))
         await store._connection.execute(
-            "DELETE FROM notifications WHERE id = ?", ("notice-2",)
+            """UPDATE evaluations SET notification_intent_json = ?
+               WHERE bundle_id = ?""",
+            (storage_module._json(value["notifications"][:1]), "bundle-notify-2"),
         )
         await store._connection.commit()
 

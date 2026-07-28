@@ -54,10 +54,9 @@ async def _reconcile_loop(
         delay = sleeper(interval_seconds)
         if inspect.isawaitable(delay):
             await delay
-        else:
-            # Test/embedded schedulers may be synchronous; still yield so the
-            # reconciliation loop cannot starve the WS receiver/processor.
-            await asyncio.sleep(0)
+        # Test/embedded schedulers may be synchronous or immediately complete;
+        # always yield so this loop cannot starve the WS receiver/processor.
+        await asyncio.sleep(0)
         try:
             snapshots = await provider.books(token_ids)
         except asyncio.CancelledError:

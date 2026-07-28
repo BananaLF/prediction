@@ -91,7 +91,8 @@ def _http_calls(tree: ast.AST) -> list[ast.Call]:
             and isinstance(receiver.value, ast.Name)
             and receiver.value.id == "self"
             and receiver.attr == "http"
-            and node.func.attr in {"get", "post", "put", "patch", "delete", "request"}
+            and node.func.attr
+            in {"get", "post", "put", "patch", "delete", "request", "stream"}
         ):
             calls.append(node)
     return calls
@@ -99,7 +100,7 @@ def _http_calls(tree: ast.AST) -> list[ast.Call]:
 
 def _looks_like_direct_http_call(node: ast.Call) -> bool:
     if not isinstance(node.func, ast.Attribute) or node.func.attr not in {
-        "get", "post", "put", "patch", "delete", "request"
+        "get", "post", "put", "patch", "delete", "request", "stream"
     }:
         return False
     receiver = node.func.value
@@ -129,14 +130,15 @@ def test_network_origins_and_endpoint_builders_are_an_exact_allowlist() -> None:
 
     gamma_calls = _http_calls(gamma)
     assert len(gamma_calls) == 1
-    assert gamma_calls[0].func.attr == "get"
-    assert ast.unparse(gamma_calls[0].args[0]) == (
-        "f'{self.base_url}/markets/keyset'"
-    )
+    assert gamma_calls[0].func.attr == "stream"
+    assert [ast.unparse(value) for value in gamma_calls[0].args[:2]] == [
+        "'GET'",
+        "f'{self.base_url}/markets/keyset'",
+    ]
 
     clob_calls = _http_calls(clob)
     assert len(clob_calls) == 1
-    assert clob_calls[0].func.attr == "request"
+    assert clob_calls[0].func.attr == "stream"
     assert [ast.unparse(value) for value in clob_calls[0].args[:2]] == [
         "method",
         "f'{self.base_url}{path}'",

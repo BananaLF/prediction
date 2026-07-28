@@ -20,7 +20,7 @@ from predmarket.exact_math import decimal_ratio
 from predmarket.risk import RiskInputs, assess_risk, worst_partial_fill
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 EVIDENCE_SCHEMA_VERSION = 2
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OPPORTUNITY_STATUSES = {
@@ -48,6 +48,23 @@ async def _immediate_transaction(connection: aiosqlite.Connection):
         await connection.commit()
 class EvidenceConflictError(ValueError):
     """An immutable evidence identifier already exists with different content."""
+
+
+class _CanonicalEvidenceError(ValueError):
+    """The immutable canonical payload is invalid."""
+
+
+class _NormalizedEvidenceError(ValueError):
+    """Normalized evidence cannot reproduce the immutable canonical payload."""
+
+    def __init__(self, mismatches: list[str], reason: str | None = None):
+        self.mismatches = tuple(mismatches)
+        self.reason = reason
+        detail = f": {reason}" if reason else ""
+        super().__init__(
+            "normalized evidence differs from canonical evidence"
+            f" ({', '.join(mismatches)}){detail}"
+        )
 
 
 def _identifier(name: str, value: object) -> str:
@@ -1023,12 +1040,19 @@ CREATE TABLE IF NOT EXISTS evidence_bundles (
     version INTEGER NOT NULL,
     canonical_json TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS runs (
-    bundle_id TEXT NOT NULL REFERENCES evidence_bundles(id) ON DELETE CASCADE,
-    id TEXT NOT NULL,
-    status TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS evaluations (
+    bundle_id TEXT PRIMARY KEY REFERENCES evidence_bundles(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    opportunity_id TEXT NOT NULL,
     started_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (bundle_id, id)
+    run_status TEXT NOT NULL,
+    opportunity_status TEXT NOT NULL,
+    pipeline_reason TEXT NOT NULL,
+    run_json TEXT NOT NULL,
+    opportunity_json TEXT NOT NULL,
+    risk_json TEXT NOT NULL,
+    notification_intent_json TEXT NOT NULL,
+    UNIQUE(opportunity_id, bundle_id)
 );
 CREATE TABLE IF NOT EXISTS events (
     bundle_id TEXT NOT NULL REFERENCES evidence_bundles(id) ON DELETE CASCADE,
@@ -1049,73 +1073,40 @@ CREATE TABLE IF NOT EXISTS fee_schedules (
     rate TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (bundle_id, id),
     FOREIGN KEY (bundle_id, token_id) REFERENCES tokens(bundle_id, id)
 );
-CREATE TABLE IF NOT EXISTS relation_sets (
-    bundle_id TEXT NOT NULL REFERENCES evidence_bundles(id) ON DELETE CASCADE,
-    id TEXT NOT NULL, version INTEGER NOT NULL, payload TEXT NOT NULL,
-    PRIMARY KEY (bundle_id, id)
+CREATE TABLE IF NOT EXISTS relation_evidence (
+    bundle_id TEXT PRIMARY KEY REFERENCES evidence_bundles(id) ON DELETE CASCADE,
+    relation_set_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    canonical_json TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS relations (
-    bundle_id TEXT NOT NULL, id TEXT NOT NULL, relation_set_id TEXT NOT NULL,
-    payload TEXT NOT NULL, PRIMARY KEY (bundle_id, id),
-    FOREIGN KEY (bundle_id, relation_set_id) REFERENCES relation_sets(bundle_id, id)
-);
-CREATE TABLE IF NOT EXISTS relation_states (
-    bundle_id TEXT NOT NULL, id TEXT NOT NULL, relation_set_id TEXT NOT NULL,
-    payload TEXT NOT NULL, PRIMARY KEY (bundle_id, id),
-    FOREIGN KEY (bundle_id, relation_set_id) REFERENCES relation_sets(bundle_id, id)
-);
-CREATE TABLE IF NOT EXISTS relation_payoffs (
-    bundle_id TEXT NOT NULL, relation_set_id TEXT NOT NULL, position INTEGER NOT NULL,
-    amount TEXT NOT NULL, payload TEXT NOT NULL,
-    PRIMARY KEY (bundle_id, relation_set_id, position),
-    FOREIGN KEY (bundle_id, relation_set_id) REFERENCES relation_sets(bundle_id, id)
-);
-CREATE TABLE IF NOT EXISTS book_epochs (
-    bundle_id TEXT NOT NULL, id TEXT NOT NULL, token_id TEXT NOT NULL,
-    payload TEXT NOT NULL, PRIMARY KEY (bundle_id, id),
-    FOREIGN KEY (bundle_id, token_id) REFERENCES tokens(bundle_id, id)
-);
-CREATE TABLE IF NOT EXISTS snapshots (
+CREATE TABLE IF NOT EXISTS book_snapshots (
     bundle_id TEXT NOT NULL, id TEXT NOT NULL, epoch_id TEXT NOT NULL,
-    payload TEXT NOT NULL, PRIMARY KEY (bundle_id, id),
-    FOREIGN KEY (bundle_id, epoch_id) REFERENCES book_epochs(bundle_id, id)
+    token_id TEXT NOT NULL, book_position INTEGER NOT NULL,
+    epoch_json TEXT NOT NULL, snapshot_json TEXT NOT NULL,
+    PRIMARY KEY(bundle_id, id),
+    UNIQUE(bundle_id, book_position),
+    FOREIGN KEY(bundle_id, token_id) REFERENCES tokens(bundle_id, id)
 );
 CREATE TABLE IF NOT EXISTS levels (
     bundle_id TEXT NOT NULL, snapshot_id TEXT NOT NULL, position INTEGER NOT NULL,
     side TEXT NOT NULL, price TEXT NOT NULL, size TEXT NOT NULL,
     PRIMARY KEY (bundle_id, snapshot_id, position),
-    FOREIGN KEY (bundle_id, snapshot_id) REFERENCES snapshots(bundle_id, id)
-);
-CREATE TABLE IF NOT EXISTS opportunities (
-    bundle_id TEXT PRIMARY KEY REFERENCES evidence_bundles(id) ON DELETE CASCADE,
-    id TEXT NOT NULL, run_id TEXT NOT NULL, status TEXT NOT NULL,
-    payload TEXT NOT NULL, UNIQUE (bundle_id, id),
-    FOREIGN KEY (bundle_id, run_id) REFERENCES runs(bundle_id, id)
+    FOREIGN KEY (bundle_id, snapshot_id) REFERENCES book_snapshots(bundle_id, id)
 );
 CREATE TABLE IF NOT EXISTS legs (
     bundle_id TEXT NOT NULL, id TEXT NOT NULL, opportunity_id TEXT NOT NULL,
     payload TEXT NOT NULL, PRIMARY KEY (bundle_id, id),
-    FOREIGN KEY (bundle_id, opportunity_id) REFERENCES opportunities(bundle_id, id)
+    FOREIGN KEY (bundle_id) REFERENCES evaluations(bundle_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS actions (
     bundle_id TEXT NOT NULL, id TEXT NOT NULL, opportunity_id TEXT NOT NULL,
     sequence INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (bundle_id, id),
-    FOREIGN KEY (bundle_id, opportunity_id) REFERENCES opportunities(bundle_id, id)
-);
-CREATE TABLE IF NOT EXISTS risk_assessments (
-    bundle_id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL, status TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    FOREIGN KEY (bundle_id, opportunity_id) REFERENCES opportunities(bundle_id, id)
+    FOREIGN KEY (bundle_id) REFERENCES evaluations(bundle_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS latency_metrics (
     bundle_id TEXT NOT NULL, id TEXT NOT NULL, opportunity_id TEXT NOT NULL,
     payload TEXT NOT NULL, PRIMARY KEY (bundle_id, id),
-    FOREIGN KEY (bundle_id, opportunity_id) REFERENCES opportunities(bundle_id, id)
-);
-CREATE TABLE IF NOT EXISTS notifications (
-    bundle_id TEXT NOT NULL, id TEXT NOT NULL, opportunity_id TEXT NOT NULL,
-    status TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (bundle_id, id),
-    FOREIGN KEY (bundle_id, opportunity_id) REFERENCES opportunities(bundle_id, id)
+    FOREIGN KEY (bundle_id) REFERENCES evaluations(bundle_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS notification_claims (
     fingerprint TEXT PRIMARY KEY,
@@ -1176,12 +1167,6 @@ CREATE TABLE IF NOT EXISTS catalog_tokens (
     canonical_json TEXT NOT NULL,
     PRIMARY KEY(snapshot_id, token_id)
 );
-CREATE TABLE IF NOT EXISTS catalog_diagnostics (
-    snapshot_id TEXT NOT NULL REFERENCES catalog_snapshots(id),
-    position INTEGER NOT NULL,
-    canonical_json TEXT NOT NULL,
-    PRIMARY KEY(snapshot_id, position)
-);
 CREATE TABLE IF NOT EXISTS catalog_relation_candidates (
     snapshot_id TEXT NOT NULL REFERENCES catalog_snapshots(id),
     relation_id TEXT NOT NULL,
@@ -1222,12 +1207,6 @@ CREATE TABLE IF NOT EXISTS current_catalog_events (
     canonical_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS watch_runs (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    id TEXT NOT NULL UNIQUE,
-    started_at_ms INTEGER NOT NULL,
-    canonical_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS watch_metrics (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE,
     started_at_ms INTEGER NOT NULL,
@@ -1325,111 +1304,15 @@ class OpportunityStore:
         connection = await aiosqlite.connect(self._path)
         try:
             await connection.execute("PRAGMA foreign_keys = ON")
-            await connection.execute("PRAGMA journal_mode = WAL")
             version_rows = await connection.execute_fetchall("PRAGMA user_version")
             existing_version = int(version_rows[0][0])
-            if existing_version == 1:
+            if existing_version not in {0, SCHEMA_VERSION}:
                 raise RuntimeError(
-                    "database schema 1 is incompatible and has no supported migration"
+                    f"database schema {existing_version} is unsupported by schema "
+                    f"{SCHEMA_VERSION}; use a new database path"
                 )
-            if existing_version > SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"database schema {existing_version} is newer than supported "
-                    f"schema {SCHEMA_VERSION}"
-                )
-            if existing_version == 3:
-                for table in (
-                    "current_catalog_markets",
-                    "current_catalog_tokens",
-                    "current_catalog_events",
-                ):
-                    await connection.execute(
-                        f"""ALTER TABLE {table}
-                            ADD COLUMN state_updated_at_ms INTEGER NOT NULL
-                            DEFAULT 0"""
-                    )
-                    await connection.execute(
-                        f"""ALTER TABLE {table}
-                            ADD COLUMN state_update_sequence INTEGER NOT NULL
-                            DEFAULT 0"""
-                    )
-                    await connection.execute(
-                        f"""UPDATE {table}
-                            SET state_updated_at_ms =
-                                CASE WHEN presence='MISSING' THEN
-                                  COALESCE(
-                                    (SELECT fetched_at_ms
-                                     FROM catalog_sync_runs
-                                     WHERE complete=1
-                                     ORDER BY fetched_at_ms DESC, sequence DESC
-                                     LIMIT 1),
-                                    (SELECT MAX(fetched_at_ms)
-                                     FROM catalog_sync_runs),
-                                    9223372036854775807
-                                  )
-                                ELSE fetched_at_ms END,
-                                state_update_sequence =
-                                CASE WHEN presence='MISSING' THEN
-                                  COALESCE(
-                                    (SELECT sequence
-                                     FROM catalog_sync_runs
-                                     WHERE complete=1
-                                     ORDER BY fetched_at_ms DESC, sequence DESC
-                                     LIMIT 1),
-                                    (SELECT MAX(sequence)
-                                     FROM catalog_sync_runs),
-                                    9223372036854775807
-                                  )
-                                ELSE COALESCE(
-                                  (SELECT MAX(sequence)
-                                   FROM catalog_sync_runs run
-                                   WHERE run.fetched_at_ms={table}.fetched_at_ms),
-                                  0
-                                ) END"""
-                    )
-            if existing_version < 5:
-                await connection.executescript(
-                    """
-                    CREATE TABLE IF NOT EXISTS watch_metrics (
-                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                        id TEXT NOT NULL UNIQUE,
-                        started_at_ms INTEGER NOT NULL,
-                        canonical_json TEXT NOT NULL
-                    );
-                    CREATE TABLE IF NOT EXISTS watch_events (
-                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                        id TEXT NOT NULL UNIQUE,
-                        run_id TEXT NOT NULL,
-                        event_index INTEGER NOT NULL,
-                        event_type TEXT NOT NULL,
-                        token_id TEXT,
-                        condition_id TEXT,
-                        canonical_json TEXT NOT NULL,
-                        raw_json TEXT NOT NULL,
-                        received_wall_ms INTEGER NOT NULL,
-                        received_monotonic REAL NOT NULL,
-                        exchange_ts_ms INTEGER NOT NULL,
-                        persisted_at_ms INTEGER NOT NULL
-                    );
-                    CREATE TABLE IF NOT EXISTS scan_runs (
-                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                        id TEXT NOT NULL UNIQUE,
-                        started_at_ms INTEGER NOT NULL,
-                        canonical_json TEXT NOT NULL
-                    );
-                    CREATE TABLE IF NOT EXISTS scan_candidates (
-                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                        id TEXT NOT NULL UNIQUE,
-                        run_id TEXT NOT NULL,
-                        result_index INTEGER NOT NULL,
-                        status TEXT NOT NULL,
-                        reason TEXT NOT NULL,
-                        canonical_json TEXT NOT NULL,
-                        observed_at_ms INTEGER NOT NULL
-                    );
-                    """
-                )
-            await connection.executescript(_SCHEMA)
+            await connection.execute("PRAGMA journal_mode = WAL")
+            await connection.executescript("BEGIN IMMEDIATE;\n" + _SCHEMA)
             await connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
                 (SCHEMA_VERSION,),
@@ -1437,7 +1320,16 @@ class OpportunityStore:
             await connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             await connection.commit()
         except BaseException:
-            await connection.close()
+            try:
+                try:
+                    await connection.rollback()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    await connection.close()
+                except Exception:
+                    pass
             raise
         self._connection = connection
         return self
@@ -1687,27 +1579,45 @@ class OpportunityStore:
             (bundle_id, data["version"], canonical),
         )
         run = data["run"]
-        await self._connection.execute(
-            "INSERT INTO runs VALUES (?, ?, ?, ?)",
-            (bundle_id, run["id"], run["status"], run["started_at_ms"]),
+        opportunity = data["opportunity"]
+        risk = data["risk"]
+        await connection.execute(
+            """INSERT INTO evaluations
+               (bundle_id, run_id, opportunity_id, started_at_ms, run_status,
+                opportunity_status, pipeline_reason, run_json, opportunity_json,
+                risk_json, notification_intent_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                bundle_id,
+                run["id"],
+                opportunity["id"],
+                run["started_at_ms"],
+                run["status"],
+                opportunity["status"],
+                str(data["producer"]["metadata"].get("pipeline_reason", "unknown")),
+                _json(run),
+                _json(opportunity),
+                _json(risk),
+                _json(data["notifications"]),
+            ),
         )
         for event in data["events"]:
-            await self._connection.execute(
+            await connection.execute(
                 "INSERT INTO events VALUES (?, ?, ?)",
                 (bundle_id, event["id"], _json(event)),
             )
         for market in data["markets"]:
-            await self._connection.execute(
+            await connection.execute(
                 "INSERT INTO markets VALUES (?, ?, ?, ?)",
                 (bundle_id, market["id"], market["event_id"], _json(market)),
             )
         for token in data["tokens"]:
-            await self._connection.execute(
+            await connection.execute(
                 "INSERT INTO tokens VALUES (?, ?, ?, ?)",
                 (bundle_id, token["id"], token["market_id"], _json(token)),
             )
         for fee in data["fee_schedules"]:
-            await self._connection.execute(
+            await connection.execute(
                 "INSERT INTO fee_schedules VALUES (?, ?, ?, ?, ?)",
                 (
                     bundle_id, fee["id"], fee["token_id"],
@@ -1716,41 +1626,36 @@ class OpportunityStore:
             )
         relation = data["relation"]
         relation_set = relation["set"]
-        set_id = relation_set["id"]
-        await self._connection.execute(
-            "INSERT INTO relation_sets VALUES (?, ?, ?, ?)",
-            (bundle_id, set_id, relation_set["version"], _json(relation_set)),
+        await connection.execute(
+            """INSERT INTO relation_evidence
+               (bundle_id, relation_set_id, version, canonical_json)
+               VALUES (?, ?, ?, ?)""",
+            (
+                bundle_id,
+                relation_set["id"],
+                relation_set["version"],
+                _json(relation),
+            ),
         )
-        for item in relation["relations"]:
-            await self._connection.execute(
-                "INSERT INTO relations VALUES (?, ?, ?, ?)",
-                (bundle_id, item["id"], set_id, _json(item)),
-            )
-        for state in relation["states"]:
-            await self._connection.execute(
-                "INSERT INTO relation_states VALUES (?, ?, ?, ?)",
-                (bundle_id, state["id"], set_id, _json(state)),
-            )
-        for position, payoff in enumerate(relation["payoffs"]):
-            await self._connection.execute(
-                "INSERT INTO relation_payoffs VALUES (?, ?, ?, ?, ?)",
+        for book_position, book in enumerate(data["books"]):
+            epoch, snapshot = book["epoch"], book["snapshot"]
+            await connection.execute(
+                """INSERT INTO book_snapshots
+                   (bundle_id, id, epoch_id, token_id, book_position,
+                    epoch_json, snapshot_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    bundle_id, set_id, position,
-                    _canonical_decimal(payoff["amount"]), _json(payoff),
+                    bundle_id,
+                    snapshot["id"],
+                    epoch["id"],
+                    epoch["token_id"],
+                    book_position,
+                    _json(epoch),
+                    _json(snapshot),
                 ),
             )
-        for book in data["books"]:
-            epoch, snapshot = book["epoch"], book["snapshot"]
-            await self._connection.execute(
-                "INSERT INTO book_epochs VALUES (?, ?, ?, ?)",
-                (bundle_id, epoch["id"], epoch["token_id"], _json(epoch)),
-            )
-            await self._connection.execute(
-                "INSERT INTO snapshots VALUES (?, ?, ?, ?)",
-                (bundle_id, snapshot["id"], epoch["id"], _json(snapshot)),
-            )
             for level in book["levels"]:
-                await self._connection.execute(
+                await connection.execute(
                     "INSERT INTO levels VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         bundle_id, snapshot["id"], level["position"], level["side"],
@@ -1758,70 +1663,199 @@ class OpportunityStore:
                         _canonical_decimal(level["size"]),
                     ),
                 )
-        opportunity = data["opportunity"]
-        await self._connection.execute(
-            "INSERT INTO opportunities VALUES (?, ?, ?, ?, ?)",
-            (
-                bundle_id, opportunity["id"], run["id"],
-                opportunity["status"], _json(opportunity),
-            ),
-        )
         for leg in data["legs"]:
-            await self._connection.execute(
+            await connection.execute(
                 "INSERT INTO legs VALUES (?, ?, ?, ?)",
                 (bundle_id, leg["id"], opportunity["id"], _json(leg)),
             )
         for action in data["actions"]:
-            await self._connection.execute(
+            await connection.execute(
                 "INSERT INTO actions VALUES (?, ?, ?, ?, ?)",
                 (
                     bundle_id, action["id"], opportunity["id"],
                     action["sequence"], _json(action),
                 ),
             )
-        risk = data["risk"]
-        await self._connection.execute(
-            "INSERT INTO risk_assessments VALUES (?, ?, ?, ?)",
-            (bundle_id, opportunity["id"], risk["status"], _json(risk)),
-        )
         for metric in data["latency_metrics"]:
-            await self._connection.execute(
+            await connection.execute(
                 "INSERT INTO latency_metrics VALUES (?, ?, ?, ?)",
                 (bundle_id, metric["id"], opportunity["id"], _json(metric)),
             )
-        for notification in data["notifications"]:
-            await self._connection.execute(
-                "INSERT INTO notifications VALUES (?, ?, ?, ?, ?)",
-                (
-                    bundle_id, notification["id"], opportunity["id"],
-                    notification["status"], _json(notification),
-                ),
-            )
 
-    async def replay(self, bundle_id: str) -> EvidenceBundle:
-        _identifier("bundle_id", bundle_id)
-        rows = await self._require_connection().execute_fetchall(
+    async def _rebuild_bundle_from_normalized(
+        self, bundle_id: str
+    ) -> EvidenceBundle:
+        """Rebuild every normalized section and verify immutable evidence."""
+        connection = self._require_connection()
+        rows = await connection.execute_fetchall(
             "SELECT canonical_json FROM evidence_bundles WHERE id = ?",
             (bundle_id,),
         )
         if not rows:
             raise KeyError(bundle_id)
-        # The canonical payload is immutable; validate again to detect corruption.
-        decoded = json.loads(rows[0][0])
-        replayed = EvidenceBundle.from_mapping(_restore_schema_decimals(decoded))
-        if replayed.canonical_json != rows[0][0]:
-            raise ValueError("stored evidence is not canonical")
+        canonical_json = str(rows[0][0])
+        try:
+            canonical_data = json.loads(canonical_json)
+            canonical_evidence = EvidenceBundle.from_mapping(
+                _restore_schema_decimals(json.loads(canonical_json))
+            )
+            if canonical_evidence.canonical_json != canonical_json:
+                raise ValueError("stored evidence is not canonical")
+        except (
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+            InvalidOperation,
+            KeyError,
+            AttributeError,
+        ) as exc:
+            raise _CanonicalEvidenceError(
+                "stored evidence JSON is corrupted or non-canonical"
+            ) from exc
+
+        async def payloads(table: str) -> list[object]:
+            payload_rows = await connection.execute_fetchall(
+                f"""SELECT payload FROM {table}
+                    WHERE bundle_id = ? ORDER BY rowid""",
+                (bundle_id,),
+            )
+            return [json.loads(str(row[0])) for row in payload_rows]
+
+        reconstructed = json.loads(canonical_json)
+        normalized_sections = (
+            "run", "opportunity", "risk", "notifications", "events", "markets",
+            "tokens", "fee_schedules", "relation", "books", "legs", "actions",
+            "latency_metrics",
+        )
+        public_section_names = {
+            "run": "run_id",
+            "opportunity": "opportunity_id",
+            "risk": "risk_assessment",
+            "notifications": "notification_audit",
+        }
+        try:
+            evaluation_rows = await connection.execute_fetchall(
+                """SELECT run_json, opportunity_json, risk_json,
+                          notification_intent_json
+                   FROM evaluations WHERE bundle_id = ?""",
+                (bundle_id,),
+            )
+            if len(evaluation_rows) != 1:
+                raise _NormalizedEvidenceError(
+                    [
+                        "run_id", "opportunity_id", "risk_assessment",
+                        "notification_audit",
+                    ],
+                    "expected exactly one evaluation row",
+                )
+            evaluation = evaluation_rows[0]
+            reconstructed["run"] = json.loads(str(evaluation[0]))
+            reconstructed["opportunity"] = json.loads(str(evaluation[1]))
+            reconstructed["risk"] = json.loads(str(evaluation[2]))
+            reconstructed["notifications"] = json.loads(str(evaluation[3]))
+            reconstructed["events"] = await payloads("events")
+            reconstructed["markets"] = await payloads("markets")
+            reconstructed["tokens"] = await payloads("tokens")
+            reconstructed["fee_schedules"] = await payloads("fee_schedules")
+
+            relation_rows = await connection.execute_fetchall(
+                """SELECT canonical_json FROM relation_evidence
+                   WHERE bundle_id = ?""",
+                (bundle_id,),
+            )
+            if len(relation_rows) != 1:
+                raise _NormalizedEvidenceError(
+                    ["relation"], "expected exactly one relation evidence row"
+                )
+            reconstructed["relation"] = json.loads(str(relation_rows[0][0]))
+
+            book_rows = await connection.execute_fetchall(
+                """SELECT id, epoch_json, snapshot_json
+                   FROM book_snapshots WHERE bundle_id = ?
+                   ORDER BY book_position""",
+                (bundle_id,),
+            )
+            books: list[dict[str, object]] = []
+            for snapshot_id, epoch_json, snapshot_json in book_rows:
+                level_rows = await connection.execute_fetchall(
+                    """SELECT side, price, size, position FROM levels
+                       WHERE bundle_id = ? AND snapshot_id = ?
+                       ORDER BY position""",
+                    (bundle_id, snapshot_id),
+                )
+                books.append({
+                    "epoch": json.loads(str(epoch_json)),
+                    "snapshot": json.loads(str(snapshot_json)),
+                    "levels": [
+                        {
+                            "side": str(side),
+                            "price": str(price),
+                            "size": str(size),
+                            "position": int(position),
+                        }
+                        for side, price, size, position in level_rows
+                    ],
+                })
+            reconstructed["books"] = books
+            reconstructed["legs"] = await payloads("legs")
+            reconstructed["actions"] = await payloads("actions")
+            reconstructed["latency_metrics"] = await payloads(
+                "latency_metrics"
+            )
+        except _NormalizedEvidenceError:
+            raise
+        except (
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+            InvalidOperation,
+            KeyError,
+            AttributeError,
+        ) as exc:
+            raise _NormalizedEvidenceError(
+                ["normalized_evidence"], str(exc)
+            ) from exc
+
+        mismatches = [
+            public_section_names.get(name, name)
+            for name in normalized_sections
+            if _normalize_validation_view(reconstructed.get(name))
+            != _normalize_validation_view(canonical_data.get(name))
+        ]
+        try:
+            restored = _restore_schema_decimals(
+                json.loads(json.dumps(reconstructed, ensure_ascii=False))
+            )
+            replayed = EvidenceBundle.from_mapping(restored)
+        except (
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+            InvalidOperation,
+            KeyError,
+            AttributeError,
+        ) as exc:
+            raise _NormalizedEvidenceError(
+                mismatches or ["normalized_evidence"], str(exc)
+            ) from exc
+        if replayed.canonical_json != canonical_json:
+            raise _NormalizedEvidenceError(
+                mismatches or ["normalized_evidence"]
+            )
         return replayed
+
+    async def replay(self, bundle_id: str) -> EvidenceBundle:
+        _identifier("bundle_id", bundle_id)
+        return await self._rebuild_bundle_from_normalized(bundle_id)
 
     async def replay_opportunity(
         self, opportunity_id: str
     ) -> NotificationAuditReplay:
         _identifier("opportunity_id", opportunity_id)
         rows = await self._require_connection().execute_fetchall(
-            """SELECT o.bundle_id FROM opportunities o
-               JOIN runs r ON r.bundle_id = o.bundle_id AND r.id = o.run_id
-               WHERE o.id = ?
-               ORDER BY r.started_at_ms DESC, o.rowid DESC LIMIT 1""",
+            """SELECT bundle_id FROM evaluations
+               WHERE opportunity_id = ?
+               ORDER BY started_at_ms DESC, rowid DESC LIMIT 1""",
             (opportunity_id,),
         )
         if not rows:
@@ -1864,15 +1898,14 @@ class OpportunityStore:
             )
         connection = self._require_connection()
         rows = await connection.execute_fetchall(
-            """SELECT o.bundle_id, o.run_id, r.started_at_ms,
+            """SELECT e.bundle_id, e.run_id, e.started_at_ms,
                       EXISTS(
                           SELECT 1 FROM evidence_bundles b
-                          WHERE b.id = o.bundle_id
+                          WHERE b.id = e.bundle_id
                       )
-               FROM opportunities o
-               LEFT JOIN runs r ON r.bundle_id = o.bundle_id AND r.id = o.run_id
-               WHERE o.id = ?
-               ORDER BY r.started_at_ms DESC, o.rowid DESC""",
+               FROM evaluations e
+               WHERE e.opportunity_id = ?
+               ORDER BY e.started_at_ms DESC, e.rowid DESC""",
             (opportunity_id,),
         )
         if not rows:
@@ -1905,7 +1938,7 @@ class OpportunityStore:
             bundle_data = json.loads(canonical_json) if bundle_rows else {}
             if bundle_rows:
                 expected_canonical = EvidenceBundle.from_mapping(
-                    _restore_schema_decimals(bundle_data)
+                    _restore_schema_decimals(json.loads(canonical_json))
                 ).canonical_json
                 if expected_canonical != canonical_json:
                     raise ValueError("stored evidence is not canonical")
@@ -1924,39 +1957,53 @@ class OpportunityStore:
                 selection_reason="canonical evidence validation failed",
             )
         expected_notifications = bundle_data.get("notifications", [])
+        evaluation_rows = await connection.execute_fetchall(
+            """SELECT run_json, opportunity_json, risk_json,
+                      notification_intent_json
+               FROM evaluations WHERE bundle_id = ?""",
+            (bundle_id,),
+        )
+        relation_rows = await connection.execute_fetchall(
+            "SELECT canonical_json FROM relation_evidence WHERE bundle_id = ?",
+            (bundle_id,),
+        )
+        book_rows = await connection.execute_fetchall(
+            """SELECT id, epoch_json, snapshot_json
+               FROM book_snapshots WHERE bundle_id = ?
+               ORDER BY book_position""",
+            (bundle_id,),
+        )
+
+        def decoded_json(raw: object) -> object:
+            return json.loads(str(raw))
+
+        try:
+            stored_notifications = (
+                decoded_json(evaluation_rows[0][3]) if evaluation_rows else None
+            )
+        except (json.JSONDecodeError, TypeError, ValueError):
+            stored_notifications = None
         required_members = {
             "bundle": bool(has_bundle),
-            "run": started_at_ms is not None,
+            "run": started_at_ms is not None and bool(evaluation_rows),
         }
         for name, table in (
             ("legs", "legs"),
             ("actions", "actions"),
-            ("risk_assessment", "risk_assessments"),
             ("latency_metrics", "latency_metrics"),
-            ("notifications", "notifications"),
         ):
             count = await connection.execute_fetchall(
                 f"SELECT COUNT(*) FROM {table} WHERE bundle_id = ? AND opportunity_id = ?",
                 (bundle_id, opportunity_id),
             )
             required_members[name] = bool(count[0][0])
-        notification_rows = await connection.execute_fetchall(
-            """SELECT id, payload FROM notifications
-               WHERE bundle_id = ? AND opportunity_id = ? ORDER BY id""",
-            (bundle_id, opportunity_id),
-        )
-        expected_notification_rows = [
-            (item["id"], _json(item))
-            for item in sorted(expected_notifications, key=lambda item: item["id"])
-        ]
+        required_members["risk_assessment"] = bool(evaluation_rows)
         required_members["notifications"] = (
-            len(notification_rows) == len(expected_notification_rows)
-            and all(
-                str(actual_id) == expected_id and str(actual_json) == expected_json
-                for (actual_id, actual_json), (expected_id, expected_json) in zip(
-                    notification_rows, expected_notification_rows
-                )
-            )
+            stored_notifications == expected_notifications
+        )
+        required_members["relation_evidence"] = bool(relation_rows)
+        required_members["book_snapshots"] = (
+            len(book_rows) == len(bundle_data.get("books", []))
         )
         missing = [name for name, exists in required_members.items() if not exists]
         completeness_status = "pass" if not missing else "fail"
@@ -1994,96 +2041,20 @@ class OpportunityStore:
             }
             return result
 
-        async def payloads(table: str, order_by: str) -> list[object]:
-            rows = await connection.execute_fetchall(
-                f"""SELECT payload FROM {table}
-                    WHERE bundle_id = ? AND opportunity_id = ? ORDER BY {order_by}""",
-                (bundle_id, opportunity_id),
+        mismatches: list[str] = []
+        reconstruction_error: str | None = None
+        try:
+            await self._rebuild_bundle_from_normalized(str(bundle_id))
+        except _CanonicalEvidenceError as exc:
+            return failure(
+                "CORRUPTED_CANONICAL_JSON",
+                "stored evidence JSON is corrupted or non-canonical",
+                context={"bundle_id": str(bundle_id), "reason": str(exc)},
+                selection_reason="canonical evidence validation failed",
             )
-            return [json.loads(row[0]) for row in rows]
-
-        risk_rows = await connection.execute_fetchall(
-            """SELECT payload FROM risk_assessments
-               WHERE bundle_id = ? AND opportunity_id = ?""",
-            (bundle_id, opportunity_id),
-        )
-        notification_payloads = await payloads("notifications", "id")
-        claim_rows = await connection.execute_fetchall(
-            """SELECT e.fingerprint, c.bundle_id, c.state, c.claimed_at_ms,
-                      c.lease_expires_at_ms, c.attempt_count
-               FROM notification_events e
-               JOIN notification_claims c ON c.fingerprint = e.fingerprint
-               WHERE e.bundle_id = ?
-               GROUP BY e.fingerprint
-               ORDER BY e.fingerprint""",
-            (bundle_id,),
-        )
-        attempts = await connection.execute_fetchall(
-            """SELECT fingerprint, status, attempted_at_ms, error
-               FROM notification_attempts WHERE bundle_id = ? ORDER BY id""",
-            (bundle_id,),
-        )
-        events = await connection.execute_fetchall(
-            """SELECT fingerprint, event, occurred_at_ms, detail
-               FROM notification_events WHERE bundle_id = ? ORDER BY id""",
-            (bundle_id,),
-        )
-        stored_view = {
-            **evidence,
-            "legs": await payloads("legs", "id"),
-            "actions": await payloads("actions", "sequence, id"),
-            "risk_assessment": json.loads(risk_rows[0][0]),
-            "latency_metrics": await payloads("latency_metrics", "id"),
-            "notification_audit": {
-                "notifications": notification_payloads,
-                "claims": [
-                    {
-                        "fingerprint": str(row[0]),
-                        "owner_bundle_id": str(row[1]),
-                        "state": str(row[2]),
-                        "claimed_at_ms": int(row[3]),
-                        "lease_expires_at_ms": int(row[4]),
-                        "attempt_count": int(row[5]),
-                    }
-                    for row in claim_rows
-                ],
-                "attempts": [list(row) for row in attempts],
-                "events": [list(row) for row in events],
-            },
-        }
-        replayed = await self.replay_opportunity(opportunity_id)
-        replay_data = replayed.evidence.data
-        replay_view = {
-            "bundle_id": replayed.evidence.id,
-            "opportunity_id": replay_data["opportunity"]["id"],
-            "run_id": replay_data["run"]["id"],
-            "legs": replay_data["legs"],
-            "actions": replay_data["actions"],
-            "risk_assessment": replay_data["risk"],
-            "latency_metrics": replay_data["latency_metrics"],
-            "notification_audit": {
-                "notifications": replay_data["notifications"],
-                "claims": [
-                    {
-                        "fingerprint": claim.fingerprint,
-                        "owner_bundle_id": claim.owner_bundle_id,
-                        "state": claim.state,
-                        "claimed_at_ms": claim.claimed_at_ms,
-                        "lease_expires_at_ms": claim.lease_expires_at_ms,
-                        "attempt_count": claim.attempt_count,
-                    }
-                    for claim in replayed.current_claims
-                ],
-                "attempts": [list(attempt) for attempt in replayed.attempts],
-                "events": [list(event) for event in replayed.events],
-            },
-        }
-        normalized_stored = _normalize_validation_view(stored_view)
-        normalized_replayed = _normalize_validation_view(replay_view)
-        mismatches = [
-            name for name in stored_view
-            if normalized_stored[name] != normalized_replayed[name]
-        ]
+        except _NormalizedEvidenceError as exc:
+            mismatches = list(exc.mismatches)
+            reconstruction_error = exc.reason
         consistency_status = "pass" if not mismatches else "fail"
         result["checks"]["consistency"] = {
             "status": consistency_status,
@@ -2097,6 +2068,10 @@ class OpportunityStore:
                 "context": {
                     "opportunity_id": opportunity_id,
                     "mismatches": mismatches,
+                    **(
+                        {"reason": reconstruction_error}
+                        if reconstruction_error is not None else {}
+                    ),
                 },
             }]
         return result
@@ -2322,11 +2297,6 @@ class OpportunityStore:
                          AND state_update_sequence = ?""",
                     (data["fetched_at_ms"], sync_sequence),
                 )
-                for position, diagnostic in enumerate(data["diagnostics"]):
-                    await connection.execute(
-                        "INSERT INTO catalog_diagnostics VALUES (?, ?, ?)",
-                        (snapshot_id, position, _json(diagnostic)),
-                    )
                 for relation in data.get("relation_candidates", []):
                     relation_record = _mapping("relation candidate", relation)
                     await connection.execute(
@@ -2477,26 +2447,38 @@ class OpportunityStore:
             raise TypeError("exit_reason must be str or None")
         params = data.get("params_json", {})
         _validate_opaque_json("params_json", params)
-        canonical = _json(
-            {
-                "run_id": run_id,
-                "started_at_ms": started_at_ms,
-                "finished_at_ms": finished_at_ms,
-                "status": status,
-                "exit_reason": exit_reason,
-                "params_json": params,
-            }
-        )
+        canonical_data = {
+            "run_id": run_id,
+            "started_at_ms": started_at_ms,
+            "finished_at_ms": finished_at_ms,
+            "status": status,
+            "exit_reason": exit_reason,
+            "params_json": params,
+        }
         connection = self._require_connection()
         async with self._write_lock:
-            await connection.execute(
-                """INSERT INTO watch_runs(id, started_at_ms, canonical_json)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET canonical_json=excluded.canonical_json,
-                   started_at_ms=excluded.started_at_ms""",
-                (run_id, started_at_ms, canonical),
-            )
-            await connection.commit()
+            await connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = await connection.execute_fetchall(
+                    "SELECT canonical_json FROM watch_runs WHERE id = ?",
+                    (run_id,),
+                )
+                if rows:
+                    existing = json.loads(rows[0][0])
+                    if "metrics" in existing:
+                        canonical_data["metrics"] = existing["metrics"]
+                await connection.execute(
+                    """INSERT INTO watch_runs(id, started_at_ms, canonical_json)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                        canonical_json=excluded.canonical_json,
+                        started_at_ms=excluded.started_at_ms""",
+                    (run_id, started_at_ms, _json(canonical_data)),
+                )
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
         return run_id
 
     async def save_watch_event(self, record: Mapping[str, object]) -> str:
@@ -2580,16 +2562,42 @@ class OpportunityStore:
             metrics_map = metrics
         _identifier("run_id", run_id)
         _validate_opaque_json("metrics", metrics_map)
-        canonical = _json(dict(metrics_map))
         connection = self._require_connection()
         async with self._write_lock:
-            await connection.execute(
-                """INSERT INTO watch_metrics(id, started_at_ms, canonical_json)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET canonical_json=excluded.canonical_json""",
-                (run_id, started_at_ms, canonical),
-            )
-            await connection.commit()
+            await connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = await connection.execute_fetchall(
+                    """SELECT started_at_ms, canonical_json FROM watch_runs
+                       WHERE id = ?""",
+                    (run_id,),
+                )
+                if rows:
+                    stored_started_at_ms, stored_canonical = rows[0]
+                    base = json.loads(stored_canonical)
+                    write_started_at_ms = int(stored_started_at_ms)
+                else:
+                    base = {
+                        "run_id": run_id,
+                        "started_at_ms": started_at_ms,
+                        "finished_at_ms": None,
+                        "status": "UNKNOWN",
+                        "exit_reason": None,
+                        "params_json": {},
+                    }
+                    write_started_at_ms = started_at_ms
+                base["metrics"] = dict(metrics_map)
+                await connection.execute(
+                    """INSERT INTO watch_runs(id, started_at_ms, canonical_json)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                        started_at_ms=excluded.started_at_ms,
+                        canonical_json=excluded.canonical_json""",
+                    (run_id, write_started_at_ms, _json(base)),
+                )
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
 
     async def save_scan_run(self, record: Mapping[str, object]) -> str:
         data = dict(record)
@@ -2674,14 +2682,20 @@ class OpportunityStore:
     async def list_watch_metrics(self, *, limit: int = 100) -> list[dict[str, object]]:
         _query_limit(limit)
         rows = await self._require_connection().execute_fetchall(
-            """SELECT id, started_at_ms, canonical_json FROM watch_metrics
-               ORDER BY sequence DESC LIMIT ?""",
-            (limit,),
+            """SELECT id, started_at_ms, canonical_json FROM watch_runs
+               ORDER BY sequence DESC""",
         )
-        return [
-            {"id": str(run_id), "started_at_ms": int(started), **json.loads(canonical)}
-            for run_id, started, canonical in rows
-        ]
+        result = []
+        for run_id, started, canonical in rows:
+            data = json.loads(canonical)
+            if "metrics" not in data:
+                continue
+            result.append(
+                {"id": str(run_id), "started_at_ms": int(started), **data["metrics"]}
+            )
+            if len(result) == limit:
+                break
+        return result
 
     async def list_watch_runs(self, *, limit: int = 100) -> list[dict[str, object]]:
         _query_limit(limit)
@@ -2801,7 +2815,8 @@ class OpportunityStore:
         if after_bundle_id is not None:
             _identifier("after_bundle_id", after_bundle_id)
         rows = await self._require_connection().execute_fetchall(
-            """SELECT id, status, bundle_id FROM opportunities
+            """SELECT opportunity_id, opportunity_status, bundle_id
+               FROM evaluations
                WHERE (? IS NULL OR bundle_id > ?)
                ORDER BY bundle_id LIMIT ?""",
             (after_bundle_id, after_bundle_id, limit),
@@ -2818,14 +2833,12 @@ class OpportunityStore:
             raise ValueError("limit must be an integer in 1..10000")
         connection = self._require_connection()
         rows = await connection.execute_fetchall(
-            """SELECT o.bundle_id, o.status, o.payload, r.payload, b.canonical_json
-               FROM opportunities o
-               JOIN risk_assessments r
-                 ON r.bundle_id = o.bundle_id AND r.opportunity_id = o.id
-               JOIN evidence_bundles b ON b.id = o.bundle_id
-               JOIN runs run
-                 ON run.bundle_id = o.bundle_id AND run.id = o.run_id
-               ORDER BY run.started_at_ms DESC, o.rowid DESC LIMIT ?""",
+            """SELECT e.bundle_id, e.opportunity_status, e.opportunity_json,
+                      e.risk_json, b.canonical_json
+               FROM evaluations e
+               JOIN evidence_bundles b ON b.id = e.bundle_id
+               ORDER BY e.started_at_ms DESC, e.rowid DESC
+               LIMIT ?""",
             (limit + 1,),
         )
         truncated = len(rows) > limit
@@ -2938,6 +2951,8 @@ class OpportunityStore:
     async def list_runs(self, *, limit: int = 100) -> list[tuple[str, str]]:
         _query_limit(limit)
         rows = await self._require_connection().execute_fetchall(
-            "SELECT id, status FROM runs ORDER BY bundle_id LIMIT ?", (limit,)
+            """SELECT run_id, run_status FROM evaluations
+               ORDER BY bundle_id LIMIT ?""",
+            (limit,),
         )
         return [(str(row[0]), str(row[1])) for row in rows]

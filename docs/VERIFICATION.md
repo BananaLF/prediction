@@ -1,5 +1,38 @@
 # 验证记录
 
+## Schema v7 / Task 6 fresh 验证
+
+**日期：2026-07-29（Asia/Hong_Kong）**
+
+当前 SQLite schema 版本为 7，共 30 张项目表。Schema v6 及更旧数据库不迁移；程序会在修改前拒绝打开。升级时必须停止进程，删除旧数据库及匹配的 WAL/SHM，或把 `database_path` 指向一个新的空文件。
+
+本节只记录 Task 6 在 schema v7 工作树上的 fresh 输出，不沿用下方历史验证的通过数量。
+
+| 命令 | 本次实际结果 |
+|---|---|
+| `PYTHONPATH=. .venv/bin/python -m pytest tests/integration/test_cli.py::test_watch_command_offline_success_reconfirms_with_two_rest_books tests/integration/test_cli.py -k 'scan_once and replay and report' -v` | 最终树 fresh 输出：1 passed，30 deselected，0.18s；`-k` 会过滤显式列出的 watch 节点，本次实际选中 fresh DB 的 scan-once → replay(latest/exact) → report 链路 |
+| `PYTHONPATH=. .venv/bin/python -m pytest tests/integration/test_cli.py::test_watch_command_offline_success_reconfirms_with_two_rest_books tests/integration/test_cli.py::test_scan_once_replay_and_report_flow_through_main_json_on_fresh_database -q` | 2 passed，0.21s |
+| `PYTHONPATH=. .venv/bin/python -m pytest tests/unit/test_storage.py::test_schema_v7_has_exact_project_tables tests/unit/test_storage.py::test_schema_v6_is_rejected_without_mutation -v` | 2 passed，0.10s；fresh DB 精确为 30 张项目表，旧库在修改前拒绝 |
+| `PYTHONPATH=. .venv/bin/python -m pytest tests/integration/test_read_only_surface.py -q` | 4 passed，0.22s |
+| `PYTHONPATH=. .venv/bin/python -m pytest tests/integration/test_cli.py -k 'not retries_initial_connect' -q` | 29 passed，1 deselected，0.46s |
+| `PYTHONPATH=. .venv/bin/python -m pytest tests/unit/test_storage.py -q` | 82 passed，0.46s |
+| `PYTHONPATH=. .venv/bin/python -m pytest tests/integration/test_read_only_surface.py tests/integration/test_cli.py tests/unit/test_storage.py -k 'not retries_initial_connect' -q` | 最终 fresh 有界轮次：115 passed，1 deselected，0.84s |
+| `rg -n 'schema (版本为 )?[0-6]\|schema version [0-6]\|39 张' README.md docs predmarket tests` | 命中仅位于 schema 精简历史设计/计划、下方 schema 6 历史验证记录，以及旧库拒绝测试 |
+| `git diff --check` | exit 0，无输出 |
+
+fresh DB 跨命令测试还直接断言了：
+
+- `scan-once` 至少评估一个结果，`report.total >= 1`；
+- opportunity ID 与最新 replay 一致，bundle ID 与 latest/exact replay 一致；
+- `PRAGMA integrity_check` 返回 `ok`；
+- `PRAGMA foreign_key_check` 返回空结果。
+
+原计划的三文件合并命令未记录为通过：`test_watch_command_retries_initial_connect_and_persists_metrics` 给后台 reconciliation 注入了不会让出事件循环的 `no_sleep`，会形成无界紧循环。本轮按有界方式分别执行其余 CLI、只读边界和存储测试，没有伪造合并套件数量。
+
+环境补充：worktree 初始 `.venv` 缺少 `predmarket` distribution metadata；本地 editable install 也会因 setuptools flat-layout 同时发现 `rules`、`config`、`predmarket` 而失败。本次只在已忽略的 `.venv` 内补齐与 `pyproject.toml` 一致的 `0.2.0` metadata 以执行只读边界测试，没有修改打包配置。
+
+## 历史验证：schema v6 / Task 13
+
 **日期：2026-07-26（Asia/Hong_Kong）**
 
 ## 被验证版本

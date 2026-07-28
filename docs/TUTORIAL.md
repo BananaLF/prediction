@@ -74,6 +74,8 @@ database_path: data/predmarket.sqlite3
 database_path: data/tutorial.sqlite3
 ```
 
+当前 SQLite schema 版本为 7，共 30 张项目表。新用户无需手工建表：首次运行使用不存在或为空的 `database_path` 时，程序会自动初始化 schema。Schema v6 及更旧数据库不迁移；程序会在修改前拒绝打开。升级时必须停止进程，删除旧数据库及匹配的 WAL/SHM，或把 `database_path` 指向一个新的空文件。
+
 后续所有命令都应使用同一个 `--config config/local.yaml`，否则可能读写不同数据库。
 
 ## 4. 同步一个小型市场目录
@@ -305,7 +307,7 @@ cp rules/example-implication.yaml /tmp/reviewed-relation.yaml
 
 ### 如何清空数据重来
 
-不要在程序运行时直接删除数据库或 WAL。更安全的做法是复制配置，把 `database_path` 改到一个新的明确文件，然后用新配置开始；旧证据仍可通过旧配置读取。
+不要在程序运行时直接删除数据库或 WAL。先停止所有使用该库的进程。更安全的做法是复制配置，把 `database_path` 改到一个新的明确空文件，然后用新配置开始；如果确认不再保留旧库，也必须把主数据库及匹配的 `-wal`、`-shm` 一并移出使用路径。Schema v6 及更旧数据库不能由当前程序读取。
 
 ## 11. 下一步
 

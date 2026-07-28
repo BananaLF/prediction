@@ -209,6 +209,28 @@ async def test_empty_report_has_defined_quantiles_and_bounds(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_catalog_diagnostics_round_trip_inside_snapshot_json(tmp_path):
+    snapshot = {
+        "fetched_at_ms": 10,
+        "complete": True,
+        "provenance": "exhausted",
+        "markets": [],
+        "diagnostics": [{"reason": "bad-market", "position": 0}],
+        "relation_candidates": [],
+    }
+    async with OpportunityStore(tmp_path / "catalog.sqlite3") as store:
+        snapshot_id = await store.save_catalog_snapshot(snapshot)
+        replayed = await store.list_catalog_snapshots(limit=1)
+        tables = await store._connection.execute_fetchall(
+            """SELECT name FROM sqlite_schema
+               WHERE type='table' AND name='catalog_diagnostics'"""
+        )
+    assert replayed[0]["id"] == snapshot_id
+    assert replayed[0]["diagnostics"] == snapshot["diagnostics"]
+    assert tables == []
+
+
+@pytest.mark.asyncio
 async def test_catalog_snapshot_is_idempotent_and_survives_reopen(tmp_path):
     path = tmp_path / "catalog.sqlite3"
     snapshot = {
@@ -370,179 +392,6 @@ async def test_delayed_seen_cannot_override_newer_missing_state(tmp_path):
     assert current["state_updated_at_ms"] == 20
     assert current["active"] is False
     assert current["tradeable"] is False
-
-
-@pytest.mark.asyncio
-async def test_v3_migration_backfills_missing_from_complete_sync_watermark(tmp_path):
-    path = tmp_path / "v3.sqlite3"
-    connection = sqlite3.connect(path)
-    connection.executescript("""
-        PRAGMA user_version=3;
-        CREATE TABLE catalog_sync_runs (
-          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-          snapshot_id TEXT NOT NULL,
-          fetched_at_ms INTEGER NOT NULL,
-          complete INTEGER NOT NULL,
-          provenance TEXT NOT NULL
-        );
-        CREATE TABLE current_catalog_markets (
-          market_id TEXT PRIMARY KEY, condition_id TEXT NOT NULL,
-          last_seen_snapshot TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
-          presence TEXT NOT NULL, active INTEGER, closed INTEGER,
-          tradeable INTEGER NOT NULL, canonical_json TEXT NOT NULL
-        );
-        CREATE TABLE current_catalog_tokens (
-          token_id TEXT PRIMARY KEY, market_id TEXT NOT NULL,
-          last_seen_snapshot TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
-          presence TEXT NOT NULL, canonical_json TEXT NOT NULL
-        );
-        CREATE TABLE current_catalog_events (
-          event_id TEXT PRIMARY KEY, last_seen_snapshot TEXT NOT NULL,
-          fetched_at_ms INTEGER NOT NULL, presence TEXT NOT NULL,
-          canonical_json TEXT NOT NULL
-        );
-        INSERT INTO catalog_sync_runs
-          (snapshot_id,fetched_at_ms,complete,provenance)
-          VALUES ('seen10',10,1,'exhausted'),('empty20',20,1,'exhausted');
-        INSERT INTO current_catalog_markets VALUES
-          ('a','ca','seen10',10,'MISSING',0,0,0,'{}'),
-          ('b','cb','seen12',12,'SEEN',1,0,1,'{}');
-    """)
-    connection.commit()
-    connection.close()
-
-    delayed = {
-        "fetched_at_ms": 15, "complete": False, "provenance": "delayed",
-        "markets": [{
-            "id": "a", "condition_id": "ca", "event_ids": [],
-            "tokens": [{"id": "ta", "outcome": "YES"}],
-            "active": True, "closed": False, "tradeable": True,
-        }],
-        "diagnostics": [],
-    }
-    async with OpportunityStore(path) as store:
-        migrated = {
-            row["market_id"]: row
-            for row in await store.list_current_catalog_markets(limit=10)
-        }
-        assert migrated["a"]["last_seen_at_ms"] == 10
-        assert migrated["a"]["state_updated_at_ms"] == 20
-        assert migrated["b"]["state_updated_at_ms"] == 12
-        await store.save_catalog_snapshot(delayed)
-        after = {
-            row["market_id"]: row
-            for row in await store.list_current_catalog_markets(limit=10)
-        }
-    assert after["a"]["presence"] == "MISSING"
-    assert after["a"]["last_seen_at_ms"] == 10
-    assert after["a"]["state_updated_at_ms"] == 20
-
-
-@pytest.mark.asyncio
-async def test_v3_missing_without_sync_history_migrates_fail_closed(tmp_path):
-    path = tmp_path / "v3-no-history.sqlite3"
-    connection = sqlite3.connect(path)
-    connection.executescript("""
-        PRAGMA user_version=3;
-        CREATE TABLE catalog_sync_runs (
-          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-          snapshot_id TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
-          complete INTEGER NOT NULL, provenance TEXT NOT NULL
-        );
-        CREATE TABLE current_catalog_markets (
-          market_id TEXT PRIMARY KEY, condition_id TEXT NOT NULL,
-          last_seen_snapshot TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
-          presence TEXT NOT NULL, active INTEGER, closed INTEGER,
-          tradeable INTEGER NOT NULL, canonical_json TEXT NOT NULL
-        );
-        CREATE TABLE current_catalog_tokens (
-          token_id TEXT PRIMARY KEY, market_id TEXT NOT NULL,
-          last_seen_snapshot TEXT NOT NULL, fetched_at_ms INTEGER NOT NULL,
-          presence TEXT NOT NULL, canonical_json TEXT NOT NULL
-        );
-        CREATE TABLE current_catalog_events (
-          event_id TEXT PRIMARY KEY, last_seen_snapshot TEXT NOT NULL,
-          fetched_at_ms INTEGER NOT NULL, presence TEXT NOT NULL,
-          canonical_json TEXT NOT NULL
-        );
-        INSERT INTO current_catalog_markets VALUES
-          ('a','ca','unknown',10,'MISSING',0,0,0,'{}'),
-          ('b','cb','unknown',10,'MISSING',0,0,0,'{}');
-    """)
-    connection.commit()
-    connection.close()
-    async with OpportunityStore(path) as store:
-        rows = await store.list_current_catalog_markets(limit=10)
-        assert rows[0]["last_seen_at_ms"] == 10
-        assert rows[0]["state_updated_at_ms"] == 9223372036854775807
-        partial_a = {
-            "fetched_at_ms": 15, "complete": False,
-            "provenance": "partial",
-            "markets": [{
-                "id": "a", "condition_id": "ca", "event_ids": [],
-                "tokens": [{"id": "ta", "outcome": "YES"}],
-                "active": True, "closed": False, "tradeable": True,
-            }],
-            "diagnostics": [],
-        }
-        await store.save_catalog_snapshot(partial_a)
-        still_missing = {
-            row["market_id"]: row
-            for row in await store.list_current_catalog_markets(limit=10)
-        }
-        assert still_missing["a"]["presence"] == "MISSING"
-        assert still_missing["a"]["state_updated_at_ms"] == 9223372036854775807
-
-        await store.save_catalog_snapshot({
-            **partial_a, "fetched_at_ms": 20, "complete": True,
-            "provenance": "pagination_exhausted",
-        })
-    async with OpportunityStore(path) as store:
-        reconciled = {
-            row["market_id"]: row
-            for row in await store.list_current_catalog_markets(limit=10)
-        }
-        assert reconciled["a"]["presence"] == "SEEN"
-        assert reconciled["a"]["last_seen_at_ms"] == 20
-        assert reconciled["a"]["state_updated_at_ms"] == 20
-        assert reconciled["b"]["presence"] == "MISSING"
-        assert reconciled["b"]["last_seen_at_ms"] == 10
-        assert reconciled["b"]["state_updated_at_ms"] == 20
-
-        await store.save_catalog_snapshot({
-            "fetched_at_ms": 19, "complete": False,
-            "provenance": "delayed_partial",
-            "markets": [{
-                "id": "b", "condition_id": "cb", "event_ids": [],
-                "tokens": [{"id": "tb", "outcome": "YES"}],
-                "active": True, "closed": False, "tradeable": True,
-            }],
-            "diagnostics": [],
-        })
-        after_delayed = {
-            row["market_id"]: row
-            for row in await store.list_current_catalog_markets(limit=10)
-        }
-        await store.save_catalog_snapshot({
-            "fetched_at_ms": 21, "complete": False,
-            "provenance": "newer_partial",
-            "markets": [{
-                "id": "a", "condition_id": "ca", "event_ids": [],
-                "tokens": [{"id": "ta", "outcome": "YES"}],
-                "active": False, "closed": True, "tradeable": False,
-            }],
-            "diagnostics": [],
-        })
-        normal = {
-            row["market_id"]: row
-            for row in await store.list_current_catalog_markets(limit=10)
-        }
-    assert after_delayed["b"]["presence"] == "MISSING"
-    assert after_delayed["b"]["state_updated_at_ms"] == 20
-    assert normal["a"]["presence"] == "SEEN"
-    assert normal["a"]["last_seen_at_ms"] == 21
-    assert normal["a"]["state_updated_at_ms"] == 21
-    assert normal["a"]["closed"] is True
 
 
 @pytest.mark.asyncio
@@ -991,13 +840,14 @@ async def test_relation_commands_flow_through_parser_and_dispatch(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_targeted_scan_replay_and_report_flow_through_main_json(
+async def test_scan_once_replay_and_report_flow_through_main_json_on_fresh_database(
     tmp_path, monkeypatch, capsys
 ):
+    database_path = tmp_path / "flow.sqlite3"
     config = tmp_path / "config.yaml"
     config.write_text(
         Path("config/default.yaml").read_text(encoding="utf-8").replace(
-            "data/predmarket.sqlite3", str(tmp_path / "flow.sqlite3")
+            "data/predmarket.sqlite3", str(database_path)
         ),
         encoding="utf-8",
     )
@@ -1050,25 +900,41 @@ async def test_targeted_scan_replay_and_report_flow_through_main_json(
         "--no-token", "no", "--rules-dir", str(tmp_path / "rules"),
     ])
     scan_output = await bound(scan_args)
+    assert scan_output["evaluated"] >= 1
     assert scan_output["results"][0]["status"] == "RESEARCH_CANDIDATE"
-    async with OpportunityStore(tmp_path / "flow.sqlite3") as store:
+    async with OpportunityStore(database_path) as store:
         runs = await store.list_scan_runs(limit=10)
         candidates = await store.list_scan_candidates(limit=10)
     assert runs[0]["status"] == "SUCCEEDED"
     assert candidates[0]["status"] == "RESEARCH_CANDIDATE"
 
-    replay_output = await bound(build_parser().parse_args([
-        "--config", str(config), "--json", "replay", "opp:condition",
+    opportunity_id = scan_output["results"][0]["opportunity_id"]
+    bundle_id = scan_output["results"][0]["evidence_id"]
+    latest = await bound(build_parser().parse_args([
+        "--config", str(config), "--json", "replay", opportunity_id,
     ]))
-    assert replay_output["core_evidence"]["opportunity"]["id"] == "opp:condition"
-    assert "notification_audit" in replay_output
+    exact = await bound(build_parser().parse_args([
+        "--config", str(config), "--json", "replay", "--bundle-id", bundle_id,
+    ]))
+    assert latest["core_evidence"]["id"] == bundle_id
+    assert exact["core_evidence"]["id"] == bundle_id
+    assert latest["core_evidence"]["opportunity"]["id"] == opportunity_id
+    assert "notification_audit" in latest
 
     report_output = await bound(build_parser().parse_args([
         "--config", str(config), "--json", "report", "--limit", "10",
     ]))
+    assert report_output["total"] >= 1
     assert report_output["by_status"]["RESEARCH_CANDIDATE"] == 1
     assert report_output["by_path"]["IMMEDIATE_CONVERSION"] == 1
     assert report_output["by_pipeline_reason"]["release_date_unknown"] == 1
+
+    connection = sqlite3.connect(database_path)
+    try:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
 
 
 def test_catalog_scan_command_continues_provider_failure_and_outputs_json(

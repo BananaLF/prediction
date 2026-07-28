@@ -1,3 +1,5 @@
+import asyncio
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 import json
 from pathlib import Path
 
@@ -61,6 +63,138 @@ async def test_keyset_pagination_preserves_cursor_and_normalizes_binary_tokens()
     assert dict(requests[0].url.params) == {"limit": "100", "closed": "false"}
     assert requests[1].url.params["after_cursor"] == "next/+=="
     assert not any(k.lower() in {"authorization", "x-api-key", "poly-signature"} for k in requests[0].headers)
+
+
+@pytest.mark.asyncio
+async def test_response_cookies_are_cleared_before_the_next_public_request():
+    requests = []
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        headers = {"Set-Cookie": "session=upstream; Path=/"} if len(requests) == 1 else {}
+        return httpx.Response(
+            200,
+            headers=headers,
+            json={"markets": [], "next_cursor": ""},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = GammaClient(http, "https://gamma-api.polymarket.com")
+        await client.active_markets()
+        assert len(http.cookies) == 0
+        await client.active_markets()
+
+    assert len(requests) == 2
+    assert "cookie" not in requests[1].headers
+
+
+@pytest.mark.asyncio
+async def test_rejected_response_cookie_policy_does_not_break_success():
+    class RejectAll(DefaultCookiePolicy):
+        def set_ok(self, cookie, request):
+            return False
+
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(
+            200,
+            headers={"Set-Cookie": "session=upstream; Path=/"},
+            json={"markets": [], "next_cursor": ""},
+        )
+    )
+    cookie_jar = CookieJar(policy=RejectAll())
+    async with httpx.AsyncClient(transport=transport, cookies=cookie_jar) as http:
+        result = await GammaClient(
+            http, "https://gamma-api.polymarket.com"
+        ).active_markets()
+
+        assert len(http.cookies) == 0
+
+    assert result.markets == ()
+
+
+@pytest.mark.asyncio
+async def test_midflight_caller_cookie_is_preserved_when_response_sets_none():
+    request_started = asyncio.Event()
+    release_response = asyncio.Event()
+    requests = []
+
+    async def handler(request: httpx.Request):
+        requests.append(request)
+        request_started.set()
+        await release_response.wait()
+        return httpx.Response(200, json={"markets": [], "next_cursor": ""})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = GammaClient(http, "https://gamma-api.polymarket.com")
+        request_task = asyncio.create_task(client.active_markets())
+        await request_started.wait()
+        http.cookies.set("caller", "secret")
+        release_response.set()
+        result = await request_task
+
+        assert http.cookies.get("caller") == "secret"
+
+    assert result.markets == ()
+    assert len(requests) == 1
+    assert "cookie" not in requests[0].headers
+
+
+@pytest.mark.asyncio
+async def test_redirect_response_cookie_is_not_followed_or_sent():
+    requests = []
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                302,
+                headers={
+                    "Location": "/redirected",
+                    "Set-Cookie": "session=upstream; Path=/",
+                },
+            )
+        return httpx.Response(200, json={"markets": [], "next_cursor": ""})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=True
+    ) as http:
+        with pytest.raises(AdapterHTTPError):
+            await GammaClient(http, "https://gamma-api.polymarket.com").active_markets()
+        assert len(http.cookies) == 0
+
+    assert len(requests) == 1
+    assert "cookie" not in requests[0].headers
+
+
+@pytest.mark.asyncio
+async def test_read_error_clears_response_cookie_and_client_remains_usable():
+    requests = []
+
+    class ReadErrorStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise httpx.ReadError("body read failed")
+            yield b""
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                headers={"Set-Cookie": "session=upstream; Path=/"},
+                stream=ReadErrorStream(),
+            )
+        return httpx.Response(200, json={"markets": [], "next_cursor": ""})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = GammaClient(http, "https://gamma-api.polymarket.com")
+        with pytest.raises(AdapterTransportError):
+            await client.active_markets()
+        assert len(http.cookies) == 0
+        result = await client.active_markets()
+
+    assert result.markets == ()
+    assert len(requests) == 2
+    assert "cookie" not in requests[1].headers
 
 
 @pytest.mark.asyncio

@@ -68,9 +68,22 @@ def _reject_credential_headers(http: httpx.AsyncClient) -> None:
         )
 
 
-def _clear_public_cookie_jar(http: httpx.AsyncClient) -> None:
-    if len(http.cookies):
-        http.cookies.clear()
+def _clear_response_cookies(
+    http: httpx.AsyncClient, response: httpx.Response
+) -> None:
+    client_cookie_keys = {
+        (cookie.name, cookie.domain, cookie.path)
+        for cookie in http.cookies.jar
+    }
+    for cookie in response.cookies.jar:
+        key = (cookie.name, cookie.domain, cookie.path)
+        if key not in client_cookie_keys:
+            continue
+        http.cookies.delete(
+            cookie.name,
+            domain=cookie.domain,
+            path=cookie.path,
+        )
 
 
 def _required_string(raw: dict[str, Any], key: str) -> str:
@@ -331,13 +344,19 @@ class GammaClient:
     async def _get_page(self, *, limit: int, cursor: str | None) -> dict[str, Any]:
         if self._closed:
             raise RuntimeError("client is closed")
-        _clear_public_cookie_jar(self.http)
         _reject_credential_headers(self.http)
         params: dict[str, str | int] = {"limit": limit, "closed": "false"}
         if cursor is not None:
             params["after_cursor"] = cursor
         try:
-            response = await self.http.get(f"{self.base_url}/markets/keyset", params=params)
+            async with self.http.stream(
+                "GET",
+                f"{self.base_url}/markets/keyset",
+                params=params,
+                follow_redirects=False,
+            ) as response:
+                _clear_response_cookies(self.http, response)
+                await response.aread()
         except httpx.HTTPError as exc:
             raise AdapterTransportError("Gamma request failed") from exc
         if not 200 <= response.status_code < 300:

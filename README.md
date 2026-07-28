@@ -74,6 +74,8 @@ flowchart LR
 - SQLite 是唯一的本地事实源；
 - 所有关键结果都要保留证据链，不能只看 stdout。
 
+当前 SQLite schema 版本为 7，共 30 张项目表。Schema v6 及更旧数据库不迁移；程序会在修改前拒绝打开。升级时必须停止进程，删除旧数据库及匹配的 WAL/SHM，或把 `database_path` 指向一个新的空文件。需要保留旧证据时，优先使用新路径，不要删除旧文件；完整替换步骤见 [运维手册](docs/OPERATIONS.md)。
+
 ## 目录索引
 
 | 文档 | 适合什么时候看 |
@@ -99,4 +101,3 @@ flowchart LR
 - 只想执行：看 [最简命令速查表](docs/QUICK-CHEAT-SHEET.md)
 - 想从头学：看 [从零开始教程](docs/TUTORIAL.md)
 - 想理解设计：看 [项目说明](docs/PROJECT-GUIDE.md)
-
