@@ -1,3 +1,5 @@
 from predmarket.cli import main
 
-raise SystemExit(main())
+
+if __name__ == "__main__":
+    main()
