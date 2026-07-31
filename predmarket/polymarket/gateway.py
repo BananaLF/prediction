@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+import importlib.metadata
 import time
 from typing import Any
 
 from polymarket import AsyncPublicClient
+from polymarket._internal.streams.handle import AsyncSubscriptionHandle
+from polymarket.models.clob.market_events import (
+    parse_market_event as _parse_pinned_market_event,
+)
 from polymarket.streams import MarketSpec
 
 from predmarket.domain.decimal import encode_decimal
@@ -21,10 +28,52 @@ from predmarket.domain.orderbook import OrderBook, OrderBookLevel
 
 
 MAPPING_VERSION = "polymarket-client-0.3.0b1:v1"
+PINNED_SDK_VERSION = "0.3.0b1"
 
 
 class GatewayMappingError(ValueError):
     """The SDK returned an entity that cannot satisfy the domain contract."""
+
+
+class GatewayLifecycleError(RuntimeError):
+    """The pinned SDK lifecycle contract is absent or has changed."""
+
+
+async def probe_pinned_sdk_lifecycle_shape() -> Mapping[str, Any]:
+    """Validate the minimum private SDK shape used for fail-closed streaming."""
+    version = importlib.metadata.version("polymarket-client")
+    if version != PINNED_SDK_VERSION:
+        raise GatewayLifecycleError(
+            f"unsupported polymarket-client version: {version}"
+        )
+    client = AsyncPublicClient()
+    try:
+        if "_market_manager" not in vars(client):
+            raise GatewayLifecycleError("SDK client has no _market_manager attribute")
+        manager = client._get_market_manager()
+        if "_connection" not in vars(manager):
+            raise GatewayLifecycleError(
+                "SDK market manager has no _connection attribute"
+            )
+        connection = manager._connection
+        if "_socket" not in vars(connection):
+            raise GatewayLifecycleError("SDK connection has no _socket attribute")
+        handle: AsyncSubscriptionHandle[Any] = AsyncSubscriptionHandle(queue_size=1)
+        return {
+            "version": version,
+            "client_manager_attribute": "_market_manager",
+            "manager_connection_attribute": "_connection",
+            "connection_socket_attribute": "_socket",
+            "manager_open_property": "is_open",
+            "manager_dropped_property": "dropped_events",
+            "handle_dropped_property": "dropped",
+            "initial_manager_open": manager.is_open,
+            "initial_socket_is_none": connection._socket is None,
+            "initial_manager_dropped": manager.dropped_events,
+            "initial_handle_dropped": handle.dropped,
+        }
+    finally:
+        await client.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +109,10 @@ class MarketStreamEvent:
         _require_string(self.market_id, "stream market id")
         if type(self.received_timestamp) is not int or self.received_timestamp < 0:
             raise ValueError("received_timestamp must be a non-negative integer")
-        if type(self.subscription_generation) is not int or self.subscription_generation < 1:
+        if (
+            type(self.subscription_generation) is not int
+            or self.subscription_generation < 1
+        ):
             raise ValueError("subscription_generation must be at least one")
         _require_string(self.mapping_version, "mapping_version")
         object.__setattr__(
@@ -70,30 +122,267 @@ class MarketStreamEvent:
         )
 
 
-class MarketSubscription(AsyncIterator[MarketStreamEvent]):
+class _InvalidReason(str, Enum):
+    CONNECTION_LOST = "connection_lost"
+    CONNECTION_REPLACED = "connection_replaced"
+    SDK_EVENT_DROPPED = "sdk_event_dropped"
+    SUBSCRIPTION_EVENT_DROPPED = "subscription_event_dropped"
+    SDK_LIFECYCLE_SHAPE_CHANGED = "sdk_lifecycle_shape_changed"
+    SDK_LIFECYCLE_STATE_UNKNOWN = "sdk_lifecycle_state_unknown"
+    SDK_VERSION_CHANGED = "sdk_version_changed"
+    SDK_HANDLE_ENDED = "sdk_handle_ended"
+    SDK_EVENT_INVALID = "sdk_event_invalid"
+
+
+@dataclass(frozen=True, slots=True)
+class MarketStreamInvalidated:
+    reason: str
+    token_ids: tuple[str, ...]
+    received_timestamp: int
+    subscription_generation: int
+    mapping_version: str
+
+    def __post_init__(self) -> None:
+        if self.reason not in {reason.value for reason in _InvalidReason}:
+            raise ValueError("unknown stream invalidation reason")
+        object.__setattr__(self, "token_ids", _token_ids(self.token_ids))
+        if type(self.received_timestamp) is not int or self.received_timestamp < 0:
+            raise ValueError("received_timestamp must be a non-negative integer")
+        if (
+            type(self.subscription_generation) is not int
+            or self.subscription_generation < 1
+        ):
+            raise ValueError("subscription_generation must be at least one")
+        _require_string(self.mapping_version, "mapping_version")
+
+
+@dataclass(slots=True)
+class _SdkLifecycleProbe:
+    client: Any
+    handle: Any
+    manager: Any
+    connection: Any
+    socket: Any
+    manager_dropped: int
+    handle_dropped: int
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        client: Any,
+        handle: Any,
+    ) -> tuple["_SdkLifecycleProbe | None", _InvalidReason | None]:
+        if importlib.metadata.version("polymarket-client") != PINNED_SDK_VERSION:
+            return None, _InvalidReason.SDK_VERSION_CHANGED
+        try:
+            manager = vars(client)["_market_manager"]
+            connection = vars(manager)["_connection"]
+            socket = vars(connection)["_socket"]
+            manager_open = manager.is_open
+            manager_dropped = manager.dropped_events
+            handle_dropped = handle.dropped
+        except (AttributeError, KeyError, TypeError):
+            return None, _InvalidReason.SDK_LIFECYCLE_SHAPE_CHANGED
+        if (
+            type(manager_open) is not bool
+            or type(manager_dropped) is not int
+            or manager_dropped < 0
+            or type(handle_dropped) is not int
+            or handle_dropped < 0
+        ):
+            return None, _InvalidReason.SDK_LIFECYCLE_STATE_UNKNOWN
+        if not manager_open or socket is None:
+            return None, _InvalidReason.CONNECTION_LOST
+        return (
+            cls(
+                client=client,
+                handle=handle,
+                manager=manager,
+                connection=connection,
+                socket=socket,
+                manager_dropped=manager_dropped,
+                handle_dropped=handle_dropped,
+            ),
+            None,
+        )
+
+    def check(self) -> _InvalidReason | None:
+        if importlib.metadata.version("polymarket-client") != PINNED_SDK_VERSION:
+            return _InvalidReason.SDK_VERSION_CHANGED
+        try:
+            manager = vars(self.client)["_market_manager"]
+            connection = vars(manager)["_connection"]
+            socket = vars(connection)["_socket"]
+            manager_open = manager.is_open
+            manager_dropped = manager.dropped_events
+            handle_dropped = self.handle.dropped
+        except (AttributeError, KeyError, TypeError):
+            return _InvalidReason.SDK_LIFECYCLE_SHAPE_CHANGED
+        if manager is not self.manager or connection is not self.connection:
+            return _InvalidReason.SDK_LIFECYCLE_SHAPE_CHANGED
+        if (
+            type(manager_open) is not bool
+            or type(manager_dropped) is not int
+            or manager_dropped < self.manager_dropped
+            or type(handle_dropped) is not int
+            or handle_dropped < self.handle_dropped
+        ):
+            return _InvalidReason.SDK_LIFECYCLE_STATE_UNKNOWN
+        if manager_dropped > self.manager_dropped:
+            return _InvalidReason.SDK_EVENT_DROPPED
+        if handle_dropped > self.handle_dropped:
+            return _InvalidReason.SUBSCRIPTION_EVENT_DROPPED
+        if not manager_open or socket is None:
+            return _InvalidReason.CONNECTION_LOST
+        if socket is not self.socket:
+            return _InvalidReason.CONNECTION_REPLACED
+        return None
+
+
+class MarketSubscription(
+    AsyncIterator[MarketStreamEvent | MarketStreamInvalidated]
+):
     def __init__(
         self,
         handle: Any,
         *,
-        mapper: Callable[[Any], MarketStreamEvent],
+        mapper: Callable[[Any], MarketStreamEvent | None],
+        lifecycle_probe: _SdkLifecycleProbe | None,
+        initial_invalid_reason: _InvalidReason | None,
+        token_ids: tuple[str, ...],
+        subscription_generation: int,
+        clock_ms: Callable[[], int],
+        lifecycle_poll_interval: float,
     ) -> None:
         self._handle = handle
         self._iterator = handle.__aiter__()
         self._mapper = mapper
+        self._lifecycle_probe = lifecycle_probe
+        self._initial_invalid_reason = initial_invalid_reason
+        self._token_ids = token_ids
+        self._subscription_generation = subscription_generation
+        self._clock_ms = clock_ms
+        self._lifecycle_poll_interval = lifecycle_poll_interval
         self._closed = False
+        self._terminal = False
 
     def __aiter__(self) -> "MarketSubscription":
         return self
 
-    async def __anext__(self) -> MarketStreamEvent:
-        if self._closed:
+    @property
+    def subscription_generation(self) -> int:
+        return self._subscription_generation
+
+    async def __anext__(self) -> MarketStreamEvent | MarketStreamInvalidated:
+        if self._closed or self._terminal:
             raise StopAsyncIteration
-        return self._mapper(await self._iterator.__anext__())
+        if self._initial_invalid_reason is not None:
+            reason = self._initial_invalid_reason
+            self._initial_invalid_reason = None
+            return await self._invalidate(reason)
+
+        while True:
+            assert self._lifecycle_probe is not None
+            reason = self._lifecycle_probe.check()
+            if reason is not None:
+                return await self._invalidate(reason)
+
+            event_task = asyncio.create_task(self._iterator.__anext__())
+            lifecycle_task = asyncio.create_task(self._wait_for_invalidation())
+            try:
+                done, _pending = await asyncio.wait(
+                    (event_task, lifecycle_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except BaseException:
+                event_task.cancel()
+                lifecycle_task.cancel()
+                await asyncio.gather(
+                    event_task,
+                    lifecycle_task,
+                    return_exceptions=True,
+                )
+                raise
+            if lifecycle_task in done:
+                event_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await event_task
+                return await self._invalidate(lifecycle_task.result())
+
+            lifecycle_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await lifecycle_task
+            try:
+                sdk_event = event_task.result()
+            except StopAsyncIteration:
+                return await self._invalidate(_InvalidReason.SDK_HANDLE_ENDED)
+
+            reason = self._lifecycle_probe.check()
+            if reason is not None:
+                return await self._invalidate(reason)
+            try:
+                mapped = self._mapper(sdk_event)
+            except GatewayMappingError:
+                return await self._invalidate(_InvalidReason.SDK_EVENT_INVALID)
+            if mapped is not None:
+                return mapped
 
     async def close(self) -> None:
         if not self._closed:
             self._closed = True
+            self._terminal = True
             await self._handle.close()
+
+    async def _wait_for_invalidation(self) -> _InvalidReason:
+        assert self._lifecycle_probe is not None
+        while True:
+            await asyncio.sleep(self._lifecycle_poll_interval)
+            reason = self._lifecycle_probe.check()
+            if reason is not None:
+                return reason
+
+    async def _invalidate(
+        self,
+        reason: _InvalidReason,
+    ) -> MarketStreamInvalidated:
+        self._closed = True
+        self._terminal = True
+        await self._handle.close()
+        return MarketStreamInvalidated(
+            reason=reason.value,
+            token_ids=self._token_ids,
+            received_timestamp=self._clock_ms(),
+            subscription_generation=self._subscription_generation,
+            mapping_version=MAPPING_VERSION,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MarketRecoverySession:
+    order_books: tuple[OrderBook, ...]
+    subscription: MarketSubscription
+    subscription_generation: int
+
+    def __post_init__(self) -> None:
+        books = tuple(self.order_books)
+        if not books or any(not isinstance(book, OrderBook) for book in books):
+            raise ValueError("order_books must contain OrderBook values")
+        if not isinstance(self.subscription, MarketSubscription):
+            raise ValueError("subscription must be a MarketSubscription")
+        if (
+            type(self.subscription_generation) is not int
+            or self.subscription_generation < 1
+        ):
+            raise ValueError("subscription_generation must be at least one")
+        if any(
+            book.subscription_generation != self.subscription_generation
+            for book in books
+        ):
+            raise ValueError("order books must share the session generation")
+        if self.subscription.subscription_generation != self.subscription_generation:
+            raise ValueError("subscription must share the session generation")
+        object.__setattr__(self, "order_books", books)
 
 
 class PolymarketGateway:
@@ -103,16 +392,27 @@ class PolymarketGateway:
         *,
         clock_ms: Callable[[], int] | None = None,
         page_size: int = 100,
+        lifecycle_poll_interval: float = 0.01,
     ) -> None:
         if type(page_size) is not int or page_size < 1:
             raise ValueError("page_size must be a positive integer")
+        if (
+            isinstance(lifecycle_poll_interval, bool)
+            or not isinstance(lifecycle_poll_interval, (int, float))
+            or lifecycle_poll_interval <= 0
+        ):
+            raise ValueError("lifecycle_poll_interval must be positive")
         self._client = client if client is not None else AsyncPublicClient()
         self._clock_ms = clock_ms or _system_clock_ms
         self._page_size = page_size
+        self._lifecycle_poll_interval = float(lifecycle_poll_interval)
         self._sync_counter = 0
         self._sync_generation: str | None = None
         self._subscription_generation = 0
         self._market_id_by_condition_id: dict[str, str] = {}
+        self._condition_id_by_market_id: dict[str, str] = {}
+        self._token_identity_by_id: dict[str, tuple[str, str]] = {}
+        self._token_ids_by_market_id: dict[str, frozenset[str]] = {}
         self._closed = False
 
     async def list_active_events(self) -> tuple[Event, ...]:
@@ -143,25 +443,66 @@ class PolymarketGateway:
                     received_at=received_at,
                     sync_generation=generation,
                 )
-                if snapshot.market.active:
-                    self._remember_market(snapshot.market)
+                if (
+                    snapshot.market.status is MarketStatus.ACTIVE
+                    and snapshot.market.active
+                ):
+                    self._remember_market(snapshot)
                     snapshots.append(snapshot)
         return tuple(snapshots)
 
     async def get_order_books(self, token_ids: Sequence[str]) -> tuple[OrderBook, ...]:
         requested = _token_ids(token_ids)
+        generation = max(1, self._subscription_generation)
+        return await self._get_order_books_for_generation(
+            requested,
+            subscription_generation=generation,
+        )
+
+    async def recover_market_session(
+        self,
+        token_ids: Sequence[str],
+    ) -> MarketRecoverySession:
+        normalized = _token_ids(token_ids)
+        self._subscription_generation += 1
+        generation = self._subscription_generation
+        subscription = await self._subscribe_markets_for_generation(
+            normalized,
+            subscription_generation=generation,
+        )
+        try:
+            books = await self._get_order_books_for_generation(
+                normalized,
+                subscription_generation=generation,
+            )
+        except BaseException:
+            await subscription.close()
+            raise
+        return MarketRecoverySession(
+            order_books=books,
+            subscription=subscription,
+            subscription_generation=generation,
+        )
+
+    async def _get_order_books_for_generation(
+        self,
+        requested: tuple[str, ...],
+        *,
+        subscription_generation: int,
+    ) -> tuple[OrderBook, ...]:
         received_at = self._now()
         sdk_books = await self._client.get_order_books(token_ids=requested)
-        generation = max(1, self._subscription_generation)
         mapped: dict[str, OrderBook] = {}
         for sdk_book in sdk_books:
             token_id = _entity_identifier(sdk_book, "token_id", fallback="unknown")
             if token_id in mapped:
-                raise GatewayMappingError(f"order books contain duplicate token {token_id}")
+                raise GatewayMappingError(
+                    f"order books contain duplicate token {token_id}"
+                )
             book = self._map_order_book(
                 sdk_book,
                 received_at=received_at,
-                subscription_generation=generation,
+                subscription_generation=subscription_generation,
             )
             mapped[book.token_id] = book
 
@@ -170,29 +511,55 @@ class PolymarketGateway:
         unexpected = returned_set - requested_set
         if unexpected:
             joined = ", ".join(sorted(unexpected))
-            raise GatewayMappingError(f"order books contain unexpected tokens: {joined}")
+            raise GatewayMappingError(
+                f"order books contain unexpected tokens: {joined}"
+            )
         missing = requested_set - returned_set
         if missing:
             joined = ", ".join(sorted(missing))
-            raise GatewayMappingError(f"order books are missing requested tokens: {joined}")
+            raise GatewayMappingError(
+                f"order books are missing requested tokens: {joined}"
+            )
         return tuple(mapped[token_id] for token_id in requested)
 
     async def subscribe_markets(self, token_ids: Sequence[str]) -> MarketSubscription:
         normalized = _token_ids(token_ids)
         self._subscription_generation += 1
         generation = self._subscription_generation
+        return await self._subscribe_markets_for_generation(
+            normalized,
+            subscription_generation=generation,
+        )
+
+    async def _subscribe_markets_for_generation(
+        self,
+        normalized: tuple[str, ...],
+        *,
+        subscription_generation: int,
+    ) -> MarketSubscription:
         handle = await self._client.subscribe(
             MarketSpec(
                 token_ids=normalized,
                 custom_feature_enabled=True,
             )
         )
+        lifecycle_probe, initial_invalid_reason = _SdkLifecycleProbe.capture(
+            client=self._client,
+            handle=handle,
+        )
         return MarketSubscription(
             handle,
             mapper=lambda event: self._map_stream_event(
                 event,
-                subscription_generation=generation,
+                subscription_generation=subscription_generation,
+                subscribed_token_ids=normalized,
             ),
+            lifecycle_probe=lifecycle_probe,
+            initial_invalid_reason=initial_invalid_reason,
+            token_ids=normalized,
+            subscription_generation=subscription_generation,
+            clock_ms=self._now,
+            lifecycle_poll_interval=self._lifecycle_poll_interval,
         )
 
     async def refresh_market(self, market_id: str) -> MarketSnapshot:
@@ -207,9 +574,10 @@ class PolymarketGateway:
         )
         if snapshot.market.id != market_id:
             raise GatewayMappingError(
-                f"market refresh requested {market_id} but SDK returned {snapshot.market.id}"
+                f"market refresh requested {market_id} "
+                f"but SDK returned {snapshot.market.id}"
             )
-        self._remember_market(snapshot.market)
+        self._remember_market(snapshot)
         return snapshot
 
     async def close(self) -> None:
@@ -233,13 +601,42 @@ class PolymarketGateway:
             return self._start_sync_generation(received_at)
         return self._sync_generation
 
-    def _remember_market(self, market: Market) -> None:
+    def _remember_market(self, snapshot: MarketSnapshot) -> None:
+        market = snapshot.market
         existing = self._market_id_by_condition_id.get(market.condition_id)
         if existing is not None and existing != market.id:
             raise GatewayMappingError(
-                f"condition {market.condition_id} maps to both {existing} and {market.id}"
+                f"condition {market.condition_id} maps to both "
+                f"{existing} and {market.id}"
             )
+        new_token_ids = frozenset(token.id for token in snapshot.tokens)
+        for token_id in new_token_ids:
+            identity = self._token_identity_by_id.get(token_id)
+            if identity is not None and identity[0] != market.id:
+                raise GatewayMappingError(
+                    f"token {token_id} maps to both market "
+                    f"{identity[0]} and {market.id}"
+                )
+
+        previous_condition = self._condition_id_by_market_id.get(market.id)
+        if (
+            previous_condition is not None
+            and previous_condition != market.condition_id
+            and self._market_id_by_condition_id.get(previous_condition) == market.id
+        ):
+            del self._market_id_by_condition_id[previous_condition]
+        for stale_token_id in (
+            self._token_ids_by_market_id.get(market.id, frozenset()) - new_token_ids
+        ):
+            stale_identity = self._token_identity_by_id.get(stale_token_id)
+            if stale_identity is not None and stale_identity[0] == market.id:
+                del self._token_identity_by_id[stale_token_id]
+
         self._market_id_by_condition_id[market.condition_id] = market.id
+        self._condition_id_by_market_id[market.id] = market.condition_id
+        self._token_ids_by_market_id[market.id] = new_token_ids
+        for token_id in new_token_ids:
+            self._token_identity_by_id[token_id] = (market.id, market.condition_id)
 
     def _map_order_book(
         self,
@@ -254,12 +651,27 @@ class PolymarketGateway:
                 getattr(sdk_book, "condition_id"),
                 "condition id",
             )
+            expected_identity = self._token_identity_by_id.get(token_id)
+            if expected_identity is None:
+                raise GatewayMappingError(
+                    f"order book {token_id} has no mapped token identity"
+                )
+            if expected_identity[1] != condition_id:
+                raise GatewayMappingError(
+                    f"order book {token_id} identity condition "
+                    f"{expected_identity[1]} does not match {condition_id}"
+                )
             try:
                 market_id = self._market_id_by_condition_id[condition_id]
             except KeyError as error:
                 raise GatewayMappingError(
                     f"condition {condition_id} has no mapped SDK market id"
                 ) from error
+            if expected_identity[0] != market_id:
+                raise GatewayMappingError(
+                    f"order book {token_id} identity market "
+                    f"{expected_identity[0]} does not match {market_id}"
+                )
             timestamp = _timestamp_ms(
                 getattr(sdk_book, "timestamp"),
                 "timestamp",
@@ -297,8 +709,11 @@ class PolymarketGateway:
         sdk_event: Any,
         *,
         subscription_generation: int,
-    ) -> MarketStreamEvent:
+        subscribed_token_ids: tuple[str, ...],
+    ) -> MarketStreamEvent | None:
         event_type = _entity_identifier(sdk_event, "type", fallback="unknown")
+        if event_type == "new_market":
+            return None
         try:
             payload_model = getattr(sdk_event, "payload")
             condition_id = _require_string(
@@ -312,6 +727,71 @@ class PolymarketGateway:
                     f"stream condition {condition_id} has no mapped SDK market id"
                 ) from error
             payload = _json_mapping(payload_model.model_dump(mode="json"))
+            event_token_ids: tuple[str, ...]
+            if event_type == "price_change":
+                changes = getattr(payload_model, "price_changes")
+                event_token_ids = tuple(
+                    _require_string(getattr(change, "token_id"), "stream token id")
+                    for change in changes
+                )
+            elif event_type == "market_resolved":
+                event_token_ids = tuple(
+                    _require_string(token_id, "stream token id")
+                    for token_id in getattr(payload_model, "token_ids")
+                )
+                resolved_market_id = _require_string(
+                    getattr(payload_model, "id"),
+                    "resolved market id",
+                )
+                if resolved_market_id != market_id:
+                    raise GatewayMappingError(
+                        f"stream market identity {resolved_market_id} "
+                        f"does not match {market_id}"
+                    )
+            elif event_type in {
+                "book",
+                "last_trade_price",
+                "tick_size_change",
+                "best_bid_ask",
+            }:
+                event_token_ids = (
+                    _require_string(
+                        getattr(payload_model, "token_id"),
+                        "stream token id",
+                    ),
+                )
+            else:
+                raise GatewayMappingError(
+                    f"unsupported stream event type {event_type}"
+                )
+
+            for token_id in event_token_ids:
+                identity = self._token_identity_by_id.get(token_id)
+                if identity is None:
+                    raise GatewayMappingError(
+                        f"stream token {token_id} has no mapped identity"
+                    )
+                if identity != (market_id, condition_id):
+                    raise GatewayMappingError(
+                        f"stream token {token_id} identity {identity} "
+                        f"does not match {(market_id, condition_id)}"
+                    )
+
+            subscribed = frozenset(subscribed_token_ids)
+            if event_type == "price_change":
+                payload["price_changes"] = [
+                    change
+                    for change in payload["price_changes"]
+                    if change["token_id"] in subscribed
+                ]
+                if not payload["price_changes"]:
+                    return None
+            elif event_type != "market_resolved" and not subscribed.intersection(
+                event_token_ids
+            ):
+                raise GatewayMappingError(
+                    f"stream event {event_type} has no subscribed token"
+                )
             return MarketStreamEvent(
                 event_type=_require_string(event_type, "stream event type"),
                 market_id=market_id,
@@ -434,6 +914,7 @@ def _map_market(
             "condition id",
         )
         fee_schedule = _map_fee_schedule(trading, received_at=received_at)
+        market_status = _market_status(sdk_market)
         token_models = (getattr(outcomes, "yes"), getattr(outcomes, "no"))
         tokens = tuple(
             Token(
@@ -457,8 +938,8 @@ def _map_market(
             event_id=event_id,
             condition_id=condition_id,
             question=_require_string(getattr(sdk_market, "question"), "question"),
-            status=_market_status(sdk_market),
-            active=getattr(state, "active") is True,
+            status=market_status,
+            active=market_status is MarketStatus.ACTIVE,
             accepting_orders=getattr(state, "accepting_orders") is True,
             enable_orderbook=getattr(state, "enable_order_book") is True,
             sync_generation=sync_generation,
@@ -559,9 +1040,23 @@ def _event_status(state: Any) -> MarketStatus:
 
 def _market_status(sdk_market: Any) -> MarketStatus:
     state = getattr(sdk_market, "state")
-    if getattr(state, "archived") is True:
+    active = getattr(state, "active")
+    closed = getattr(state, "closed")
+    archived = getattr(state, "archived")
+    for field_name, value in (
+        ("active", active),
+        ("closed", closed),
+        ("archived", archived),
+    ):
+        if type(value) is not bool:
+            raise ValueError(f"market state {field_name} must be a boolean")
+    if active and (closed or archived):
+        raise ValueError("contradictory active and closed/archived market state")
+    if closed and archived:
+        raise ValueError("contradictory closed and archived market state")
+    if archived:
         return MarketStatus.ARCHIVED
-    if getattr(state, "closed") is True:
+    if closed:
         resolution_status = getattr(
             getattr(sdk_market, "resolution"),
             "uma_resolution_status",
@@ -574,7 +1069,7 @@ def _market_status(sdk_market: Any) -> MarketStatus:
         if value in {"resolved", "settled"}:
             return MarketStatus.RESOLVED
         return MarketStatus.CLOSED
-    if getattr(state, "active") is True:
+    if active:
         return MarketStatus.ACTIVE
     return MarketStatus.CLOSED
 

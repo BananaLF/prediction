@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from datetime import datetime
 from decimal import Decimal
+import importlib.metadata
 import json
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -10,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from predmarket.polymarket import gateway as gateway_module
 from predmarket.domain.fees import FeeModel
 from predmarket.domain.market import Event, MarketStatus, Token
 from predmarket.domain.orderbook import OrderBook
@@ -95,6 +98,87 @@ def _fixture_model(value: Any, *, field_name: str | None = None) -> Any:
     return value
 
 
+def _real_sdk_market_event(
+    event_type: str,
+    *,
+    condition_id: str,
+    token_id: str = "1001",
+    additional_token_ids: tuple[str, ...] = (),
+) -> Any:
+    common = {
+        "event_type": event_type,
+        "market": condition_id,
+        "timestamp": "1785405962000",
+    }
+    variants: dict[str, dict[str, Any]] = {
+        "book": {
+            **common,
+            "asset_id": token_id,
+            "bids": [{"price": "0.41", "size": "3"}],
+            "asks": [{"price": "0.43", "size": "2"}],
+            "hash": "stream-book-hash",
+            "min_order_size": "5",
+            "tick_size": "0.01",
+            "neg_risk": True,
+        },
+        "price_change": {
+            **common,
+            "price_changes": [
+                {
+                    "asset_id": change_token_id,
+                    "price": "0.42",
+                    "size": "3",
+                    "side": "BUY",
+                    "hash": "delta-hash",
+                    "best_bid": "0.41",
+                    "best_ask": "0.43",
+                }
+                for change_token_id in (token_id, *additional_token_ids)
+            ],
+        },
+        "last_trade_price": {
+            **common,
+            "asset_id": token_id,
+            "price": "0.42",
+            "size": "3",
+            "side": "BUY",
+            "fee_rate_bps": "25",
+            "transaction_hash": "0xabc",
+        },
+        "tick_size_change": {
+            **common,
+            "asset_id": token_id,
+            "old_tick_size": "0.01",
+            "new_tick_size": "0.001",
+        },
+        "best_bid_ask": {
+            **common,
+            "asset_id": token_id,
+            "best_bid": "0.41",
+            "best_ask": "0.43",
+            "spread": "0.02",
+        },
+        "market_resolved": {
+            **common,
+            "id": "200",
+            "assets_ids": ["1001", "1002"],
+            "winning_asset_id": "1001",
+            "winning_outcome": "Yes",
+            "tags": [],
+        },
+        "new_market": {
+            **common,
+            "id": "999",
+            "question": "A newly announced market",
+            "assets_ids": ["9001", "9002"],
+            "condition_id": condition_id,
+            "active": True,
+            "fees_enabled": False,
+        },
+    }
+    return gateway_module._parse_pinned_market_event(variants[event_type])
+
+
 class FakePaginator:
     def __init__(self, pages: tuple[tuple[Any, ...], ...]) -> None:
         self.pages = pages
@@ -112,7 +196,12 @@ class FakePaginator:
 class FakeSubscriptionHandle:
     def __init__(self, events: tuple[Any, ...] = ()) -> None:
         self._events = iter(events)
+        self._dropped = 0
         self.closed = False
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
 
     def __aiter__(self):
         return self
@@ -125,6 +214,43 @@ class FakeSubscriptionHandle:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class BlockingSubscriptionHandle(FakeSubscriptionHandle):
+    def __init__(self) -> None:
+        super().__init__()
+        self._release = asyncio.Event()
+        self.event_wait_cancelled = False
+
+    async def __anext__(self):
+        try:
+            await self._release.wait()
+            raise StopAsyncIteration
+        except asyncio.CancelledError:
+            self.event_wait_cancelled = True
+            raise
+
+
+class FakeConnection:
+    def __init__(self) -> None:
+        self._socket: object | None = object()
+
+
+class FakeMarketManager:
+    def __init__(self) -> None:
+        self._connection = FakeConnection()
+        self._dropped_events = 0
+        self.open_state_override: object | None = None
+
+    @property
+    def is_open(self) -> object:
+        if self.open_state_override is not None:
+            return self.open_state_override
+        return self._connection._socket is not None
+
+    @property
+    def dropped_events(self) -> int:
+        return self._dropped_events
 
 
 class FakePublicClient:
@@ -146,6 +272,8 @@ class FakePublicClient:
         self.refreshed_market_id: str | None = None
         self.subscription_spec: Any = None
         self.subscription_handle = FakeSubscriptionHandle(stream_events)
+        self._market_manager = FakeMarketManager()
+        self.operations: list[str] = []
         self.closed = False
 
     def list_events(self, **kwargs: Any) -> FakePaginator:
@@ -161,10 +289,12 @@ class FakePublicClient:
         return next(market for market in self.markets if market.id == id)
 
     async def get_order_books(self, *, token_ids: tuple[str, ...]) -> tuple[Any, ...]:
+        self.operations.append("get_order_books")
         self.book_token_ids = token_ids
         return tuple(book for book in self.books if book.token_id in token_ids)
 
     async def subscribe(self, spec: Any) -> FakeSubscriptionHandle:
+        self.operations.append("subscribe")
         self.subscription_spec = spec
         return self.subscription_handle
 
@@ -229,6 +359,27 @@ async def test_list_active_events_drains_every_sdk_page_and_maps_explicit_neg_ri
     assert isinstance(event.neg_risk_metadata, MappingProxyType)
 
 
+async def test_pinned_sdk_private_lifecycle_shape_is_exactly_supported() -> None:
+    # Catches a pinned SDK upgrade or private lifecycle shape drift going unnoticed.
+    assert importlib.metadata.version("polymarket-client") == "0.3.0b1"
+
+    shape = await gateway_module.probe_pinned_sdk_lifecycle_shape()
+
+    assert shape == {
+        "version": "0.3.0b1",
+        "client_manager_attribute": "_market_manager",
+        "manager_connection_attribute": "_connection",
+        "connection_socket_attribute": "_socket",
+        "manager_open_property": "is_open",
+        "manager_dropped_property": "dropped_events",
+        "handle_dropped_property": "dropped",
+        "initial_manager_open": False,
+        "initial_socket_is_none": True,
+        "initial_manager_dropped": 0,
+        "initial_handle_dropped": 0,
+    }
+
+
 async def test_list_active_events_excludes_defensive_inactive_sdk_results(
     sdk_fixture: dict[str, tuple[Any, ...]],
 ) -> None:
@@ -257,6 +408,8 @@ async def test_list_active_markets_maps_tokens_and_authoritative_fee_schedules(
     first = snapshots[0]
     assert isinstance(first, MarketSnapshot)
     assert first.mapping_version == MAPPING_VERSION
+    assert first.market.status is MarketStatus.ACTIVE
+    assert first.market.active is True
     assert first.market.event_id == "100"
     assert first.market.condition_id.endswith("1" * 64)
     assert first.market.neg_risk is True
@@ -279,6 +432,21 @@ async def test_list_active_markets_maps_tokens_and_authoritative_fee_schedules(
     assert zero_fee is not None
     assert zero_fee.model is FeeModel.ZERO
     assert zero_fee.enabled is False
+
+
+@pytest.mark.parametrize("contradictory_flag", ["closed", "archived"])
+async def test_contradictory_active_market_state_is_rejected(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+    contradictory_flag: str,
+) -> None:
+    # Catches closed/archived SDK results entering the active watch catalog.
+    payload = deepcopy(sdk_fixture)
+    setattr(payload["markets"][0].state, contradictory_flag, True)
+    client = FakePublicClient(**payload)
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+
+    with pytest.raises(GatewayMappingError, match=r"market 200.*contradictory"):
+        await gateway.list_active_markets()
 
 
 async def test_get_order_books_preserves_complete_l2_and_request_coverage(
@@ -310,6 +478,23 @@ async def test_get_order_books_preserves_complete_l2_and_request_coverage(
     )
 
 
+async def test_order_book_token_condition_identity_mismatch_is_rejected(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    # Catches a known token being silently attached to another known market.
+    payload = deepcopy(sdk_fixture)
+    payload["books"][0].condition_id = payload["markets"][1].condition_id
+    client = FakePublicClient(**payload)
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+
+    with pytest.raises(
+        GatewayMappingError,
+        match=r"order book 1001.*identity.*condition",
+    ):
+        await gateway.get_order_books(("1001",))
+
+
 async def test_refresh_market_returns_fresh_immutable_market_snapshot(
     gateway: PolymarketGateway,
     fake_client: FakePublicClient,
@@ -323,6 +508,26 @@ async def test_refresh_market_returns_fresh_immutable_market_snapshot(
     assert snapshot.tokens[0].id == "1001"
 
 
+async def test_recover_market_session_shares_one_new_generation(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    # Catches a REST recovery baseline and its new stream using different generations.
+    client = FakePublicClient(**sdk_fixture)
+    client.subscription_handle = BlockingSubscriptionHandle()
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+
+    session = await gateway.recover_market_session(("1001", "1002"))
+
+    assert session.subscription_generation == 1
+    assert tuple(
+        book.subscription_generation for book in session.order_books
+    ) == (1, 1)
+    assert session.subscription.subscription_generation == 1
+    assert client.operations == ["subscribe", "get_order_books"]
+    await session.subscription.close()
+
+
 async def test_subscribe_markets_uses_public_market_spec_and_maps_stream_models(
     sdk_fixture: dict[str, tuple[Any, ...]],
 ) -> None:
@@ -333,7 +538,7 @@ async def test_subscribe_markets_uses_public_market_spec_and_maps_stream_models(
             market=sdk_fixture["markets"][0].condition_id,
             price_changes=(
                 FixtureModel(
-                    asset_id="1001",
+                    token_id="1001",
                     price=Decimal("0.42"),
                     size=Decimal("3"),
                     side="BUY",
@@ -362,6 +567,274 @@ async def test_subscribe_markets_uses_public_market_spec_and_maps_stream_models(
     assert mapped.payload["price_changes"][0]["price"] == "0.42"
     assert isinstance(mapped.payload, MappingProxyType)
     await subscription.close()
+    assert client.subscription_handle.closed is True
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "book",
+        "price_change",
+        "last_trade_price",
+        "tick_size_change",
+        "best_bid_ask",
+        "market_resolved",
+    ],
+)
+async def test_every_token_scoped_public_market_event_variant_is_consumable(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+    event_type: str,
+) -> None:
+    # Catches a documented SDK MarketEvent variant being dropped by the gateway.
+    condition_id = sdk_fixture["markets"][0].condition_id
+    sdk_event = _real_sdk_market_event(
+        event_type,
+        condition_id=condition_id,
+    )
+    client = FakePublicClient(**sdk_fixture, stream_events=(sdk_event,))
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+
+    subscription = await gateway.subscribe_markets(("1001", "1002"))
+    mapped = await anext(subscription)
+
+    assert isinstance(mapped, MarketStreamEvent)
+    assert mapped.event_type == event_type
+    assert mapped.market_id == "200"
+    await subscription.close()
+
+
+async def test_unscoped_new_market_variant_is_filtered_without_killing_consumer(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    # Catches the custom-feature global new_market event terminating a token watch.
+    unknown_condition = "0x" + "9" * 64
+    known_condition = sdk_fixture["markets"][0].condition_id
+    new_market = _real_sdk_market_event(
+        "new_market",
+        condition_id=unknown_condition,
+        token_id="9001",
+    )
+    next_price = _real_sdk_market_event(
+        "price_change",
+        condition_id=known_condition,
+    )
+    client = FakePublicClient(
+        **sdk_fixture,
+        stream_events=(new_market, next_price),
+    )
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+
+    subscription = await gateway.subscribe_markets(("1001",))
+    mapped = await anext(subscription)
+
+    assert isinstance(mapped, MarketStreamEvent)
+    assert mapped.event_type == "price_change"
+    assert mapped.market_id == "200"
+    await subscription.close()
+
+
+async def test_stream_token_condition_identity_mismatch_invalidates_generation(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    # Catches an SDK stream token being accepted under another known condition.
+    wrong_condition = sdk_fixture["markets"][1].condition_id
+    sdk_event = _real_sdk_market_event(
+        "price_change",
+        condition_id=wrong_condition,
+        token_id="1001",
+    )
+    client = FakePublicClient(**sdk_fixture, stream_events=(sdk_event,))
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+
+    subscription = await gateway.subscribe_markets(("1001",))
+    invalid = await anext(subscription)
+
+    assert isinstance(invalid, gateway_module.MarketStreamInvalidated)
+    assert invalid.reason == "sdk_event_invalid"
+    assert client.subscription_handle.closed is True
+    with pytest.raises(StopAsyncIteration):
+        await anext(subscription)
+
+
+async def test_price_change_filters_unsubscribed_tokens_after_identity_validation(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    # Catches batched price changes leaking tokens outside the requested watch.
+    condition_id = sdk_fixture["markets"][0].condition_id
+    sdk_event = _real_sdk_market_event(
+        "price_change",
+        condition_id=condition_id,
+        token_id="1001",
+        additional_token_ids=("1002",),
+    )
+    client = FakePublicClient(**sdk_fixture, stream_events=(sdk_event,))
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+
+    subscription = await gateway.subscribe_markets(("1001",))
+    mapped = await anext(subscription)
+
+    assert isinstance(mapped, MarketStreamEvent)
+    assert tuple(
+        change["token_id"] for change in mapped.payload["price_changes"]
+    ) == ("1001",)
+    await subscription.close()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        (
+            lambda client: setattr(
+                client._market_manager._connection,
+                "_socket",
+                None,
+            ),
+            "connection_lost",
+        ),
+        (
+            lambda client: setattr(
+                client._market_manager._connection,
+                "_socket",
+                object(),
+            ),
+            "connection_replaced",
+        ),
+        (
+            lambda client: setattr(
+                client._market_manager,
+                "_dropped_events",
+                1,
+            ),
+            "sdk_event_dropped",
+        ),
+        (
+            lambda client: setattr(client.subscription_handle, "_dropped", 1),
+            "subscription_event_dropped",
+        ),
+    ],
+)
+async def test_subscription_lifecycle_change_emits_invalid_then_stops(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+    mutation: Any,
+    reason: str,
+) -> None:
+    # Catches a transparent reconnect or SDK drop continuing the old generation.
+    client = FakePublicClient(**sdk_fixture)
+    client.subscription_handle = BlockingSubscriptionHandle()
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+    subscription = await gateway.subscribe_markets(("1001", "1002"))
+
+    mutation(client)
+    invalid = await asyncio.wait_for(anext(subscription), timeout=0.2)
+
+    assert isinstance(invalid, gateway_module.MarketStreamInvalidated)
+    assert invalid.reason == reason
+    assert invalid.token_ids == ("1001", "1002")
+    assert invalid.subscription_generation == 1
+    assert client.subscription_handle.closed is True
+    with pytest.raises(StopAsyncIteration):
+        await anext(subscription)
+
+
+@pytest.mark.parametrize(
+    ("break_shape", "reason"),
+    [
+        (
+            lambda client: delattr(client._market_manager, "_connection"),
+            "sdk_lifecycle_shape_changed",
+        ),
+        (
+            lambda client: setattr(
+                client._market_manager,
+                "open_state_override",
+                "UNKNOWN",
+            ),
+            "sdk_lifecycle_state_unknown",
+        ),
+    ],
+)
+async def test_unknown_sdk_lifecycle_shape_or_state_fails_closed(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+    break_shape: Any,
+    reason: str,
+) -> None:
+    # Catches SDK private state drift being silently interpreted as healthy.
+    client = FakePublicClient(**sdk_fixture)
+    client.subscription_handle = BlockingSubscriptionHandle()
+    break_shape(client)
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+
+    subscription = await gateway.subscribe_markets(("1001",))
+    invalid = await asyncio.wait_for(anext(subscription), timeout=0.2)
+
+    assert invalid.reason == reason
+    assert client.subscription_handle.closed is True
+    with pytest.raises(StopAsyncIteration):
+        await anext(subscription)
+
+
+async def test_unexpected_sdk_handle_end_is_an_invalid_generation(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    # Catches an ended SDK handle looking like a normal graceful watch shutdown.
+    client = FakePublicClient(**sdk_fixture)
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+
+    subscription = await gateway.subscribe_markets(("1001",))
+    invalid = await anext(subscription)
+
+    assert invalid.reason == "sdk_handle_ended"
+    with pytest.raises(StopAsyncIteration):
+        await anext(subscription)
+
+
+async def test_cancelled_subscription_read_cleans_up_internal_event_wait(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    # Catches a cancelled watcher leaving a child task that can consume later events.
+    client = FakePublicClient(**sdk_fixture)
+    client.subscription_handle = BlockingSubscriptionHandle()
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+    subscription = await gateway.subscribe_markets(("1001",))
+
+    read_task = asyncio.create_task(anext(subscription))
+    await asyncio.sleep(0)
+    read_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await read_task
+    await asyncio.sleep(0)
+
+    assert client.subscription_handle.event_wait_cancelled is True
+    await subscription.close()
+
+
+async def test_sdk_version_drift_fails_closed_as_invalid_generation(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches private state inspection continuing after an unreviewed SDK upgrade.
+    client = FakePublicClient(**sdk_fixture)
+    client.subscription_handle = BlockingSubscriptionHandle()
+    monkeypatch.setattr(
+        gateway_module.importlib.metadata,
+        "version",
+        lambda _distribution: "0.3.0b2",
+    )
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+
+    subscription = await gateway.subscribe_markets(("1001",))
+    invalid = await asyncio.wait_for(anext(subscription), timeout=0.2)
+
+    assert invalid.reason == "sdk_version_changed"
     assert client.subscription_handle.closed is True
 
 
