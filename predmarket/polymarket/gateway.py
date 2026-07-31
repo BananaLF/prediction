@@ -317,6 +317,10 @@ class MarketSubscription(
         if self._close_task is not None or self._closed or self._terminal:
             raise StopAsyncIteration
         if self._buffered_events:
+            reason = self._current_invalid_reason()
+            if reason is not None:
+                self._buffered_events.clear()
+                return await self._invalidate(reason)
             return self._buffered_events.popleft()
         return await self._next_live()
 

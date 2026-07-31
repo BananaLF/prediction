@@ -672,6 +672,56 @@ async def test_recovery_replays_events_buffered_by_its_lifecycle_monitor(
     await session.subscription.close()
 
 
+async def test_recovery_replay_rechecks_lifecycle_before_each_buffered_event(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    # Catches old-generation buffered events leaking after a post-recovery drop.
+    condition_id = sdk_fixture["markets"][0].condition_id
+    sdk_event = _real_sdk_market_event(
+        "price_change",
+        condition_id=condition_id,
+    )
+    handle: Any = gateway_module.AsyncSubscriptionHandle(queue_size=2)
+    client = BlockingOrderBookClient(**sdk_fixture)
+    client.subscription_handle = handle
+    gateway = PolymarketGateway(
+        client=client,
+        clock_ms=lambda: 1_785_405_970_000,
+        lifecycle_poll_interval=0.001,
+    )
+    await gateway.list_active_markets()
+    recovery_task = asyncio.create_task(
+        gateway.recover_market_session(("1001", "1002"))
+    )
+    await asyncio.wait_for(client.books_started.wait(), timeout=0.2)
+
+    for _ in range(2):
+        handle._push(sdk_event)
+        for _ in range(20):
+            if handle._queue.empty():
+                break
+            await asyncio.sleep(0)
+        assert handle._queue.empty() is True
+    client.books_release.set()
+    session = await asyncio.wait_for(recovery_task, timeout=0.2)
+
+    first = await asyncio.wait_for(anext(session.subscription), timeout=0.2)
+    assert isinstance(first, MarketStreamEvent)
+
+    for _ in range(3):
+        handle._push(sdk_event)
+    assert handle.dropped == 1
+
+    invalid = await asyncio.wait_for(anext(session.subscription), timeout=0.2)
+
+    assert isinstance(invalid, gateway_module.MarketStreamInvalidated)
+    assert invalid.reason == "subscription_event_dropped"
+    assert invalid.subscription_generation == session.subscription_generation
+    assert handle._ended is True
+    with pytest.raises(StopAsyncIteration):
+        await anext(session.subscription)
+
+
 async def test_recovery_buffer_is_bounded_by_real_sdk_handle_queue(
     sdk_fixture: dict[str, tuple[Any, ...]],
 ) -> None:
