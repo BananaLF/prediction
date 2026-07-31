@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import Enum
-from types import MappingProxyType
 from typing import Any, Mapping
+
+from predmarket.domain.json import freeze_json_object
 
 
 class RelationStatus(str, Enum):
@@ -70,7 +71,12 @@ class Relation:
             if not isinstance(self.llm_analysis, Mapping):
                 raise ValueError("llm_analysis must be a mapping")
             object.__setattr__(
-                self, "llm_analysis", MappingProxyType(dict(self.llm_analysis))
+                self,
+                "llm_analysis",
+                freeze_json_object(
+                    self.llm_analysis,
+                    field_name="llm_analysis",
+                ),
             )
 
     def transition_to(self, status: RelationStatus, *, updated_at: int) -> "Relation":

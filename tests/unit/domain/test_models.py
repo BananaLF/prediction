@@ -74,7 +74,7 @@ def _book(*, token_id: str = "token-1", market_id: str = "market-1") -> OrderBoo
     )
 
 
-def _calculation() -> OpportunityCalculation:
+def _calculation(*, details: object | None = None) -> OpportunityCalculation:
     return OpportunityCalculation(
         quantity=Decimal("2"),
         total_capital=Decimal("1.6"),
@@ -84,7 +84,7 @@ def _calculation() -> OpportunityCalculation:
         risk_rate=Decimal("0.5"),
         unhedged_notional=Decimal("0.6"),
         risk_flags=("PARTIAL_FILL",),
-        details={"minimum_proceeds": "2"},
+        details={"minimum_proceeds": "2"} if details is None else details,  # type: ignore[arg-type]
     )
 
 
@@ -113,6 +113,54 @@ def _strategy_config() -> StrategyConfig:
         maximum_book_age_ms=2_000,
         maximum_leg_skew_ms=500,
     )
+
+
+def _json_payload_owner(kind: str, payload: object) -> object:
+    if kind == "event":
+        return Event(
+            id="event-1",
+            title="Event",
+            status=MarketStatus.ACTIVE,
+            market_ids=("market-1",),
+            sync_generation="sync-1",
+            sync_generation_complete=True,
+            neg_risk_metadata=payload,  # type: ignore[arg-type]
+        )
+    if kind == "relation":
+        return Relation(
+            id="relation-1",
+            market_a_id="market-a",
+            market_b_id="market-b",
+            status=RelationStatus.NO_LLM_APPROVE,
+            discovery_source=DiscoverySource.RULE,
+            created_at=1,
+            updated_at=1,
+            llm_analysis=payload,  # type: ignore[arg-type]
+        )
+    if kind == "calculation":
+        return _calculation(details=payload)
+    if kind == "not_evaluable":
+        return NotEvaluable(
+            reason_code=DecisionReason.ORDERBOOK_INVALID,
+            context=payload,  # type: ignore[arg-type]
+        )
+    raise AssertionError(f"unknown owner: {kind}")
+
+
+def _json_payload(owner: object) -> object:
+    if isinstance(owner, Event):
+        return owner.neg_risk_metadata
+    if isinstance(owner, Relation):
+        return owner.llm_analysis
+    if isinstance(owner, OpportunityCalculation):
+        return owner.details
+    if isinstance(owner, NotEvaluable):
+        return owner.context
+    raise AssertionError(f"unknown owner: {type(owner)}")
+
+
+class _CustomList(list[object]):
+    pass
 
 
 def test_event_canonicalizes_market_ids_by_utf8_bytes() -> None:
@@ -152,6 +200,58 @@ def test_event_rejects_string_instead_of_market_id_collection() -> None:
             sync_generation="sync-1",
             sync_generation_complete=True,
         )
+
+
+@pytest.mark.parametrize("kind", ["event", "relation", "calculation", "not_evaluable"])
+def test_json_payloads_are_recursively_copied_and_frozen(kind: str) -> None:
+    source = {
+        "nested": {
+            "items": ["a"],
+            "enabled": True,
+            "count": 1,
+            "optional": None,
+        }
+    }
+
+    owner = _json_payload_owner(kind, source)
+    source["nested"]["items"].append("mutated")  # type: ignore[index,union-attr]
+    source["nested"]["enabled"] = False  # type: ignore[index]
+    payload = _json_payload(owner)
+
+    assert isinstance(payload, MappingProxyType)
+    nested = payload["nested"]  # type: ignore[index]
+    assert isinstance(nested, MappingProxyType)
+    assert nested["items"] == ("a",)
+    assert nested["enabled"] is True
+    with pytest.raises(TypeError):
+        nested["count"] = 2  # type: ignore[index]
+
+
+@pytest.mark.parametrize("kind", ["event", "relation", "calculation", "not_evaluable"])
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        0.5,
+        Decimal("0.5"),
+        {"not-json"},
+        _CustomList(["custom"]),
+        object(),
+    ],
+)
+def test_json_payloads_reject_values_outside_closed_json_types(
+    kind: str, invalid: object
+) -> None:
+    with pytest.raises(ValueError, match="JSON"):
+        _json_payload_owner(kind, {"invalid": invalid})
+
+
+@pytest.mark.parametrize("kind", ["event", "relation", "calculation", "not_evaluable"])
+def test_json_payloads_reject_cycles(kind: str) -> None:
+    payload: dict[str, object] = {}
+    payload["cycle"] = payload
+
+    with pytest.raises(ValueError, match="JSON"):
+        _json_payload_owner(kind, payload)
 
 
 @pytest.mark.parametrize(
@@ -244,6 +344,79 @@ def test_present_and_absent_decisions_require_current_calculation_and_evidence()
         )
 
 
+@pytest.mark.parametrize("kind", ["present", "absent"])
+def test_decision_materializes_one_shot_payload_iterators_once(kind: str) -> None:
+    leg = _leg()
+    book = _book()
+    legs = (item for item in (leg,))
+    evidence = (item for item in (book,))
+
+    if kind == "present":
+        decision = OpportunityPresent(
+            calculation=_calculation(),
+            legs=legs,  # type: ignore[arg-type]
+            evidence=evidence,  # type: ignore[arg-type]
+        )
+    else:
+        decision = OpportunityAbsent(
+            reason_code=DecisionReason.PROFIT_BELOW_THRESHOLD,
+            calculation=_calculation(),
+            legs=legs,  # type: ignore[arg-type]
+            evidence=evidence,  # type: ignore[arg-type]
+        )
+
+    assert decision.legs == (leg,)
+    assert decision.evidence == (book,)
+
+
+def test_decision_rejects_duplicate_or_noncontiguous_leg_positions() -> None:
+    with pytest.raises(ValueError, match="positions"):
+        OpportunityPresent(
+            calculation=_calculation(),
+            legs=(_leg(), _leg()),
+            evidence=(_book(),),
+        )
+
+    noncontiguous = SignalLeg(
+        position=1,
+        market_id="market-1",
+        token_id="token-1",
+        action=Action.BUY,
+        quantity=Decimal("2"),
+        average_price=Decimal("0.4"),
+        worst_price=Decimal("0.4"),
+        gross_amount=Decimal("0.8"),
+        fee_amount=Decimal("0"),
+    )
+    with pytest.raises(ValueError, match="positions"):
+        OpportunityPresent(
+            calculation=_calculation(),
+            legs=(noncontiguous,),
+            evidence=(_book(),),
+        )
+
+
+def test_decision_rejects_duplicate_orderbook_evidence_tokens() -> None:
+    book = _book()
+
+    with pytest.raises(ValueError, match="unique"):
+        OpportunityPresent(
+            calculation=_calculation(),
+            legs=(_leg(),),
+            evidence=(book, book),
+        )
+
+
+def test_decision_requires_evidence_to_match_every_trade_leg_exactly() -> None:
+    with pytest.raises(ValueError, match="correspond"):
+        OpportunityAbsent(
+            reason_code=DecisionReason.INSUFFICIENT_DEPTH,
+            calculation=_calculation(),
+            legs=(_leg(),),
+            evidence=(_book(token_id="different-token"),),
+        )
+
+
 def test_not_evaluable_requires_stable_reason_and_context_without_economics() -> None:
     decision = NotEvaluable(
         reason_code=DecisionReason.ORDERBOOK_INVALID,
@@ -256,6 +429,24 @@ def test_not_evaluable_requires_stable_reason_and_context_without_economics() ->
         NotEvaluable(reason_code=DecisionReason.FEE_SCHEDULE_UNKNOWN, context={})
     with pytest.raises(ValueError, match="not valid"):
         NotEvaluable(reason_code=DecisionReason.PROFIT_BELOW_THRESHOLD, context={"x": 1})
+
+
+def test_absent_decision_rejects_bare_string_reason_code() -> None:
+    with pytest.raises(ValueError, match="DecisionReason"):
+        OpportunityAbsent(
+            reason_code="PROFIT_BELOW_THRESHOLD",  # type: ignore[arg-type]
+            calculation=_calculation(),
+            legs=(_leg(),),
+            evidence=(_book(),),
+        )
+
+
+def test_not_evaluable_rejects_bare_string_reason_code() -> None:
+    with pytest.raises(ValueError, match="DecisionReason"):
+        NotEvaluable(
+            reason_code="ORDERBOOK_INVALID",  # type: ignore[arg-type]
+            context={"token_id": "token-1"},
+        )
 
 
 def test_strategy_context_is_deeply_immutable_and_canonical() -> None:

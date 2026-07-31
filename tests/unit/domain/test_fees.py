@@ -19,7 +19,13 @@ def test_zero_fee_schedule_returns_exact_zero() -> None:
     )
 
     assert schedule.model is FeeModel.ZERO
-    assert FeeCalculator.calculate(schedule, Decimal("0.42"), Decimal("12.5")) == Decimal("0")
+    assert FeeCalculator.calculate(
+        schedule,
+        Decimal("0.42"),
+        Decimal("12.5"),
+        evaluated_at_ms=100,
+        max_age_seconds=300,
+    ) == Decimal("0")
 
 
 def test_flat_fee_schedule_charges_rate_on_notional() -> None:
@@ -33,7 +39,13 @@ def test_flat_fee_schedule_charges_rate_on_notional() -> None:
         }
     )
 
-    assert FeeCalculator.calculate(schedule, Decimal("0.4"), Decimal("10")) == Decimal("0.08")
+    assert FeeCalculator.calculate(
+        schedule,
+        Decimal("0.4"),
+        Decimal("10"),
+        evaluated_at_ms=100,
+        max_age_seconds=300,
+    ) == Decimal("0.08")
 
 
 def test_disabled_known_schedule_returns_zero() -> None:
@@ -47,7 +59,13 @@ def test_disabled_known_schedule_returns_zero() -> None:
         }
     )
 
-    assert FeeCalculator.calculate(schedule, Decimal("0.4"), Decimal("10")) == Decimal("0")
+    assert FeeCalculator.calculate(
+        schedule,
+        Decimal("0.4"),
+        Decimal("10"),
+        evaluated_at_ms=100,
+        max_age_seconds=300,
+    ) == Decimal("0")
 
 
 def test_unknown_fee_model_is_rejected_instead_of_assumed_zero() -> None:
@@ -92,6 +110,47 @@ def test_fee_schedule_freshness_is_evaluated_without_wall_clock_access() -> None
     assert schedule.is_stale(evaluated_at=400_001, max_age_seconds=300) is True
 
 
+def test_fee_calculation_rejects_schedule_without_update_timestamp() -> None:
+    schedule = FeeSchedule.from_json(
+        {
+            "model": "ZERO",
+            "enabled": True,
+            "source": "clob",
+            "parameters": {},
+        }
+    )
+
+    with pytest.raises(ValueError, match="stale"):
+        FeeCalculator.calculate(
+            schedule,
+            Decimal("0.5"),
+            Decimal("1"),
+            evaluated_at_ms=100_000,
+            max_age_seconds=300,
+        )
+
+
+def test_fee_calculation_rejects_schedule_older_than_maximum_age() -> None:
+    schedule = FeeSchedule.from_json(
+        {
+            "model": "FLAT",
+            "enabled": True,
+            "source": "clob",
+            "parameters": {"rate": "0.02"},
+            "updated_at": 100_000,
+        }
+    )
+
+    with pytest.raises(ValueError, match="stale"):
+        FeeCalculator.calculate(
+            schedule,
+            Decimal("0.5"),
+            Decimal("1"),
+            evaluated_at_ms=400_001,
+            max_age_seconds=300,
+        )
+
+
 @pytest.mark.parametrize(
     ("price", "quantity"),
     [
@@ -115,4 +174,10 @@ def test_fee_calculation_rejects_invalid_price_or_quantity(
     )
 
     with pytest.raises(ValueError):
-        FeeCalculator.calculate(schedule, price, quantity)
+        FeeCalculator.calculate(
+            schedule,
+            price,
+            quantity,
+            evaluated_at_ms=100,
+            max_age_seconds=300,
+        )

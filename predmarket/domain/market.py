@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
-from types import MappingProxyType
 from typing import Any, Mapping
 
 from predmarket.domain.fees import FeeSchedule
+from predmarket.domain.json import freeze_json_object
 
 
 class MarketStatus(str, Enum):
@@ -57,7 +57,12 @@ class Event:
             if not isinstance(self.neg_risk_metadata, Mapping):
                 raise ValueError("neg_risk_metadata must be a mapping")
             object.__setattr__(
-                self, "neg_risk_metadata", MappingProxyType(dict(self.neg_risk_metadata))
+                self,
+                "neg_risk_metadata",
+                freeze_json_object(
+                    self.neg_risk_metadata,
+                    field_name="neg_risk_metadata",
+                ),
             )
         _timestamps(
             self.neg_risk_synced_at,

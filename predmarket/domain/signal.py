@@ -10,6 +10,7 @@ from typing import Any, Mapping, TypeAlias
 
 from predmarket.config import StrategyConfig
 from predmarket.domain.fees import FeeSchedule
+from predmarket.domain.json import freeze_json_object
 from predmarket.domain.market import Market, Token
 from predmarket.domain.orderbook import OrderBook
 from predmarket.domain.relation import Relation, RelationStatus
@@ -105,7 +106,11 @@ class OpportunityCalculation:
         object.__setattr__(self, "risk_flags", risk_flags)
         if not isinstance(self.details, Mapping):
             raise ValueError("details must be a mapping")
-        object.__setattr__(self, "details", _freeze_mapping(self.details))
+        object.__setattr__(
+            self,
+            "details",
+            freeze_json_object(self.details, field_name="details"),
+        )
 
 
 @dataclass(frozen=True)
@@ -164,9 +169,13 @@ class OpportunityPresent:
     evidence: tuple[OrderBook, ...]
 
     def __post_init__(self) -> None:
-        _complete_payload(self.calculation, self.legs, self.evidence)
-        object.__setattr__(self, "legs", tuple(self.legs))
-        object.__setattr__(self, "evidence", tuple(self.evidence))
+        legs, evidence = _complete_payload(
+            self.calculation,
+            self.legs,
+            self.evidence,
+        )
+        object.__setattr__(self, "legs", legs)
+        object.__setattr__(self, "evidence", evidence)
 
 
 @dataclass(frozen=True)
@@ -177,11 +186,17 @@ class OpportunityAbsent:
     evidence: tuple[OrderBook, ...]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.reason_code, DecisionReason):
+            raise ValueError("reason_code must be a DecisionReason")
         if self.reason_code not in _ABSENT_REASONS:
             raise ValueError("reason_code is not valid for OpportunityAbsent")
-        _complete_payload(self.calculation, self.legs, self.evidence)
-        object.__setattr__(self, "legs", tuple(self.legs))
-        object.__setattr__(self, "evidence", tuple(self.evidence))
+        legs, evidence = _complete_payload(
+            self.calculation,
+            self.legs,
+            self.evidence,
+        )
+        object.__setattr__(self, "legs", legs)
+        object.__setattr__(self, "evidence", evidence)
 
 
 @dataclass(frozen=True)
@@ -190,11 +205,17 @@ class NotEvaluable:
     context: Mapping[str, Any]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.reason_code, DecisionReason):
+            raise ValueError("reason_code must be a DecisionReason")
         if self.reason_code not in _NOT_EVALUABLE_REASONS:
             raise ValueError("reason_code is not valid for NotEvaluable")
         if not isinstance(self.context, Mapping) or not self.context:
             raise ValueError("context must be a non-empty mapping")
-        object.__setattr__(self, "context", _freeze_mapping(self.context))
+        object.__setattr__(
+            self,
+            "context",
+            freeze_json_object(self.context, field_name="context"),
+        )
 
 
 StrategyDecision: TypeAlias = OpportunityPresent | OpportunityAbsent | NotEvaluable
@@ -249,13 +270,56 @@ def _complete_payload(
     calculation: OpportunityCalculation,
     legs: tuple[SignalLeg, ...],
     evidence: tuple[OrderBook, ...],
-) -> None:
+) -> tuple[tuple[SignalLeg, ...], tuple[OrderBook, ...]]:
     if not isinstance(calculation, OpportunityCalculation):
         raise ValueError("calculation must be an OpportunityCalculation")
-    if not legs or any(not isinstance(leg, SignalLeg) for leg in legs):
+    try:
+        materialized_legs = tuple(legs)
+    except TypeError as error:
+        raise ValueError("legs must be an iterable of SignalLeg values") from error
+    try:
+        materialized_evidence = tuple(evidence)
+    except TypeError as error:
+        raise ValueError("evidence must be an iterable of OrderBook values") from error
+    if not materialized_legs or any(
+        not isinstance(leg, SignalLeg) for leg in materialized_legs
+    ):
         raise ValueError("legs must contain at least one SignalLeg")
-    if not evidence or any(not isinstance(book, OrderBook) for book in evidence):
+    if not materialized_evidence or any(
+        not isinstance(book, OrderBook) for book in materialized_evidence
+    ):
         raise ValueError("evidence must contain at least one OrderBook")
+
+    positions = [leg.position for leg in materialized_legs]
+    if set(positions) != set(range(len(materialized_legs))):
+        raise ValueError("leg positions must be unique and contiguous from zero")
+
+    evidence_token_ids = [book.token_id for book in materialized_evidence]
+    if len(evidence_token_ids) != len(set(evidence_token_ids)):
+        raise ValueError("order-book evidence token IDs must be unique")
+    evidence_identities = {
+        (book.market_id, book.token_id) for book in materialized_evidence
+    }
+    trade_identities = {
+        (leg.market_id, leg.token_id)
+        for leg in materialized_legs
+        if leg.action in _TRADE_ACTIONS
+    }
+    if trade_identities != evidence_identities:
+        raise ValueError("order-book evidence must correspond exactly to trade legs")
+
+    return (
+        tuple(sorted(materialized_legs, key=lambda leg: leg.position)),
+        tuple(
+            sorted(
+                materialized_evidence,
+                key=lambda book: (
+                    book.market_id.encode("utf-8"),
+                    book.token_id.encode("utf-8"),
+                ),
+            )
+        ),
+    )
 
 
 def _sorted_unique(
@@ -275,20 +339,6 @@ def _sorted_unique(
     if len(identities) != len(set(identities)):
         raise ValueError(f"{field_name} must not contain duplicate IDs")
     return tuple(sorted(items, key=lambda item: getattr(item, key).encode("utf-8")))
-
-
-def _freeze_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    if any(not isinstance(key, str) for key in value):
-        raise ValueError("mapping keys must be strings")
-    return MappingProxyType({key: _freeze_value(item) for key, item in value.items()})
-
-
-def _freeze_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return _freeze_mapping(value)
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_value(item) for item in value)
-    return value
 
 
 def _identifier(value: object, field_name: str) -> None:

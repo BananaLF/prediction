@@ -101,10 +101,20 @@ class FeeSchedule:
 class FeeCalculator:
     @staticmethod
     def calculate(
-        schedule: FeeSchedule, price: Decimal, quantity: Decimal
+        schedule: FeeSchedule,
+        price: Decimal,
+        quantity: Decimal,
+        *,
+        evaluated_at_ms: int,
+        max_age_seconds: int,
     ) -> Decimal:
         if not isinstance(schedule, FeeSchedule):
             raise ValueError("schedule must be a FeeSchedule")
+        if schedule.is_stale(
+            evaluated_at=evaluated_at_ms,
+            max_age_seconds=max_age_seconds,
+        ):
+            raise ValueError("fee schedule is stale")
         _finite_decimal(price, "price")
         _finite_decimal(quantity, "quantity")
         if not Decimal("0") <= price <= Decimal("1"):
