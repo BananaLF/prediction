@@ -61,31 +61,43 @@ class DatabaseWriter:
         self._connection: aiosqlite.Connection | None = None
         self._worker: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._lifecycle_lock = asyncio.Lock()
         self._started = False
         self._closing = False
         self._closed = False
 
     async def start(self) -> None:
-        if self._started:
-            return
-        if self._closed:
-            raise DatabaseWriterClosedError("database writer cannot be restarted")
-        initialize_database(self._path)
-        connection = await aiosqlite.connect(self._path, isolation_level=None)
-        try:
-            await connection.execute("PRAGMA foreign_keys = ON")
-            await connection.execute(
-                f"PRAGMA busy_timeout = {self._busy_timeout_ms}"
+        async with self._lifecycle_lock:
+            if self._closing or self._closed:
+                raise DatabaseWriterClosedError(
+                    "database writer cannot be restarted"
+                )
+            if self._started:
+                return
+            initialize_database(self._path)
+            connection: aiosqlite.Connection | None = None
+            try:
+                connection = await aiosqlite.connect(
+                    self._path,
+                    isolation_level=None,
+                )
+                self._raise_if_closing()
+                await connection.execute("PRAGMA foreign_keys = ON")
+                self._raise_if_closing()
+                await connection.execute(
+                    f"PRAGMA busy_timeout = {self._busy_timeout_ms}"
+                )
+                self._raise_if_closing()
+            except BaseException:
+                if connection is not None:
+                    await asyncio.shield(connection.close())
+                raise
+            self._connection = connection
+            self._started = True
+            self._worker = asyncio.create_task(
+                self._run(),
+                name=f"database-writer:{self._path.name}",
             )
-        except BaseException:
-            await connection.close()
-            raise
-        self._connection = connection
-        self._started = True
-        self._worker = asyncio.create_task(
-            self._run(),
-            name=f"database-writer:{self._path.name}",
-        )
 
     async def execute(self, command: DatabaseCommand[T]) -> T:
         if not callable(command):
@@ -103,10 +115,6 @@ class DatabaseWriter:
     async def close(self) -> None:
         if self._closed:
             return
-        if not self._started:
-            self._closed = True
-            self._closing = True
-            return
         if self._close_task is None:
             self._closing = True
             self._close_task = asyncio.create_task(
@@ -116,18 +124,33 @@ class DatabaseWriter:
         await asyncio.shield(self._close_task)
 
     async def _finish_close(self) -> None:
-        worker = self._worker
-        connection = self._connection
-        assert worker is not None
-        assert connection is not None
-        await self._queue.put(_STOP)
-        try:
-            await worker
-        finally:
-            await connection.close()
-            self._connection = None
-            self._worker = None
-            self._closed = True
+        async with self._lifecycle_lock:
+            if self._closed:
+                return
+            if not self._started:
+                self._closed = True
+                return
+            worker = self._worker
+            connection = self._connection
+            assert worker is not None
+            assert connection is not None
+            await self._queue.put(_STOP)
+            try:
+                await worker
+            finally:
+                try:
+                    await connection.close()
+                finally:
+                    self._connection = None
+                    self._worker = None
+                    self._started = False
+                    self._closed = True
+
+    def _raise_if_closing(self) -> None:
+        if self._closing or self._closed:
+            raise DatabaseWriterClosedError(
+                "database writer closed during startup"
+            )
 
     async def _run(self) -> None:
         connection = self._connection

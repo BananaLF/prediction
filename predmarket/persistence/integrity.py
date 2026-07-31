@@ -340,6 +340,32 @@ def _check_revision_payloads(
             )
         if not valid:
             _add(violations, "REVISION_PAYLOAD_INVALID")
+        trade_identities = {
+            (identity["market_id"], identity["token_id"])
+            for identity in connection.execute(
+                """
+                SELECT market_id, token_id
+                FROM signal_legs
+                WHERE signal_id = ?
+                  AND revision = ?
+                  AND action IN ('BUY', 'SELL')
+                """,
+                (row["signal_id"], row["revision"]),
+            )
+        }
+        evidence_identities = {
+            (identity["market_id"], identity["token_id"])
+            for identity in connection.execute(
+                """
+                SELECT market_id, token_id
+                FROM orderbook_snapshots
+                WHERE signal_id = ? AND revision = ?
+                """,
+                (row["signal_id"], row["revision"]),
+            )
+        }
+        if trade_identities != evidence_identities:
+            _add(violations, "EVIDENCE_IDENTITY_MISMATCH")
 
     for row in connection.execute(
         """

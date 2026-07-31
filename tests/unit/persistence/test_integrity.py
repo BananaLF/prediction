@@ -289,6 +289,92 @@ def test_integrity_rejects_cross_market_token_reference(tmp_path: Path) -> None:
     _assert_violation(database_path, "FOREIGN_KEY_VIOLATION")
 
 
+def test_integrity_rejects_evidence_for_a_different_token_than_trade_leg(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+    _corrupt(
+        database_path,
+        """
+        INSERT INTO tokens (
+            id, market_id, outcome, position, sync_generation,
+            sync_generation_complete, created_at, updated_at
+        ) VALUES ('token-2', 'market-1', 'NO', 1, 'sync-1', 1, 1, 1)
+        """
+    )
+    _corrupt(
+        database_path,
+        """
+        UPDATE orderbook_snapshots
+        SET token_id = 'token-2'
+        WHERE id = 'snapshot-1'
+        """
+    )
+
+    _assert_violation(database_path, "EVIDENCE_IDENTITY_MISMATCH")
+
+
+def test_integrity_accepts_duplicate_trade_identity_with_one_snapshot(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+    _corrupt(
+        database_path,
+        """
+        INSERT INTO signal_legs (
+            signal_id, revision, position, market_id, token_id, action,
+            side, quantity, average_price, worst_price, gross_amount,
+            fee_amount
+        ) VALUES ('signal-1', 1, 1, 'market-1', 'token-1', 'BUY', 'BUY',
+                  '1', '0.4', '0.4', '0.4', '0')
+        """
+    )
+
+    check_database_integrity(database_path)
+
+
+def test_integrity_accepts_multiple_matching_trade_and_snapshot_identities(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+    _corrupt(
+        database_path,
+        """
+        INSERT INTO tokens (
+            id, market_id, outcome, position, sync_generation,
+            sync_generation_complete, created_at, updated_at
+        ) VALUES ('token-2', 'market-1', 'NO', 1, 'sync-1', 1, 1, 1)
+        """
+    )
+    _corrupt(
+        database_path,
+        """
+        INSERT INTO signal_legs (
+            signal_id, revision, position, market_id, token_id, action,
+            side, quantity, average_price, worst_price, gross_amount,
+            fee_amount
+        ) VALUES ('signal-1', 1, 1, 'market-1', 'token-2', 'SELL', 'SELL',
+                  '1', '0.6', '0.6', '0.6', '0')
+        """
+    )
+    _corrupt(
+        database_path,
+        """
+        INSERT INTO orderbook_snapshots (
+            id, signal_id, revision, market_id, token_id,
+            subscription_generation, book_hash, exchange_timestamp,
+            received_timestamp, tick_size, minimum_order_size
+        ) VALUES ('snapshot-2', 'signal-1', 1, 'market-1', 'token-2',
+                  1, 'hash-2', 1, 1, '0.01', '1')
+        """
+    )
+
+    check_database_integrity(database_path)
+
+
 def test_integrity_rejects_economic_revision_without_legs_or_evidence(
     tmp_path: Path,
 ) -> None:

@@ -39,14 +39,27 @@ class CatalogRepository:
         materialized_tokens = _typed_tuple(tokens, Token, "tokens")
 
         async def command(connection: aiosqlite.Connection) -> None:
+            affected_event_ids = {event.id for event in materialized_events}
+            for market in materialized_markets:
+                affected_event_ids.add(market.event_id)
+                cursor = await connection.execute(
+                    "SELECT event_id FROM markets WHERE id = ?",
+                    (market.id,),
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    affected_event_ids.add(row[0])
             for event in materialized_events:
                 await connection.execute(_UPSERT_EVENT, _event_values(event))
             for market in materialized_markets:
                 await connection.execute(_UPSERT_MARKET, _market_values(market))
             for token in materialized_tokens:
                 await connection.execute(_UPSERT_TOKEN, _token_values(token))
-            for event in materialized_events:
-                await _validate_event_markets(connection, event.id, event.market_ids)
+            for event_id in sorted(
+                affected_event_ids,
+                key=lambda value: value.encode("utf-8"),
+            ):
+                await _validate_stored_event_markets(connection, event_id)
 
         await self._writer.execute(command)
 
@@ -118,10 +131,18 @@ class RelationRepository:
             )
             row = await cursor.fetchone()
             previous = None if row is None else RelationStatus(row[0])
-            if previous is not None and relation.status not in {
-                previous,
-                _next_relation_status(previous),
-            }:
+            if (
+                previous is None
+                and relation.status is not RelationStatus.NO_LLM_APPROVE
+            ):
+                raise ValueError(
+                    "initial relation status must be NO_LLM_APPROVE"
+                )
+            if (
+                previous is not None
+                and relation.status
+                not in {previous, _next_relation_status(previous)}
+            ):
                 raise ValueError(
                     f"invalid persisted relation transition: "
                     f"{previous.value} -> {relation.status.value}"
@@ -828,6 +849,24 @@ async def _validate_event_markets(
     actual = tuple(row[0] for row in await cursor.fetchall())
     if actual != expected:
         raise ValueError(f"event {event_id!r} market_ids do not match its markets")
+
+
+async def _validate_stored_event_markets(
+    connection: aiosqlite.Connection,
+    event_id: str,
+) -> None:
+    cursor = await connection.execute(
+        "SELECT market_ids_json FROM events WHERE id = ?",
+        (event_id,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        raise ValueError(f"event {event_id!r} does not exist")
+    await _validate_event_markets(
+        connection,
+        event_id,
+        tuple(json.loads(row[0])),
+    )
 
 
 async def _fetch_one(

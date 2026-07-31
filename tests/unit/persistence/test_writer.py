@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 import sqlite3
 
 import pytest
 
+import predmarket.persistence.writer as writer_module
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
 from predmarket.domain.relation import DiscoverySource, Relation, RelationStatus
@@ -150,6 +152,263 @@ async def test_writer_concurrent_close_calls_share_one_shutdown(
         await writer.execute(lambda connection: None)
 
 
+async def test_writer_close_during_connection_creation_cleans_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_connect = writer_module.aiosqlite.connect
+
+    class DelayedConnection:
+        def __init__(self, connection: object) -> None:
+            self._connection = connection
+
+        def __await__(self) -> object:
+            async def wait_for_release() -> object:
+                entered.set()
+                await release.wait()
+                return await self._connection  # type: ignore[misc]
+
+            return wait_for_release().__await__()
+
+    def delayed_connect(*args: object, **kwargs: object) -> DelayedConnection:
+        return DelayedConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(writer_module.aiosqlite, "connect", delayed_connect)
+    writer = DatabaseWriter(tmp_path / "market.db")
+    start_task = asyncio.create_task(writer.start())
+    await entered.wait()
+    close_task = asyncio.create_task(writer.close())
+    await asyncio.sleep(0)
+    release.set()
+
+    try:
+        with pytest.raises(DatabaseWriterClosedError):
+            await start_task
+        await close_task
+        assert writer._connection is None
+        assert writer._worker is None
+        assert writer._closed is True
+    finally:
+        if writer._connection is not None or writer._worker is not None:
+            writer._closed = False
+            writer._closing = False
+            writer._close_task = None
+            await writer.close()
+
+
+async def test_writer_concurrent_start_calls_create_one_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    real_connect = writer_module.aiosqlite.connect
+
+    class DelayedConnection:
+        def __init__(self, connection: object) -> None:
+            self._connection = connection
+
+        def __await__(self) -> object:
+            async def wait_for_release() -> object:
+                entered.set()
+                await release.wait()
+                return await self._connection  # type: ignore[misc]
+
+            return wait_for_release().__await__()
+
+    def delayed_connect(*args: object, **kwargs: object) -> DelayedConnection:
+        nonlocal calls
+        calls += 1
+        return DelayedConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(writer_module.aiosqlite, "connect", delayed_connect)
+    writer = DatabaseWriter(tmp_path / "market.db")
+    starts = [asyncio.create_task(writer.start()) for _ in range(2)]
+    await entered.wait()
+    await asyncio.sleep(0)
+
+    if calls != 1:
+        for task in starts:
+            task.cancel()
+        await asyncio.gather(*starts, return_exceptions=True)
+        assert calls == 1
+
+    release.set()
+    await asyncio.gather(*starts)
+    try:
+        assert calls == 1
+    finally:
+        await writer.close()
+
+
+async def test_writer_close_during_connection_configuration_closes_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_connect = writer_module.aiosqlite.connect
+    proxy: object | None = None
+
+    class BlockingConnection:
+        def __init__(self, connection: object) -> None:
+            self._connection = connection
+            self.closed = False
+            self._blocked = False
+
+        async def execute(self, sql: str) -> object:
+            if not self._blocked:
+                self._blocked = True
+                entered.set()
+                await release.wait()
+            return await self._connection.execute(sql)  # type: ignore[attr-defined]
+
+        async def close(self) -> None:
+            self.closed = True
+            await self._connection.close()  # type: ignore[attr-defined]
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._connection, name)
+
+    class ProxiedConnection:
+        def __init__(self, connection: object) -> None:
+            self._connection = connection
+
+        def __await__(self) -> object:
+            async def create_proxy() -> object:
+                nonlocal proxy
+                connection = await self._connection  # type: ignore[misc]
+                proxy = BlockingConnection(connection)
+                return proxy
+
+            return create_proxy().__await__()
+
+    def proxied_connect(*args: object, **kwargs: object) -> ProxiedConnection:
+        return ProxiedConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(writer_module.aiosqlite, "connect", proxied_connect)
+    writer = DatabaseWriter(tmp_path / "market.db")
+    start_task = asyncio.create_task(writer.start())
+    await entered.wait()
+    close_task = asyncio.create_task(writer.close())
+    await asyncio.sleep(0)
+    release.set()
+
+    try:
+        with pytest.raises(DatabaseWriterClosedError):
+            await start_task
+        await close_task
+        assert proxy is not None
+        assert proxy.closed is True  # type: ignore[union-attr]
+        assert writer._connection is None
+        assert writer._worker is None
+    finally:
+        if writer._connection is not None or writer._worker is not None:
+            writer._closed = False
+            writer._closing = False
+            writer._close_task = None
+            await writer.close()
+
+
+async def test_writer_cancelled_start_can_be_retried_without_leaked_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_connect = writer_module.aiosqlite.connect
+
+    class DelayedConnection:
+        def __init__(self, connection: object) -> None:
+            self._connection = connection
+
+        def __await__(self) -> object:
+            async def wait_for_release() -> object:
+                entered.set()
+                await release.wait()
+                return await self._connection  # type: ignore[misc]
+
+            return wait_for_release().__await__()
+
+    def delayed_connect(*args: object, **kwargs: object) -> DelayedConnection:
+        return DelayedConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(writer_module.aiosqlite, "connect", delayed_connect)
+    writer = DatabaseWriter(tmp_path / "market.db")
+    start_task = asyncio.create_task(writer.start())
+    await entered.wait()
+    start_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+    assert writer._connection is None
+    assert writer._worker is None
+    assert writer._started is False
+    assert writer._closed is False
+
+    release.set()
+    await writer.start()
+    await writer.close()
+
+
+async def test_writer_cancelled_close_still_finishes_shared_shutdown(
+    tmp_path: Path,
+) -> None:
+    writer = DatabaseWriter(tmp_path / "market.db", queue_size=1)
+    await writer.start()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking(connection: object) -> None:
+        entered.set()
+        await release.wait()
+
+    first = asyncio.create_task(writer.execute(blocking))
+    await entered.wait()
+    second = asyncio.create_task(writer.execute(lambda connection: None))
+    await asyncio.sleep(0)
+    close_task = asyncio.create_task(writer.close())
+    await asyncio.sleep(0)
+    close_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    release.set()
+    await first
+    await second
+    await writer.close()
+    assert writer._connection is None
+    assert writer._worker is None
+    assert writer._closed is True
+
+
+async def test_writer_start_is_rejected_after_close_begins(
+    tmp_path: Path,
+) -> None:
+    writer = DatabaseWriter(tmp_path / "market.db")
+    await writer.start()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking(connection: object) -> None:
+        entered.set()
+        await release.wait()
+
+    command = asyncio.create_task(writer.execute(blocking))
+    await entered.wait()
+    close_task = asyncio.create_task(writer.close())
+    await asyncio.sleep(0)
+    try:
+        with pytest.raises(DatabaseWriterClosedError):
+            await writer.start()
+    finally:
+        release.set()
+        await command
+        await close_task
+
+
 async def test_repositories_round_trip_typed_catalog_and_relation_records(
     tmp_path: Path,
 ) -> None:
@@ -158,6 +417,7 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
     await writer.start()
     catalog = CatalogRepository(database_path, writer)
     relations = RelationRepository(database_path, writer)
+    system_events = SystemEventRepository(database_path, writer)
     event = Event(
         id="event-1",
         title="Event",
@@ -226,13 +486,47 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
             tokens=(token,),
         )
         await relations.save(relation)
+        for invalid_initial_status in (
+            RelationStatus.LLM_APPROVE,
+            RelationStatus.APPROVED,
+        ):
+            with pytest.raises(ValueError, match="initial"):
+                await relations.save(
+                    Relation(
+                        id=f"relation-bad-{invalid_initial_status.value}",
+                        market_a_id="market-2",
+                        market_b_id="market-1",
+                        status=invalid_initial_status,
+                        discovery_source=DiscoverySource.MANUAL,
+                        created_at=2,
+                        updated_at=2,
+                    )
+                )
+        llm_approved = relation.transition_to(
+            RelationStatus.LLM_APPROVE,
+            updated_at=3,
+        )
+        approved = llm_approved.transition_to(
+            RelationStatus.APPROVED,
+            updated_at=4,
+        )
+        await relations.save(llm_approved)
+        await relations.save(approved)
         stored_market = await catalog.get_market("market-1")
         stored_relation = await relations.get("relation-1")
+        activation_events = await system_events.read_after(0)
     finally:
         await writer.close()
 
     assert stored_market == market
-    assert stored_relation == relation
+    assert stored_relation == approved
+    assert tuple(
+        (
+            event["event_type"],
+            event["details"],
+        )
+        for event in activation_events
+    ) == (("RELATION_ACTIVATED", {"relation_id": "relation-1"}),)
     with sqlite3.connect(database_path) as connection:
         encoded = connection.execute(
             "SELECT market_ids_json, neg_risk_metadata_json FROM events"
@@ -289,8 +583,20 @@ async def test_catalog_single_entity_write_cannot_break_event_market_consistency
             markets=(first_market,),
             tokens=(),
         )
+        await catalog.save_catalog(
+            events=(),
+            markets=(replace(first_market, question="Updated question?"),),
+            tokens=(),
+        )
+        assert (await catalog.get_market("market-1")).question == "Updated question?"  # type: ignore[union-attr]
         with pytest.raises(ValueError, match="market_ids"):
             await catalog.save_market(extra_market)
+        with pytest.raises(ValueError, match="market_ids"):
+            await catalog.save_catalog(
+                events=(),
+                markets=(extra_market,),
+                tokens=(),
+            )
     finally:
         await writer.close()
 
