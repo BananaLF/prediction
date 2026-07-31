@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections import deque
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -192,6 +193,8 @@ class _SdkLifecycleProbe:
             or handle_dropped < 0
         ):
             return None, _InvalidReason.SDK_LIFECYCLE_STATE_UNKNOWN
+        if handle_dropped != 0:
+            return None, _InvalidReason.SUBSCRIPTION_EVENT_DROPPED
         if not manager_open or socket is None:
             return None, _InvalidReason.CONNECTION_LOST
         return (
@@ -266,6 +269,10 @@ class MarketSubscription(
         self._lifecycle_poll_interval = lifecycle_poll_interval
         self._closed = False
         self._terminal = False
+        self._close_task: asyncio.Task[None] | None = None
+        self._close_error: BaseException | None = None
+        self._invalid_reason: _InvalidReason | None = None
+        self._buffered_events: deque[MarketStreamEvent] = deque()
 
     def __aiter__(self) -> "MarketSubscription":
         return self
@@ -275,8 +282,13 @@ class MarketSubscription(
         return self._subscription_generation
 
     async def __anext__(self) -> MarketStreamEvent | MarketStreamInvalidated:
-        if self._closed or self._terminal:
+        if self._close_task is not None or self._closed or self._terminal:
             raise StopAsyncIteration
+        if self._buffered_events:
+            return self._buffered_events.popleft()
+        return await self._next_live()
+
+    async def _next_live(self) -> MarketStreamEvent | MarketStreamInvalidated:
         if self._initial_invalid_reason is not None:
             reason = self._initial_invalid_reason
             self._initial_invalid_reason = None
@@ -328,11 +340,72 @@ class MarketSubscription(
             if mapped is not None:
                 return mapped
 
+    async def _guard_awaitable(self, awaitable: Awaitable[Any]) -> Any:
+        """Buffer stream events while rejecting an invalid recovery baseline."""
+        operation_task = asyncio.ensure_future(awaitable)
+        live_task: asyncio.Task[
+            MarketStreamEvent | MarketStreamInvalidated
+        ] | None = None
+        buffered: list[MarketStreamEvent] = []
+        try:
+            while True:
+                live_task = asyncio.create_task(self._next_live())
+                done, _pending = await asyncio.wait(
+                    (operation_task, live_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if live_task not in done:
+                    await asyncio.sleep(0)
+                if live_task.done():
+                    item = live_task.result()
+                    live_task = None
+                    if isinstance(item, MarketStreamInvalidated):
+                        raise GatewayLifecycleError(
+                            f"recovery stream invalidated: {item.reason}"
+                        )
+                    buffered.append(item)
+                    if not operation_task.done():
+                        continue
+                else:
+                    live_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await live_task
+                    live_task = None
+
+                result = operation_task.result()
+                reason = self._current_invalid_reason()
+                if reason is not None:
+                    await self._invalidate(reason)
+                    raise GatewayLifecycleError(
+                        f"recovery stream invalidated: {reason.value}"
+                    )
+                self._buffered_events.extend(buffered)
+                return result
+        except BaseException:
+            for task in (live_task, operation_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (live_task, operation_task) if task is not None),
+                return_exceptions=True,
+            )
+            raise
+
     async def close(self) -> None:
-        if not self._closed:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._finish_close())
+        await asyncio.shield(self._close_task)
+        if self._close_error is not None:
+            raise self._close_error
+
+    async def _finish_close(self) -> None:
+        try:
+            await self._handle.close()
+        except BaseException as error:
+            self._close_error = error
+        else:
             self._closed = True
             self._terminal = True
-            await self._handle.close()
 
     async def _wait_for_invalidation(self) -> _InvalidReason:
         assert self._lifecycle_probe is not None
@@ -342,13 +415,21 @@ class MarketSubscription(
             if reason is not None:
                 return reason
 
+    def _current_invalid_reason(self) -> _InvalidReason | None:
+        if self._invalid_reason is not None:
+            return self._invalid_reason
+        if self._initial_invalid_reason is not None:
+            return self._initial_invalid_reason
+        if self._lifecycle_probe is None:
+            return _InvalidReason.SDK_LIFECYCLE_SHAPE_CHANGED
+        return self._lifecycle_probe.check()
+
     async def _invalidate(
         self,
         reason: _InvalidReason,
     ) -> MarketStreamInvalidated:
-        self._closed = True
-        self._terminal = True
-        await self._handle.close()
+        self._invalid_reason = reason
+        await self.close()
         return MarketStreamInvalidated(
             reason=reason.value,
             token_ids=self._token_ids,
@@ -471,9 +552,11 @@ class PolymarketGateway:
             subscription_generation=generation,
         )
         try:
-            books = await self._get_order_books_for_generation(
-                normalized,
-                subscription_generation=generation,
+            books = await subscription._guard_awaitable(
+                self._get_order_books_for_generation(
+                    normalized,
+                    subscription_generation=generation,
+                )
             )
         except BaseException:
             await subscription.close()
