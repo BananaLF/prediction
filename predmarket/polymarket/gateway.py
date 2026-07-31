@@ -60,6 +60,11 @@ async def probe_pinned_sdk_lifecycle_shape() -> Mapping[str, Any]:
         if "_socket" not in vars(connection):
             raise GatewayLifecycleError("SDK connection has no _socket attribute")
         handle: AsyncSubscriptionHandle[Any] = AsyncSubscriptionHandle(queue_size=1)
+        if "_queue" not in vars(handle):
+            raise GatewayLifecycleError("SDK handle has no _queue attribute")
+        queue_maxsize = handle._queue.maxsize
+        if type(queue_maxsize) is not int or queue_maxsize < 1:
+            raise GatewayLifecycleError("SDK handle queue maxsize is invalid")
         return {
             "version": version,
             "client_manager_attribute": "_market_manager",
@@ -68,6 +73,8 @@ async def probe_pinned_sdk_lifecycle_shape() -> Mapping[str, Any]:
             "manager_open_property": "is_open",
             "manager_dropped_property": "dropped_events",
             "handle_dropped_property": "dropped",
+            "handle_queue_attribute": "_queue",
+            "handle_queue_maxsize": queue_maxsize,
             "initial_manager_open": manager.is_open,
             "initial_socket_is_none": connection._socket is None,
             "initial_manager_dropped": manager.dropped_events,
@@ -133,6 +140,7 @@ class _InvalidReason(str, Enum):
     SDK_VERSION_CHANGED = "sdk_version_changed"
     SDK_HANDLE_ENDED = "sdk_handle_ended"
     SDK_EVENT_INVALID = "sdk_event_invalid"
+    RECOVERY_BUFFER_OVERFLOW = "recovery_buffer_overflow"
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +174,8 @@ class _SdkLifecycleProbe:
     socket: Any
     manager_dropped: int
     handle_dropped: int
+    handle_queue: Any
+    handle_queue_maxsize: int
 
     @classmethod
     def capture(
@@ -183,6 +193,8 @@ class _SdkLifecycleProbe:
             manager_open = manager.is_open
             manager_dropped = manager.dropped_events
             handle_dropped = handle.dropped
+            handle_queue = vars(handle)["_queue"]
+            handle_queue_maxsize = handle_queue.maxsize
         except (AttributeError, KeyError, TypeError):
             return None, _InvalidReason.SDK_LIFECYCLE_SHAPE_CHANGED
         if (
@@ -191,6 +203,8 @@ class _SdkLifecycleProbe:
             or manager_dropped < 0
             or type(handle_dropped) is not int
             or handle_dropped < 0
+            or type(handle_queue_maxsize) is not int
+            or handle_queue_maxsize < 1
         ):
             return None, _InvalidReason.SDK_LIFECYCLE_STATE_UNKNOWN
         if handle_dropped != 0:
@@ -206,6 +220,8 @@ class _SdkLifecycleProbe:
                 socket=socket,
                 manager_dropped=manager_dropped,
                 handle_dropped=handle_dropped,
+                handle_queue=handle_queue,
+                handle_queue_maxsize=handle_queue_maxsize,
             ),
             None,
         )
@@ -220,9 +236,16 @@ class _SdkLifecycleProbe:
             manager_open = manager.is_open
             manager_dropped = manager.dropped_events
             handle_dropped = self.handle.dropped
+            handle_queue = vars(self.handle)["_queue"]
+            handle_queue_maxsize = handle_queue.maxsize
         except (AttributeError, KeyError, TypeError):
             return _InvalidReason.SDK_LIFECYCLE_SHAPE_CHANGED
         if manager is not self.manager or connection is not self.connection:
+            return _InvalidReason.SDK_LIFECYCLE_SHAPE_CHANGED
+        if (
+            handle_queue is not self.handle_queue
+            or handle_queue_maxsize != self.handle_queue_maxsize
+        ):
             return _InvalidReason.SDK_LIFECYCLE_SHAPE_CHANGED
         if (
             type(manager_open) is not bool
@@ -230,6 +253,8 @@ class _SdkLifecycleProbe:
             or manager_dropped < self.manager_dropped
             or type(handle_dropped) is not int
             or handle_dropped < self.handle_dropped
+            or type(handle_queue_maxsize) is not int
+            or handle_queue_maxsize < 1
         ):
             return _InvalidReason.SDK_LIFECYCLE_STATE_UNKNOWN
         if manager_dropped > self.manager_dropped:
@@ -270,9 +295,16 @@ class MarketSubscription(
         self._closed = False
         self._terminal = False
         self._close_task: asyncio.Task[None] | None = None
-        self._close_error: BaseException | None = None
+        self._sdk_close_task: asyncio.Task[None] | None = None
         self._invalid_reason: _InvalidReason | None = None
-        self._buffered_events: deque[MarketStreamEvent] = deque()
+        self._recovery_buffer_capacity = (
+            lifecycle_probe.handle_queue_maxsize
+            if lifecycle_probe is not None
+            else 0
+        )
+        self._buffered_events: deque[MarketStreamEvent] = deque(
+            maxlen=self._recovery_buffer_capacity
+        )
 
     def __aiter__(self) -> "MarketSubscription":
         return self
@@ -363,6 +395,18 @@ class MarketSubscription(
                         raise GatewayLifecycleError(
                             f"recovery stream invalidated: {item.reason}"
                         )
+                    if len(buffered) >= self._recovery_buffer_capacity:
+                        reason = _InvalidReason.RECOVERY_BUFFER_OVERFLOW
+                        if not operation_task.done():
+                            operation_task.cancel()
+                            await asyncio.gather(
+                                operation_task,
+                                return_exceptions=True,
+                            )
+                        await self._invalidate(reason)
+                        raise GatewayLifecycleError(
+                            f"recovery stream invalidated: {reason.value}"
+                        )
                     buffered.append(item)
                     if not operation_task.done():
                         continue
@@ -375,6 +419,21 @@ class MarketSubscription(
                 result = operation_task.result()
                 reason = self._current_invalid_reason()
                 if reason is not None:
+                    await self._invalidate(reason)
+                    raise GatewayLifecycleError(
+                        f"recovery stream invalidated: {reason.value}"
+                    )
+                if (
+                    len(self._buffered_events) + len(buffered)
+                    > self._recovery_buffer_capacity
+                ):
+                    reason = _InvalidReason.RECOVERY_BUFFER_OVERFLOW
+                    if not operation_task.done():
+                        operation_task.cancel()
+                        await asyncio.gather(
+                            operation_task,
+                            return_exceptions=True,
+                        )
                     await self._invalidate(reason)
                     raise GatewayLifecycleError(
                         f"recovery stream invalidated: {reason.value}"
@@ -392,20 +451,16 @@ class MarketSubscription(
             raise
 
     async def close(self) -> None:
-        if self._close_task is None:
+        if self._close_task is None or self._close_task.cancelled():
             self._close_task = asyncio.create_task(self._finish_close())
         await asyncio.shield(self._close_task)
-        if self._close_error is not None:
-            raise self._close_error
 
     async def _finish_close(self) -> None:
-        try:
-            await self._handle.close()
-        except BaseException as error:
-            self._close_error = error
-        else:
-            self._closed = True
-            self._terminal = True
+        if self._sdk_close_task is None:
+            self._sdk_close_task = asyncio.create_task(self._handle.close())
+        await asyncio.shield(self._sdk_close_task)
+        self._closed = True
+        self._terminal = True
 
     async def _wait_for_invalidation(self) -> _InvalidReason:
         assert self._lifecycle_probe is not None
