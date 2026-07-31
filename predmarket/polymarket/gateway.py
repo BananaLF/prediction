@@ -62,9 +62,14 @@ async def probe_pinned_sdk_lifecycle_shape() -> Mapping[str, Any]:
         handle: AsyncSubscriptionHandle[Any] = AsyncSubscriptionHandle(queue_size=1)
         if "_queue" not in vars(handle):
             raise GatewayLifecycleError("SDK handle has no _queue attribute")
+        if "_ended" not in vars(handle):
+            raise GatewayLifecycleError("SDK handle has no _ended attribute")
         queue_maxsize = handle._queue.maxsize
         if type(queue_maxsize) is not int or queue_maxsize < 1:
             raise GatewayLifecycleError("SDK handle queue maxsize is invalid")
+        handle_ended = handle._ended
+        if type(handle_ended) is not bool:
+            raise GatewayLifecycleError("SDK handle ended state is invalid")
         return {
             "version": version,
             "client_manager_attribute": "_market_manager",
@@ -75,10 +80,12 @@ async def probe_pinned_sdk_lifecycle_shape() -> Mapping[str, Any]:
             "handle_dropped_property": "dropped",
             "handle_queue_attribute": "_queue",
             "handle_queue_maxsize": queue_maxsize,
+            "handle_ended_attribute": "_ended",
             "initial_manager_open": manager.is_open,
             "initial_socket_is_none": connection._socket is None,
             "initial_manager_dropped": manager.dropped_events,
             "initial_handle_dropped": handle.dropped,
+            "initial_handle_ended": handle_ended,
         }
     finally:
         await client.close()
@@ -193,8 +200,10 @@ class _SdkLifecycleProbe:
             manager_open = manager.is_open
             manager_dropped = manager.dropped_events
             handle_dropped = handle.dropped
-            handle_queue = vars(handle)["_queue"]
+            handle_state = vars(handle)
+            handle_queue = handle_state["_queue"]
             handle_queue_maxsize = handle_queue.maxsize
+            handle_ended = handle_state["_ended"]
         except (AttributeError, KeyError, TypeError):
             return None, _InvalidReason.SDK_LIFECYCLE_SHAPE_CHANGED
         if (
@@ -205,8 +214,11 @@ class _SdkLifecycleProbe:
             or handle_dropped < 0
             or type(handle_queue_maxsize) is not int
             or handle_queue_maxsize < 1
+            or type(handle_ended) is not bool
         ):
             return None, _InvalidReason.SDK_LIFECYCLE_STATE_UNKNOWN
+        if handle_ended:
+            return None, _InvalidReason.SDK_HANDLE_ENDED
         if handle_dropped != 0:
             return None, _InvalidReason.SUBSCRIPTION_EVENT_DROPPED
         if not manager_open or socket is None:
@@ -236,8 +248,10 @@ class _SdkLifecycleProbe:
             manager_open = manager.is_open
             manager_dropped = manager.dropped_events
             handle_dropped = self.handle.dropped
-            handle_queue = vars(self.handle)["_queue"]
+            handle_state = vars(self.handle)
+            handle_queue = handle_state["_queue"]
             handle_queue_maxsize = handle_queue.maxsize
+            handle_ended = handle_state["_ended"]
         except (AttributeError, KeyError, TypeError):
             return _InvalidReason.SDK_LIFECYCLE_SHAPE_CHANGED
         if manager is not self.manager or connection is not self.connection:
@@ -255,8 +269,11 @@ class _SdkLifecycleProbe:
             or handle_dropped < self.handle_dropped
             or type(handle_queue_maxsize) is not int
             or handle_queue_maxsize < 1
+            or type(handle_ended) is not bool
         ):
             return _InvalidReason.SDK_LIFECYCLE_STATE_UNKNOWN
+        if handle_ended:
+            return _InvalidReason.SDK_HANDLE_ENDED
         if manager_dropped > self.manager_dropped:
             return _InvalidReason.SDK_EVENT_DROPPED
         if handle_dropped > self.handle_dropped:
@@ -294,6 +311,7 @@ class MarketSubscription(
         self._lifecycle_poll_interval = lifecycle_poll_interval
         self._closed = False
         self._terminal = False
+        self._normal_close_requested = False
         self._close_task: asyncio.Task[None] | None = None
         self._sdk_close_task: asyncio.Task[None] | None = None
         self._invalid_reason: _InvalidReason | None = None
@@ -354,21 +372,24 @@ class MarketSubscription(
                 raise
             if lifecycle_task in done:
                 event_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await event_task
+                await asyncio.gather(event_task, return_exceptions=True)
                 return await self._invalidate(lifecycle_task.result())
 
             lifecycle_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await lifecycle_task
+            if self._normal_close_requested:
+                await asyncio.gather(event_task, return_exceptions=True)
+                raise StopAsyncIteration
+            reason = self._lifecycle_probe.check()
+            if reason is not None:
+                await asyncio.gather(event_task, return_exceptions=True)
+                return await self._invalidate(reason)
             try:
                 sdk_event = event_task.result()
             except StopAsyncIteration:
                 return await self._invalidate(_InvalidReason.SDK_HANDLE_ENDED)
 
-            reason = self._lifecycle_probe.check()
-            if reason is not None:
-                return await self._invalidate(reason)
             try:
                 mapped = self._mapper(sdk_event)
             except GatewayMappingError:
@@ -455,6 +476,8 @@ class MarketSubscription(
             raise
 
     async def close(self) -> None:
+        if self._invalid_reason is None:
+            self._normal_close_requested = True
         if self._close_task is None or self._close_task.cancelled():
             self._close_task = asyncio.create_task(self._finish_close())
         await asyncio.shield(self._close_task)
@@ -487,6 +510,9 @@ class MarketSubscription(
         self,
         reason: _InvalidReason,
     ) -> MarketStreamInvalidated:
+        if self._normal_close_requested:
+            self._buffered_events.clear()
+            raise StopAsyncIteration
         self._invalid_reason = reason
         await self.close()
         return MarketStreamInvalidated(

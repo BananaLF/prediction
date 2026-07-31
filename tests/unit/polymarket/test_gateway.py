@@ -197,6 +197,7 @@ class FakeSubscriptionHandle:
     def __init__(self, events: tuple[Any, ...] = ()) -> None:
         self._events = iter(events)
         self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1024)
+        self._ended = False
         self._dropped = 0
         self.closed = False
 
@@ -406,10 +407,12 @@ async def test_pinned_sdk_private_lifecycle_shape_is_exactly_supported() -> None
         "handle_dropped_property": "dropped",
         "handle_queue_attribute": "_queue",
         "handle_queue_maxsize": 1,
+        "handle_ended_attribute": "_ended",
         "initial_manager_open": False,
         "initial_socket_is_none": True,
         "initial_manager_dropped": 0,
         "initial_handle_dropped": 0,
+        "initial_handle_ended": False,
     }
 
 
@@ -720,6 +723,73 @@ async def test_recovery_replay_rechecks_lifecycle_before_each_buffered_event(
     assert handle._ended is True
     with pytest.raises(StopAsyncIteration):
         await anext(session.subscription)
+
+
+async def test_recovery_replay_rejects_unexpected_real_sdk_handle_end(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    # Catches an ended generation replaying events buffered before SDK termination.
+    sdk_client = gateway_module.AsyncPublicClient()
+    close_manager = sdk_client._get_market_manager()
+    handle: Any = gateway_module.AsyncSubscriptionHandle(queue_size=2)
+    sdk_subscription = gateway_module.MarketSpec(
+        token_ids=("1001", "1002"),
+        custom_feature_enabled=True,
+    )
+    close_manager._registry.add(
+        sub=sdk_subscription,
+        matcher=lambda _event: True,
+        handle=handle,
+    )
+    handle._bind_close(close_manager._on_handle_close)
+    client = BlockingOrderBookClient(**sdk_fixture)
+    client.subscription_handle = handle
+    gateway = PolymarketGateway(
+        client=client,
+        clock_ms=lambda: 1_785_405_970_000,
+        lifecycle_poll_interval=0.001,
+    )
+    await gateway.list_active_markets()
+    try:
+        condition_id = sdk_fixture["markets"][0].condition_id
+        sdk_event = _real_sdk_market_event(
+            "price_change",
+            condition_id=condition_id,
+        )
+        recovery_task = asyncio.create_task(
+            gateway.recover_market_session(("1001", "1002"))
+        )
+        await asyncio.wait_for(client.books_started.wait(), timeout=0.2)
+
+        for _ in range(2):
+            handle._push(sdk_event)
+            for _ in range(20):
+                if handle._queue.empty():
+                    break
+                await asyncio.sleep(0)
+            assert handle._queue.empty() is True
+        client.books_release.set()
+        session = await asyncio.wait_for(recovery_task, timeout=0.2)
+        assert len(session.subscription._buffered_events) == 2
+
+        handle._end()
+        assert handle._ended is True
+        assert handle.dropped == 0
+
+        invalid = await asyncio.wait_for(
+            anext(session.subscription),
+            timeout=0.2,
+        )
+
+        assert isinstance(invalid, gateway_module.MarketStreamInvalidated)
+        assert invalid.reason == "sdk_handle_ended"
+        assert invalid.subscription_generation == session.subscription_generation
+        assert len(session.subscription._buffered_events) == 0
+        assert close_manager._registry.is_empty is True
+        with pytest.raises(StopAsyncIteration):
+            await anext(session.subscription)
+    finally:
+        await sdk_client.close()
 
 
 async def test_recovery_buffer_is_bounded_by_real_sdk_handle_queue(
@@ -1103,6 +1173,18 @@ async def test_subscription_lifecycle_change_emits_invalid_then_stops(
             ),
             "sdk_lifecycle_state_unknown",
         ),
+        (
+            lambda client: delattr(client.subscription_handle, "_ended"),
+            "sdk_lifecycle_shape_changed",
+        ),
+        (
+            lambda client: setattr(
+                client.subscription_handle,
+                "_ended",
+                "UNKNOWN",
+            ),
+            "sdk_lifecycle_state_unknown",
+        ),
     ],
 )
 async def test_unknown_sdk_lifecycle_shape_or_state_fails_closed(
@@ -1140,6 +1222,113 @@ async def test_unexpected_sdk_handle_end_is_an_invalid_generation(
     assert invalid.reason == "sdk_handle_ended"
     with pytest.raises(StopAsyncIteration):
         await anext(subscription)
+
+
+async def test_real_sdk_handle_error_end_is_an_invalid_generation(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    # Catches an SDK end error bypassing invalidation and cleanup as a raw exception.
+    handle: Any = gateway_module.AsyncSubscriptionHandle(queue_size=1)
+    client = FakePublicClient(**sdk_fixture)
+    client.subscription_handle = handle
+    gateway = PolymarketGateway(
+        client=client,
+        clock_ms=lambda: 1_785_405_970_000,
+        lifecycle_poll_interval=0.001,
+    )
+    await gateway.list_active_markets()
+    subscription = await gateway.subscribe_markets(("1001",))
+    read_task = asyncio.create_task(anext(subscription))
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if handle._queue._getters:
+            break
+    assert handle._queue._getters
+
+    handle._end(RuntimeError("SDK stream failed"))
+    invalid = await asyncio.wait_for(read_task, timeout=0.2)
+
+    assert isinstance(invalid, gateway_module.MarketStreamInvalidated)
+    assert invalid.reason == "sdk_handle_ended"
+    assert handle._ended is True
+    with pytest.raises(StopAsyncIteration):
+        await anext(subscription)
+
+
+async def test_concurrent_handle_error_and_lifecycle_loss_still_invalidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches a simultaneously completed SDK read error escaping the lifecycle branch.
+    release = asyncio.Event()
+
+    class ConcurrentEndingHandle(FakeSubscriptionHandle):
+        async def __anext__(self) -> Any:
+            await release.wait()
+            raise RuntimeError("SDK stream failed")
+
+    async def concurrent_invalidation(
+        _subscription: gateway_module.MarketSubscription,
+    ) -> gateway_module._InvalidReason:
+        await release.wait()
+        return gateway_module._InvalidReason.SDK_HANDLE_ENDED
+
+    monkeypatch.setattr(
+        gateway_module.MarketSubscription,
+        "_wait_for_invalidation",
+        concurrent_invalidation,
+    )
+    handle = ConcurrentEndingHandle()
+    lifecycle_probe = SimpleNamespace(
+        handle_queue_maxsize=handle._queue.maxsize,
+        check=lambda: None,
+    )
+    subscription = gateway_module.MarketSubscription(
+        handle,
+        mapper=lambda _event: None,
+        lifecycle_probe=lifecycle_probe,
+        initial_invalid_reason=None,
+        token_ids=("1001",),
+        subscription_generation=1,
+        clock_ms=lambda: 1_785_405_970_000,
+        lifecycle_poll_interval=0.001,
+    )
+    read_task = asyncio.create_task(anext(subscription))
+    await asyncio.sleep(0)
+    release.set()
+
+    invalid = await asyncio.wait_for(read_task, timeout=0.2)
+
+    assert isinstance(invalid, gateway_module.MarketStreamInvalidated)
+    assert invalid.reason == "sdk_handle_ended"
+    assert handle.closed is True
+
+
+async def test_explicit_subscription_close_is_not_reported_as_sdk_handle_end(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    # Catches wrapper-owned normal close being misreported as stream invalidation.
+    handle: Any = gateway_module.AsyncSubscriptionHandle(queue_size=1)
+    client = FakePublicClient(**sdk_fixture)
+    client.subscription_handle = handle
+    gateway = PolymarketGateway(
+        client=client,
+        clock_ms=lambda: 1_785_405_970_000,
+        lifecycle_poll_interval=0.001,
+    )
+    await gateway.list_active_markets()
+    subscription = await gateway.subscribe_markets(("1001",))
+    read_task = asyncio.create_task(anext(subscription))
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if handle._queue._getters:
+            break
+    assert handle._queue._getters
+
+    await subscription.close()
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(read_task, timeout=0.2)
+    assert subscription._invalid_reason is None
 
 
 async def test_cancelled_subscription_read_cleans_up_internal_event_wait(
