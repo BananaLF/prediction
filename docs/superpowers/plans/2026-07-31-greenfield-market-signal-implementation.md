@@ -166,7 +166,8 @@ git commit -m "refactor: establish greenfield project skeleton"
 
 **Interfaces:**
 - Produces: `parse_decimal(text: str) -> Decimal`, `encode_decimal(value: Decimal) -> str`
-- Produces: `FeeSchedule.from_json(data)`, `FeeCalculator.calculate(schedule, price, quantity) -> Decimal`
+- Produces: `FeeSchedule.from_json(data)`,
+  `FeeCalculator.calculate(schedule, price, quantity, *, evaluated_at_ms, max_age_seconds) -> Decimal`
 - Produces: immutable `Event`, `Market`, `Token`, `OrderBook`, `OrderBookLevel`, `Relation`
 - Produces: `OpportunityPresent`, `OpportunityAbsent`, `NotEvaluable`, `StrategyContext`
 
