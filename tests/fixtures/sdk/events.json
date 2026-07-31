@@ -1,0 +1,419 @@
+{
+  "events": [
+    {
+      "id": "100",
+      "parent_event_id": null,
+      "ticker": "SDK",
+      "slug": "sdk-neg-risk-event",
+      "title": "SDK NegRisk event",
+      "subtitle": null,
+      "description": "Fixture for the pinned public SDK model.",
+      "category": "fixture",
+      "subcategory": null,
+      "image": null,
+      "icon": null,
+      "featured_image": null,
+      "created_at": "2026-07-30T10:00:00Z",
+      "updated_at": "2026-07-30T10:05:00Z",
+      "published_at": "2026-07-30T10:01:00Z",
+      "state": {
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "new": false,
+        "featured": false,
+        "restricted": false,
+        "cyom": false,
+        "live": true,
+        "ended": false,
+        "automatically_active": true,
+        "comments_enabled": true,
+        "requires_translation": false
+      },
+      "schedule": {
+        "start_date": "2026-07-30T10:00:00Z",
+        "creation_date": "2026-07-30T09:55:00Z",
+        "end_date": "2026-08-30T10:00:00Z",
+        "closed_time": null,
+        "start_time": "2026-07-30T10:00:00Z",
+        "event_date": "2026-07-30",
+        "event_week": 31,
+        "finished_at": null
+      },
+      "metrics": {
+        "liquidity": "1000",
+        "liquidity_amm": "0",
+        "liquidity_clob": "1000",
+        "volume": "500",
+        "volume_24hr": "50",
+        "volume_1wk": "100",
+        "volume_1mo": "500",
+        "volume_1yr": "500",
+        "open_interest": "100",
+        "competitive": 0.75,
+        "comment_count": 2,
+        "tweet_count": 0
+      },
+      "display": {
+        "sort_by": null,
+        "show_all_outcomes": true,
+        "show_market_images": false,
+        "gmp_chart_mode": null,
+        "color": null,
+        "featured_order": null,
+        "country_name": null,
+        "election_type": null,
+        "image_optimized": null,
+        "icon_optimized": null,
+        "featured_image_optimized": null
+      },
+      "trading": {
+        "enable_order_book": true,
+        "neg_risk": true,
+        "neg_risk_market_id": "neg-risk-100",
+        "neg_risk_fee_bips": 25.0,
+        "enable_neg_risk": true,
+        "neg_risk_augmented": false,
+        "cumulative_markets": false
+      },
+      "resolution": {
+        "source": "Fixture resolution source",
+        "automatically_resolved": false
+      },
+      "estimation": {
+        "estimate_value": false,
+        "cant_estimate": false,
+        "estimated_value": null
+      },
+      "sports": {
+        "series_slug": null,
+        "score": null,
+        "elapsed": null,
+        "period": null,
+        "game_status": null,
+        "game_id": null,
+        "rescheduled_from_game_id": null,
+        "sportsradar_match_id": null,
+        "home_team_name": null,
+        "away_team_name": null,
+        "spreads_main_line": null,
+        "totals_main_line": null,
+        "best_lines": [],
+        "teams": [],
+        "sport": null,
+        "last_highlight": null,
+        "last_highlight_type": null,
+        "last_highlight_at": null
+      },
+      "partners": [],
+      "metadata": {"fixture": true},
+      "markets": [
+        {
+          "id": "200",
+          "conditionId": "0x1111111111111111111111111111111111111111111111111111111111111111",
+          "question": "Will the SDK fixture pass?",
+          "outcomes": "[\"Yes\",\"No\"]",
+          "outcomePrices": "[\"0.42\",\"0.58\"]",
+          "clobTokenIds": "[\"1001\",\"1002\"]",
+          "events": [],
+          "tags": [],
+          "positionIds": []
+        }
+      ],
+      "series": [],
+      "tags": [],
+      "creators": []
+    },
+    {
+      "id": "101",
+      "parent_event_id": null,
+      "ticker": "SDK2",
+      "slug": "sdk-regular-event",
+      "title": "SDK regular event",
+      "subtitle": null,
+      "description": null,
+      "category": "fixture",
+      "subcategory": null,
+      "image": null,
+      "icon": null,
+      "featured_image": null,
+      "created_at": "2026-07-30T11:00:00Z",
+      "updated_at": "2026-07-30T11:05:00Z",
+      "published_at": "2026-07-30T11:01:00Z",
+      "state": {
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "new": false,
+        "featured": false,
+        "restricted": false,
+        "cyom": false,
+        "live": false,
+        "ended": false,
+        "automatically_active": true,
+        "comments_enabled": true,
+        "requires_translation": false
+      },
+      "schedule": {
+        "start_date": "2026-07-30T11:00:00Z",
+        "creation_date": "2026-07-30T10:55:00Z",
+        "end_date": "2026-08-30T11:00:00Z",
+        "closed_time": null,
+        "start_time": "2026-07-30T11:00:00Z",
+        "event_date": "2026-07-30",
+        "event_week": 31,
+        "finished_at": null
+      },
+      "metrics": {
+        "liquidity": "2000",
+        "liquidity_amm": "0",
+        "liquidity_clob": "2000",
+        "volume": "800",
+        "volume_24hr": "80",
+        "volume_1wk": "200",
+        "volume_1mo": "800",
+        "volume_1yr": "800",
+        "open_interest": "200",
+        "competitive": 0.8,
+        "comment_count": 1,
+        "tweet_count": 0
+      },
+      "display": {
+        "sort_by": null,
+        "show_all_outcomes": true,
+        "show_market_images": false,
+        "gmp_chart_mode": null,
+        "color": null,
+        "featured_order": null,
+        "country_name": null,
+        "election_type": null,
+        "image_optimized": null,
+        "icon_optimized": null,
+        "featured_image_optimized": null
+      },
+      "trading": {
+        "enable_order_book": true,
+        "neg_risk": false,
+        "neg_risk_market_id": null,
+        "neg_risk_fee_bips": null,
+        "enable_neg_risk": false,
+        "neg_risk_augmented": false,
+        "cumulative_markets": false
+      },
+      "resolution": {
+        "source": "Fixture resolution source",
+        "automatically_resolved": false
+      },
+      "estimation": {
+        "estimate_value": false,
+        "cant_estimate": false,
+        "estimated_value": null
+      },
+      "sports": {
+        "series_slug": null,
+        "score": null,
+        "elapsed": null,
+        "period": null,
+        "game_status": null,
+        "game_id": null,
+        "rescheduled_from_game_id": null,
+        "sportsradar_match_id": null,
+        "home_team_name": null,
+        "away_team_name": null,
+        "spreads_main_line": null,
+        "totals_main_line": null,
+        "best_lines": [],
+        "teams": [],
+        "sport": null,
+        "last_highlight": null,
+        "last_highlight_type": null,
+        "last_highlight_at": null
+      },
+      "partners": [],
+      "metadata": null,
+      "markets": [
+        {
+          "id": "201",
+          "conditionId": "0x2222222222222222222222222222222222222222222222222222222222222222",
+          "question": "Will the second SDK fixture pass?",
+          "outcomes": "[\"Yes\",\"No\"]",
+          "outcomePrices": "[\"0.6\",\"0.4\"]",
+          "clobTokenIds": "[\"2001\",\"2002\"]",
+          "events": [],
+          "tags": [],
+          "positionIds": []
+        }
+      ],
+      "series": [],
+      "tags": [],
+      "creators": []
+    }
+  ],
+  "markets": [
+    {
+      "id": "200",
+      "slug": "sdk-market-one",
+      "condition_id": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "question": "Will the SDK fixture pass?",
+      "group_item_title": null,
+      "description": "A fee-enabled market fixture.",
+      "category": "fixture",
+      "image": null,
+      "icon": null,
+      "state": {
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "accepting_orders": true,
+        "enable_order_book": true,
+        "neg_risk": true,
+        "start_date": "2026-07-30T10:00:00Z",
+        "end_date": "2026-08-30T10:00:00Z",
+        "closed_time": null
+      },
+      "outcomes": {
+        "yes": {"label": "Yes", "token_id": "1001", "price": "0.42"},
+        "no": {"label": "No", "token_id": "1002", "price": "0.58"}
+      },
+      "metrics": {
+        "volume": "500",
+        "volume_num": "500",
+        "volume_24hr": "50",
+        "volume_1wk": "100",
+        "volume_1mo": "500",
+        "volume_1yr": "500",
+        "volume_amm": "0",
+        "volume_clob": "500",
+        "liquidity": "1000",
+        "liquidity_num": "1000",
+        "liquidity_clob": "1000"
+      },
+      "prices": {
+        "best_bid": "0.41",
+        "best_ask": "0.43",
+        "last_trade_price": "0.42",
+        "spread": "0.02",
+        "one_hour_price_change": "0.01",
+        "one_day_price_change": "0.02",
+        "one_week_price_change": "0.03",
+        "one_month_price_change": "0.04",
+        "one_year_price_change": "0.05"
+      },
+      "trading": {
+        "minimum_order_size": "5",
+        "minimum_tick_size": "0.01",
+        "seconds_delay": 0,
+        "fees_enabled": true,
+        "fee_type": "flat",
+        "fee_schedule": {
+          "exponent": 0,
+          "rate": "0.02",
+          "taker_only": true,
+          "rebate_rate": "0"
+        }
+      },
+      "resolution": {
+        "question_id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "neg_risk_request_id": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "uma_resolution_status": "requested",
+        "source": "Fixture resolution source",
+        "resolved_by": null
+      },
+      "rewards": {
+        "clob_rewards": null,
+        "rewards_min_size": null,
+        "rewards_max_spread": null,
+        "holding_rewards_enabled": false
+      },
+      "sports": {
+        "sports_market_type": null,
+        "line": null,
+        "game_id": null,
+        "game_start_time": null
+      },
+      "events": [{"id": "100", "slug": "sdk-neg-risk-event", "title": "SDK NegRisk event"}],
+      "tags": [],
+      "position_ids": []
+    },
+    {
+      "id": "201",
+      "slug": "sdk-market-two",
+      "condition_id": "0x2222222222222222222222222222222222222222222222222222222222222222",
+      "question": "Will the second SDK fixture pass?",
+      "group_item_title": null,
+      "description": "A zero-fee market fixture.",
+      "category": "fixture",
+      "image": null,
+      "icon": null,
+      "state": {
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "accepting_orders": true,
+        "enable_order_book": true,
+        "neg_risk": false,
+        "start_date": "2026-07-30T11:00:00Z",
+        "end_date": "2026-08-30T11:00:00Z",
+        "closed_time": null
+      },
+      "outcomes": {
+        "yes": {"label": "Yes", "token_id": "2001", "price": "0.6"},
+        "no": {"label": "No", "token_id": "2002", "price": "0.4"}
+      },
+      "metrics": {
+        "volume": "800",
+        "volume_num": "800",
+        "volume_24hr": "80",
+        "volume_1wk": "200",
+        "volume_1mo": "800",
+        "volume_1yr": "800",
+        "volume_amm": "0",
+        "volume_clob": "800",
+        "liquidity": "2000",
+        "liquidity_num": "2000",
+        "liquidity_clob": "2000"
+      },
+      "prices": {
+        "best_bid": "0.59",
+        "best_ask": "0.61",
+        "last_trade_price": "0.6",
+        "spread": "0.02",
+        "one_hour_price_change": "0",
+        "one_day_price_change": "0",
+        "one_week_price_change": "0",
+        "one_month_price_change": "0",
+        "one_year_price_change": "0"
+      },
+      "trading": {
+        "minimum_order_size": "1",
+        "minimum_tick_size": "0.001",
+        "seconds_delay": 0,
+        "fees_enabled": false,
+        "fee_type": null,
+        "fee_schedule": null
+      },
+      "resolution": {
+        "question_id": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "neg_risk_request_id": null,
+        "uma_resolution_status": null,
+        "source": "Fixture resolution source",
+        "resolved_by": null
+      },
+      "rewards": {
+        "clob_rewards": null,
+        "rewards_min_size": null,
+        "rewards_max_spread": null,
+        "holding_rewards_enabled": false
+      },
+      "sports": {
+        "sports_market_type": null,
+        "line": null,
+        "game_id": null,
+        "game_start_time": null
+      },
+      "events": [{"id": "101", "slug": "sdk-regular-event", "title": "SDK regular event"}],
+      "tags": [],
+      "position_ids": []
+    }
+  ]
+}
