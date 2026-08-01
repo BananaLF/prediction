@@ -9,6 +9,7 @@ import sqlite3
 import pytest
 
 import predmarket.persistence.writer as writer_module
+from predmarket.catalog.relations import semantic_evidence_digest
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
 from predmarket.domain.relation import DiscoverySource, Relation, RelationStatus
@@ -512,7 +513,9 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
                         updated_at=2,
                     )
                 )
-        llm_approved = relation.transition_to(
+        context = await relations.get_for_analysis("relation-1")
+        assert context is not None
+        llm_approved = context.transition_to(
             RelationStatus.LLM_APPROVE,
             updated_at=3,
         )
@@ -523,13 +526,28 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
                 "approved": True,
                 "reasoning": "fixture",
                 "warnings": (),
+                "semantic_evidence": context.llm_analysis["semantic_evidence"],
             },
         )
         approved = llm_approved.transition_to(
             RelationStatus.APPROVED,
             updated_at=4,
         )
-        await relations.save_analysis(llm_approved)
+        with pytest.raises(TypeError):
+            await relations.save_analysis(llm_approved)  # type: ignore[call-arg]
+        forged_analysis = dict(llm_approved.llm_analysis or {})
+        forged_evidence = dict(forged_analysis["semantic_evidence"])
+        forged_evidence["sha256"] = "0" * 64
+        forged_analysis["semantic_evidence"] = forged_evidence
+        with pytest.raises(ValueError, match="digest|evidence"):
+            await relations.save_analysis(
+                replace(llm_approved, llm_analysis=forged_analysis),
+                expected_semantic_digest=semantic_evidence_digest(context),
+            )
+        await relations.save_analysis(
+            llm_approved,
+            expected_semantic_digest=semantic_evidence_digest(context),
+        )
         await relations.save(relation)
         with pytest.raises(ValueError, match="NO_LLM_APPROVE"):
             await relations.save(approved)

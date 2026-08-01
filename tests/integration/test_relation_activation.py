@@ -7,6 +7,7 @@ from io import StringIO
 import json
 from pathlib import Path
 import sqlite3
+import threading
 
 import pytest
 import yaml
@@ -16,6 +17,7 @@ from predmarket.catalog.relations import (
     RelationActivation,
     RelationAnalysis,
     RelationChangeMonitor,
+    semantic_evidence_digest,
 )
 from predmarket.cli import main
 from predmarket.domain.market import Event, Market, MarketStatus, Token
@@ -99,18 +101,24 @@ async def _seed_relation(
         )
         await relations.save(relation)
         if analyzed:
+            context = await relations.get_for_analysis(relation_id)
+            assert context is not None
             await relations.save_analysis(
                 replace(
-                    relation,
+                    context,
                     status=RelationStatus.LLM_APPROVE,
                     llm_confidence=Decimal("0.8"),
                     llm_analysis={
                         "approved": True,
                         "reasoning": "fixture",
                         "warnings": (),
+                        "semantic_evidence": context.llm_analysis[
+                            "semantic_evidence"
+                        ],
                     },
                     updated_at=11,
-                )
+                ),
+                expected_semantic_digest=semantic_evidence_digest(context),
             )
     finally:
         await writer.close()
@@ -298,6 +306,56 @@ async def test_cli_approval_ignores_nonsemantic_market_metadata_changes(
         stdout=StringIO(),
         now_ms=lambda: 12,
     ) == 0
+
+
+async def test_analysis_rejects_semantics_changed_while_analyzer_is_running(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    config_path = _write_config(tmp_path, database_path)
+    raw = yaml.safe_load(config_path.read_text())
+    raw["relations"]["llm_enabled"] = True
+    config_path.write_text(yaml.safe_dump(raw))
+    await _seed_relation(database_path, "relation-1", analyzed=False)
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowAnalyzer:
+        def analyze(self, relation: Relation) -> RelationAnalysis:
+            assert relation.llm_analysis is not None
+            assert "semantic_evidence" in relation.llm_analysis
+            started.set()
+            assert release.wait(timeout=2)
+            return RelationAnalysis(
+                approved=True,
+                confidence=Decimal("0.9"),
+                reasoning="slow fixture",
+                warnings=(),
+            )
+
+    analysis_task = asyncio.create_task(
+        asyncio.to_thread(
+            main,
+            ["--config", str(config_path), "relations", "analyze", "relation-1"],
+            stdout=StringIO(),
+            analyzer=SlowAnalyzer(),
+            now_ms=lambda: 11,
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE markets SET question = 'Changed during analysis?' "
+            "WHERE id = 'market-a'"
+        )
+    release.set()
+
+    with pytest.raises(ValueError, match="changed during analysis"):
+        await analysis_task
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT status, llm_analysis_json FROM relations WHERE id = 'relation-1'"
+        ).fetchone() == ("NO_LLM_APPROVE", None)
 
 
 async def test_cli_cannot_approve_an_unanalyzed_relation(tmp_path: Path) -> None:

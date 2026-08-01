@@ -152,7 +152,14 @@ class RelationAnalyzer(Protocol):
 class RelationAnalysisRepository(Protocol):
     async def get(self, relation_id: str) -> Relation | None: ...
 
-    async def save_analysis(self, relation: Relation) -> Relation: ...
+    async def get_for_analysis(self, relation_id: str) -> Relation | None: ...
+
+    async def save_analysis(
+        self,
+        relation: Relation,
+        *,
+        expected_semantic_digest: str,
+    ) -> Relation: ...
 
 
 class DeterministicFakeAnalyzer:
@@ -210,11 +217,15 @@ class RelationWorkflow:
             raise ValueError(f"relation {relation_id!r} does not exist")
         if not self._llm_enabled:
             return relation
+        relation = await self._repository.get_for_analysis(relation_id)
+        if relation is None:
+            raise ValueError(f"relation {relation_id!r} does not exist")
         if relation.status is not RelationStatus.NO_LLM_APPROVE:
             raise ValueError("analyzer requires relation status NO_LLM_APPROVE")
         if updated_at < relation.updated_at:
             raise ValueError("updated_at must not move backwards")
 
+        expected_semantic_digest = semantic_evidence_digest(relation)
         result = self._analyzer.analyze(relation)
         if inspect.isawaitable(result):
             result = await result
@@ -232,10 +243,14 @@ class RelationWorkflow:
                 "approved": result.approved,
                 "reasoning": result.reasoning,
                 "warnings": result.warnings,
+                "semantic_evidence": relation.llm_analysis["semantic_evidence"],
             },
             updated_at=updated_at,
         )
-        return await self._repository.save_analysis(analyzed)
+        return await self._repository.save_analysis(
+            analyzed,
+            expected_semantic_digest=expected_semantic_digest,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,10 +419,24 @@ class RelationCliStore:
         _relation_id(relation_id)
         return await asyncio.to_thread(self._get_sync, relation_id)
 
-    async def save_analysis(self, relation: Relation) -> Relation:
+    async def get_for_analysis(self, relation_id: str) -> Relation | None:
+        _relation_id(relation_id)
+        return await asyncio.to_thread(self._get_for_analysis_sync, relation_id)
+
+    async def save_analysis(
+        self,
+        relation: Relation,
+        *,
+        expected_semantic_digest: str,
+    ) -> Relation:
         if not isinstance(relation, Relation):
             raise TypeError("relation must be a Relation")
-        return await asyncio.to_thread(self._save_analysis_sync, relation)
+        _validate_digest(expected_semantic_digest)
+        return await asyncio.to_thread(
+            self._save_analysis_sync,
+            relation,
+            expected_semantic_digest,
+        )
 
     def approve_manual(self, relation_id: str, *, occurred_at: int) -> Relation:
         _relation_id(relation_id)
@@ -502,7 +531,31 @@ class RelationCliStore:
             ).fetchone()
         return None if row is None else _relation_from_row(row)
 
-    def _save_analysis_sync(self, relation: Relation) -> Relation:
+    def _get_for_analysis_sync(self, relation_id: str) -> Relation | None:
+        with self._read_connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM relations WHERE id = ?",
+                    (relation_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                relation = _relation_from_row(row)
+                semantics = _capture_relation_semantics_sync(
+                    connection,
+                    relation.market_a_id,
+                    relation.market_b_id,
+                )
+                return relation_with_semantic_context(relation, semantics)
+            finally:
+                connection.rollback()
+
+    def _save_analysis_sync(
+        self,
+        relation: Relation,
+        expected_semantic_digest: str,
+    ) -> Relation:
         if relation.status not in {
             RelationStatus.NO_LLM_APPROVE,
             RelationStatus.LLM_APPROVE,
@@ -538,15 +591,21 @@ class RelationCliStore:
                 raise ValueError("analysis cannot change relation identity")
             if relation.updated_at < current.updated_at:
                 raise ValueError("analysis updated_at must not move backwards")
+            provided_digest = semantic_evidence_digest(relation)
+            if not hmac.compare_digest(provided_digest, expected_semantic_digest):
+                raise ValueError("analysis semantic evidence does not match expected digest")
             semantics = _capture_relation_semantics_sync(
                 connection,
                 relation.market_a_id,
                 relation.market_b_id,
             )
-            analysis = _analysis_with_semantic_evidence(
-                relation.llm_analysis,
-                semantics,
-            )
+            if not hmac.compare_digest(
+                _semantic_digest(semantics),
+                expected_semantic_digest,
+            ):
+                raise ValueError("relation semantics changed during analysis")
+            analysis = _thaw_json(relation.llm_analysis)
+            assert isinstance(analysis, dict)
             updated = connection.execute(
                 """
                 UPDATE relations
@@ -702,6 +761,22 @@ def analysis_with_semantic_evidence(
     return _analysis_with_semantic_evidence(analysis, semantics)
 
 
+def relation_with_semantic_context(
+    relation: Relation,
+    semantics: Mapping[str, object],
+) -> Relation:
+    evidence = _analysis_with_semantic_evidence({}, semantics)["semantic_evidence"]
+    return replace(relation, llm_analysis={"semantic_evidence": evidence})
+
+
+def semantic_evidence_digest(relation: Relation) -> str:
+    if relation.llm_analysis is None:
+        raise ValueError("analysis semantic evidence is missing")
+    evidence = relation.llm_analysis.get("semantic_evidence")
+    snapshot = _snapshot_from_evidence(evidence)
+    return _semantic_digest(snapshot)
+
+
 def _capture_relation_semantics_sync(
     connection: sqlite3.Connection,
     market_a_id: str,
@@ -795,24 +870,39 @@ def _analysis_with_semantic_evidence(
 def _stored_semantic_snapshot(encoded_analysis: str | None) -> dict[str, object]:
     try:
         analysis = json.loads(encoded_analysis) if encoded_analysis is not None else None
-        evidence = analysis["semantic_evidence"]
-        if not isinstance(analysis, dict) or not isinstance(evidence, dict):
+        if not isinstance(analysis, dict):
             raise TypeError
-        if set(evidence) != {"version", "market_a", "market_b", "sha256"}:
-            raise ValueError
-        if evidence["version"] != 1 or not isinstance(evidence["sha256"], str):
-            raise ValueError
-        snapshot = {
-            "market_a": evidence["market_a"],
-            "market_b": evidence["market_b"],
-        }
-        if not hmac.compare_digest(evidence["sha256"], _semantic_digest(snapshot)):
-            raise ValueError
-        return snapshot
+        return _snapshot_from_evidence(analysis["semantic_evidence"])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise ValueError(
             "relation semantic evidence is missing or invalid; analyze again"
         ) from error
+
+
+def _snapshot_from_evidence(evidence: object) -> dict[str, object]:
+    if not isinstance(evidence, Mapping):
+        raise ValueError("analysis semantic evidence is missing")
+    if set(evidence) != {"version", "market_a", "market_b", "sha256"}:
+        raise ValueError("analysis semantic evidence shape is invalid")
+    if evidence["version"] != 1 or not isinstance(evidence["sha256"], str):
+        raise ValueError("analysis semantic evidence version is invalid")
+    snapshot = {
+        "market_a": evidence["market_a"],
+        "market_b": evidence["market_b"],
+    }
+    digest = _semantic_digest(snapshot)
+    if not hmac.compare_digest(evidence["sha256"], digest):
+        raise ValueError("analysis semantic evidence digest is invalid")
+    return snapshot
+
+
+def _validate_digest(value: object) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError("expected_semantic_digest must be a SHA-256 hex digest")
 
 
 def _same_semantics(

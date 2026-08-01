@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import fields
 from decimal import Decimal
+import asyncio
 
 import pytest
 
@@ -10,6 +11,8 @@ from predmarket.catalog.relations import (
     RelationAnalysis,
     RelationDetector,
     RelationWorkflow,
+    relation_with_semantic_context,
+    semantic_evidence_digest,
 )
 from predmarket.domain.market import Event, Market, MarketStatus
 from predmarket.domain.relation import DiscoverySource, Relation, RelationStatus
@@ -95,7 +98,25 @@ class _MemoryRelations:
     async def get(self, relation_id: str) -> Relation | None:
         return self.relation if relation_id == self.relation.id else None
 
-    async def save_analysis(self, relation: Relation) -> Relation:
+    async def get_for_analysis(self, relation_id: str) -> Relation | None:
+        relation = await self.get(relation_id)
+        if relation is None:
+            return None
+        return relation_with_semantic_context(
+            relation,
+            {
+                "market_a": {"market": {"question": "A?"}},
+                "market_b": {"market": {"question": "B?"}},
+            },
+        )
+
+    async def save_analysis(
+        self,
+        relation: Relation,
+        *,
+        expected_semantic_digest: str,
+    ) -> Relation:
+        assert semantic_evidence_digest(relation) == expected_semantic_digest
         self.analysis_writes += 1
         self.relation = relation
         return relation
@@ -149,11 +170,15 @@ async def test_only_positive_analyzer_result_advances_one_step() -> None:
 
     assert result.status is RelationStatus.LLM_APPROVE
     assert result.llm_confidence == Decimal("0.875")
-    assert result.llm_analysis == {
-        "approved": True,
-        "reasoning": "The stricter outcome entails the broader outcome.",
-        "warnings": ("Settlement wording must remain unchanged",),
-    }
+    assert result.llm_analysis is not None
+    assert result.llm_analysis["approved"] is True
+    assert result.llm_analysis["reasoning"] == (
+        "The stricter outcome entails the broader outcome."
+    )
+    assert result.llm_analysis["warnings"] == (
+        "Settlement wording must remain unchanged",
+    )
+    assert "semantic_evidence" in result.llm_analysis
     assert analyzer.calls == ("relation-1",)
     assert repository.analysis_writes == 1
 
@@ -175,11 +200,11 @@ async def test_negative_analyzer_result_persists_analysis_without_approval() -> 
     result = await workflow.analyze("relation-1", updated_at=11)
 
     assert result.status is RelationStatus.NO_LLM_APPROVE
-    assert result.llm_analysis == {
-        "approved": False,
-        "reasoning": "Resolution criteria differ.",
-        "warnings": (),
-    }
+    assert result.llm_analysis is not None
+    assert result.llm_analysis["approved"] is False
+    assert result.llm_analysis["reasoning"] == "Resolution criteria differ."
+    assert result.llm_analysis["warnings"] == ()
+    assert "semantic_evidence" in result.llm_analysis
     assert repository.analysis_writes == 1
 
 
@@ -197,3 +222,39 @@ async def test_analyzer_cannot_run_on_a_relation_past_the_llm_gate() -> None:
 
     assert repository.analysis_writes == 0
     assert analyzer.calls == ()
+
+
+async def test_analyzer_failure_and_cancellation_do_not_persist_analysis() -> None:
+    repository = _MemoryRelations(_unreviewed_relation())
+
+    class FailingAnalyzer:
+        def analyze(self, relation: Relation) -> RelationAnalysis:
+            raise RuntimeError("analyzer failed")
+
+    with pytest.raises(RuntimeError, match="analyzer failed"):
+        await RelationWorkflow(
+            repository,
+            FailingAnalyzer(),
+            llm_enabled=True,
+        ).analyze("relation-1", updated_at=11)
+    assert repository.analysis_writes == 0
+
+    entered = asyncio.Event()
+
+    class BlockingAnalyzer:
+        async def analyze(self, relation: Relation) -> RelationAnalysis:
+            entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    task = asyncio.create_task(
+        RelationWorkflow(repository, BlockingAnalyzer(), llm_enabled=True).analyze(
+            "relation-1",
+            updated_at=11,
+        )
+    )
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert repository.analysis_writes == 0

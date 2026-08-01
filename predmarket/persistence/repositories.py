@@ -13,8 +13,9 @@ import aiosqlite
 
 from predmarket.catalog.changes import MarketChange, MarketChangeType
 from predmarket.catalog.relations import (
-    analysis_with_semantic_evidence,
     capture_relation_semantics,
+    relation_with_semantic_context,
+    semantic_evidence_digest,
 )
 from predmarket.domain.decimal import encode_decimal
 from predmarket.domain.fees import FeeSchedule
@@ -206,7 +207,12 @@ class RelationRepository:
 
         await self._writer.execute(command)
 
-    async def save_analysis(self, relation: Relation) -> Relation:
+    async def save_analysis(
+        self,
+        relation: Relation,
+        *,
+        expected_semantic_digest: str,
+    ) -> Relation:
         """Persist one analyzer result without crossing the manual gate."""
 
         _require_type(relation, Relation, "relation")
@@ -251,15 +257,20 @@ class RelationRepository:
                 raise ValueError("analysis cannot change relation identity")
             if relation.updated_at < row[5]:
                 raise ValueError("analysis updated_at must not move backwards")
+            provided_digest = semantic_evidence_digest(relation)
+            if provided_digest != expected_semantic_digest:
+                raise ValueError("analysis semantic evidence does not match expected digest")
             semantics = await capture_relation_semantics(
                 connection,
                 relation.market_a_id,
                 relation.market_b_id,
             )
-            analysis = analysis_with_semantic_evidence(
-                relation.llm_analysis,
-                semantics,
+            current_digest = semantic_evidence_digest(
+                relation_with_semantic_context(relation, semantics)
             )
+            if current_digest != expected_semantic_digest:
+                raise ValueError("relation semantics changed during analysis")
+            analysis = relation.llm_analysis
             updated = await connection.execute(
                 """
                 UPDATE relations
@@ -288,6 +299,29 @@ class RelationRepository:
             (relation_id,),
         )
         return None if row is None else _relation_from_row(row)
+
+    async def get_for_analysis(self, relation_id: str) -> Relation | None:
+        async with aiosqlite.connect(self._path, isolation_level=None) as connection:
+            connection.row_factory = aiosqlite.Row
+            await connection.execute("PRAGMA query_only = ON")
+            await connection.execute("BEGIN")
+            try:
+                cursor = await connection.execute(
+                    "SELECT * FROM relations WHERE id = ?",
+                    (relation_id,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    return None
+                relation = _relation_from_row(row)
+                semantics = await capture_relation_semantics(
+                    connection,
+                    relation.market_a_id,
+                    relation.market_b_id,
+                )
+                return relation_with_semantic_context(relation, semantics)
+            finally:
+                await connection.execute("ROLLBACK")
 
     async def list_approved(self) -> tuple[Relation, ...]:
         rows = await _fetch_all(
