@@ -15,7 +15,12 @@ from predmarket.domain.signal import DecisionReason, NotEvaluable
 from predmarket.persistence.repositories import CatalogSnapshot
 from predmarket.polymarket.gateway import MarketStreamEvent, MarketStreamInvalidated
 from predmarket.watch.cache import CacheState
-from predmarket.watch.task import EvaluationTarget, WatchTask, _timestamp_ms
+from predmarket.watch.task import (
+    EvaluationTarget,
+    WatchCleanupError,
+    WatchTask,
+    _timestamp_ms,
+)
 
 
 def _market(market_id: str, event_id: str = "event-1", *, active: bool = True) -> Market:
@@ -128,6 +133,60 @@ class SelfCancellingCloseSubscription(FakeSubscription):
             assert current is not None
             current.cancel()
             await asyncio.sleep(0)
+        self.closed = True
+
+
+class ActiveFailOnceCloseSubscription(FakeSubscription):
+    def __init__(self, generation: int) -> None:
+        super().__init__(generation)
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_calls == 1:
+            raise RuntimeError("active close failed")
+        self.closed = True
+
+
+class ActiveSelfCancellingCloseSubscription(FakeSubscription):
+    def __init__(self, generation: int) -> None:
+        super().__init__(generation)
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_calls == 1:
+            current = asyncio.current_task()
+            assert current is not None
+            current.cancel()
+            await asyncio.sleep(0)
+        self.closed = True
+
+
+class BlockingFailOnceCloseSubscription(ActiveFailOnceCloseSubscription):
+    def __init__(self, generation: int) -> None:
+        super().__init__(generation)
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_calls == 1:
+            self.close_started.set()
+            await self.release_close.wait()
+            raise RuntimeError("active close failed")
+        self.closed = True
+
+
+class BlockingCloseSubscription(FakeSubscription):
+    def __init__(self, generation: int) -> None:
+        super().__init__(generation)
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+
+    async def close(self) -> None:
+        self.close_started.set()
+        await self.release_close.wait()
         self.closed = True
 
 
@@ -1068,6 +1127,146 @@ async def test_late_recovery_self_cancel_is_normalized_and_retryable() -> None:
     assert late.close_calls == 2
     assert watch._recovery_owner is None
     assert gateway.recovery_cancellations == 1
+
+
+async def test_active_subscription_close_failure_is_retained_and_retryable() -> None:
+    # Catches a failed active-handle close losing the only retryable reference.
+    gateway = FakeGateway()
+    gateway.subscription_factory = ActiveFailOnceCloseSubscription
+    watch, _, _, _, strategy, _ = _watch(gateway=gateway)
+    await watch.start()
+    active = gateway.subscriptions[0]
+    assert isinstance(active, ActiveFailOnceCloseSubscription)
+    baseline_calls = len(strategy.calls)
+
+    with pytest.raises(RuntimeError, match="active close failed"):
+        await watch.handle_stream_message(
+            MarketStreamInvalidated(
+                reason="connection_lost",
+                token_ids=("token-1", "token-2"),
+                received_timestamp=120,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+
+    assert watch._subscription is active
+    assert active.closed is False
+    assert active.close_calls == 1
+    assert gateway.requests == [("token-1", "token-2")]
+    assert len(strategy.calls) == baseline_calls
+
+    await watch.close()
+
+    assert active.closed is True
+    assert active.close_calls == 2
+    assert watch._subscription is None
+
+
+async def test_active_subscription_self_cancel_is_normalized_and_retryable() -> None:
+    # Catches SDK self-cancellation becoming a cached caller cancellation or lost handle.
+    gateway = FakeGateway()
+    gateway.subscription_factory = ActiveSelfCancellingCloseSubscription
+    watch, _, _, _, _, _ = _watch(gateway=gateway)
+    await watch.start()
+    active = gateway.subscriptions[0]
+    assert isinstance(active, ActiveSelfCancellingCloseSubscription)
+
+    with pytest.raises(
+        WatchCleanupError,
+        match="SDK subscription cleanup cancelled internally",
+    ):
+        await watch.handle_stream_message(
+            MarketStreamInvalidated(
+                reason="connection_lost",
+                token_ids=("token-1", "token-2"),
+                received_timestamp=120,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+
+    assert watch._subscription is active
+    assert active.closed is False
+    assert active.close_calls == 1
+
+    await watch.close()
+
+    assert active.closed is True
+    assert active.close_calls == 2
+    assert watch._subscription is None
+
+
+async def test_concurrent_rotation_and_close_share_one_active_close_attempt() -> None:
+    # Catches close retrying or forgetting an active handle while rotation still owns it.
+    gateway = FakeGateway()
+    gateway.subscription_factory = BlockingFailOnceCloseSubscription
+    catalog = FakeCatalog(_catalog())
+    watch, _, _, _, strategy, _ = _watch(gateway=gateway, catalog=catalog)
+    await watch.start()
+    active = gateway.subscriptions[0]
+    assert isinstance(active, BlockingFailOnceCloseSubscription)
+    baseline_calls = len(strategy.calls)
+    catalog.snapshot = _catalog(second_market=True)
+    rotating = asyncio.create_task(
+        watch.handle_market_change(
+            MarketChange(
+                change_id="concurrent-active-close",
+                change_type=MarketChangeType.MARKET_ADDED,
+                event_id="event-1",
+                market_id="market-2",
+                token_ids=("token-3", "token-4"),
+                occurred_at=200,
+            )
+        )
+    )
+    await active.close_started.wait()
+
+    closing = asyncio.create_task(watch.close())
+    await asyncio.sleep(0)
+    active.release_close.set()
+    results = await asyncio.gather(rotating, closing, return_exceptions=True)
+
+    assert [type(result) for result in results] == [RuntimeError, RuntimeError]
+    assert [str(result) for result in results] == [
+        "active close failed",
+        "active close failed",
+    ]
+    assert active.close_calls == 1
+    assert active.closed is False
+    assert watch._subscription is active
+    assert gateway.requests == [("token-1", "token-2")]
+    assert len(strategy.calls) == baseline_calls
+
+    await watch.close()
+
+    assert active.close_calls == 2
+    assert active.closed is True
+    assert watch._subscription is None
+
+
+async def test_active_close_success_uses_identity_compare_and_clear() -> None:
+    # Catches an old close completion clearing a newer installed subscription.
+    gateway = FakeGateway()
+    gateway.subscription_factory = BlockingCloseSubscription
+    watch, _, _, _, _, _ = _watch(gateway=gateway)
+    await watch.start()
+    active = gateway.subscriptions[0]
+    assert isinstance(active, BlockingCloseSubscription)
+    closing = asyncio.create_task(watch._close_current_subscription())
+    await active.close_started.wait()
+    retained_while_pending = watch._subscription is active
+    replacement = FakeSubscription(99)
+    watch._subscription = replacement
+    active.release_close.set()
+
+    await closing
+
+    assert retained_while_pending is True
+    assert active.closed is True
+    assert watch._subscription is replacement
+    await watch.close()
+    assert replacement.closed is True
 
 
 async def test_price_change_uses_local_arrival_sequence_and_evaluates_changed_token() -> None:

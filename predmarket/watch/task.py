@@ -45,11 +45,23 @@ class _RecoveryCleanupResult:
     error: Exception | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _SubscriptionCloseResult:
+    error: Exception | None = None
+
+
 @dataclass(slots=True)
 class _OwnedRecovery:
     target: asyncio.Task[Any]
     cleanup_task: asyncio.Task[_RecoveryCleanupResult] | None = None
     pending_subscription: Any | None = None
+
+
+@dataclass(slots=True)
+class _OwnedSubscriptionClose:
+    subscription: Any
+    task: asyncio.Task[_SubscriptionCloseResult]
+    retryable: bool = False
 
 
 class _Gateway(Protocol):
@@ -155,6 +167,7 @@ class WatchTask:
         self._stop_event = asyncio.Event()
         self._close_task: asyncio.Task[None] | None = None
         self._recovery_owner: _OwnedRecovery | None = None
+        self._subscription_close_owner: _OwnedSubscriptionClose | None = None
 
     @property
     def cache(self) -> OrderBookCache:
@@ -243,6 +256,7 @@ class WatchTask:
         async with self._operation_lock:
             if self._closed:
                 return
+            self._prepare_current_subscription_close_retry()
             snapshot = await self._catalog.load_catalog()
             new_token_ids = _watchable_token_ids(snapshot)
             if (
@@ -275,6 +289,7 @@ class WatchTask:
         async with self._operation_lock:
             if self._closed or message.subscription_generation < self._cache.generation:
                 return
+            self._prepare_current_subscription_close_retry()
             if message.subscription_generation > self._cache.generation:
                 await self._invalidate_close_recover(
                     DecisionReason.ORDERBOOK_INVALID,
@@ -332,6 +347,7 @@ class WatchTask:
         self._closed = True
         self._stop_event.set()
         if self._close_task is None:
+            self._prepare_current_subscription_close_retry()
             owner = self._recovery_owner
             if owner is not None:
                 _prepare_recovery_cleanup_retry(owner)
@@ -364,16 +380,11 @@ class WatchTask:
                 if terminal.error is None and owner.pending_subscription is None:
                     if self._recovery_owner is owner:
                         self._recovery_owner = None
-            subscription = self._subscription
-            if subscription is not None:
-                try:
-                    await _close_owned(subscription)
-                except Exception as error:
-                    if cleanup_error is None:
-                        cleanup_error = error
-                else:
-                    if self._subscription is subscription:
-                        self._subscription = None
+            try:
+                await self._close_current_subscription()
+            except Exception as error:
+                if cleanup_error is None:
+                    cleanup_error = error
         if cleanup_error is not None:
             raise cleanup_error
 
@@ -531,9 +542,38 @@ class WatchTask:
         await self._evaluate_tokens(token_ids)
 
     async def _close_current_subscription(self) -> None:
-        subscription, self._subscription = self._subscription, None
-        if subscription is not None:
-            await _close_owned(subscription)
+        subscription = self._subscription
+        if subscription is None:
+            return
+        owner = self._subscription_close_owner
+        if owner is None or owner.subscription is not subscription:
+            owner = _OwnedSubscriptionClose(
+                subscription=subscription,
+                task=asyncio.create_task(
+                    _finish_subscription_close(subscription),
+                    name="watch:close-subscription",
+                ),
+            )
+            self._subscription_close_owner = owner
+        terminal, cancellation = await _wait_subscription_close(owner.task)
+        if terminal.error is not None:
+            owner.retryable = True
+            raise terminal.error
+        if self._subscription is subscription:
+            self._subscription = None
+        if self._subscription_close_owner is owner:
+            self._subscription_close_owner = None
+        if cancellation is not None:
+            raise cancellation
+
+    def _prepare_current_subscription_close_retry(self) -> None:
+        owner = self._subscription_close_owner
+        if (
+            owner is not None
+            and owner.subscription is self._subscription
+            and owner.retryable
+        ):
+            self._subscription_close_owner = None
 
     async def _close_signals(
         self,
@@ -744,6 +784,38 @@ async def _wait_recovery_cleanup(
         except asyncio.CancelledError:
             continue
     return cleanup.result()
+
+
+async def _finish_subscription_close(subscription: Any) -> _SubscriptionCloseResult:
+    """Own exactly one SDK close attempt and normalize its terminal state."""
+
+    try:
+        await _close_owned(subscription)
+    except asyncio.CancelledError:
+        return _SubscriptionCloseResult(
+            error=WatchCleanupError(
+                "watch subscription close owner cancelled internally"
+            )
+        )
+    except Exception as error:
+        return _SubscriptionCloseResult(error=error)
+    return _SubscriptionCloseResult()
+
+
+async def _wait_subscription_close(
+    task: asyncio.Task[_SubscriptionCloseResult],
+) -> tuple[_SubscriptionCloseResult, asyncio.CancelledError | None]:
+    """Shield one close attempt while preserving cancellation of each waiter."""
+
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            continue
+    return task.result(), cancellation
 
 
 async def _close_owned(subscription: Any) -> None:
