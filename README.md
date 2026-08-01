@@ -18,10 +18,12 @@ python -m predmarket signals list --config config/default.yaml
 python -m predmarket relations list --config config/default.yaml
 ```
 
-`run` is the long-running collector.  `status`, `signals`, and `relations`
-read the local SQLite database.  See [the project guide](docs/PROJECT-GUIDE.md)
-for the schema and [operations](docs/OPERATIONS.md) for safe lifecycle and reset
-procedures.
+`run` is the long-running collector.  `status`, `signals`, and `relations list`
+or `relations show` read the local SQLite database.  `relations analyze` and
+`relations approve` are controlled local writes: they update relationship and
+event records but never mutate Polymarket.  See [the project
+guide](docs/PROJECT-GUIDE.md) for the schema and
+[operations](docs/OPERATIONS.md) for safe lifecycle and reset procedures.
 
 ## Safety boundary
 

@@ -114,6 +114,32 @@ def test_reset_helper_refuses_when_predmarket_is_running(tmp_path: Path) -> None
     assert database.exists()
 
 
+def test_reset_helper_refuses_parent_directory_replaced_by_symlink(
+    tmp_path: Path,
+) -> None:
+    approved_parent = tmp_path / "approved"
+    neighbor_parent = tmp_path / "neighbor"
+    approved_parent.mkdir()
+    neighbor_parent.mkdir()
+    database = approved_parent / "reset.sqlite3"
+    for path in (database, Path(f"{database}-wal"), Path(f"{database}-shm")):
+        path.write_text("approved database")
+    plan = prepare_reset(_reset_config(tmp_path, database))
+
+    for name in ("reset.sqlite3", "reset.sqlite3-wal", "reset.sqlite3-shm"):
+        (neighbor_parent / name).write_text("neighbor must survive")
+    approved_parent.rename(tmp_path / "original-approved")
+    approved_parent.symlink_to(neighbor_parent, target_is_directory=True)
+
+    with pytest.raises(ResetRefused, match="parent directory"):
+        execute_reset(plan, running_processes=())
+
+    assert [
+        (neighbor_parent / name).read_text()
+        for name in ("reset.sqlite3", "reset.sqlite3-wal", "reset.sqlite3-shm")
+    ] == ["neighbor must survive"] * 3
+
+
 def test_reset_helper_detects_a_running_predmarket_process(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "predmarket.operator_reset.subprocess.run",
@@ -122,6 +148,27 @@ def test_reset_helper_detects_a_running_predmarket_process(monkeypatch: pytest.M
                 args=["ps"],
                 returncode=0,
                 stdout="4242 python -m predmarket run --config config/default.yaml\n",
+            )
+        ),
+    )
+
+    assert running_predmarket_processes() == (4242,)
+
+
+def test_reset_helper_detects_console_script_but_not_ordinary_predmarket_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "predmarket.operator_reset.subprocess.run",
+        Mock(
+            return_value=subprocess.CompletedProcess(
+                args=["ps"],
+                returncode=0,
+                stdout=(
+                    "4242 /venv/bin/predmarket run --config config/default.yaml\n"
+                    "4243 python -m pytest tests/predmarket/test_reset.py\n"
+                    "4244 /tmp/predmarket-notes.txt\n"
+                ),
             )
         ),
     )

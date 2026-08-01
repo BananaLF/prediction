@@ -10,6 +10,16 @@
   the documented `COMMAND --config PATH` order, verifies real `--help` exit
   behavior, and verifies the reset helper's exact-target, directory-refusal,
   and running-process refusal behavior.
+- **RED (review remediation):** a temporary-directory test replaced the
+  already-planned reset parent with a symlink to a neighbouring directory. The
+  original path-based `Path.unlink()` followed that replacement and did not
+  refuse; its neighbour targets were therefore deletable. A second test showed
+  that `/venv/bin/predmarket run ...` was not detected as an active process.
+- **GREEN (review remediation):** the parent-replacement test now refuses
+  before deletion and preserves all neighbour targets. Command parsing detects
+  both a `predmarket` console-script basename and `python -m predmarket`, while
+  ignoring ordinary filenames and pytest invocations. The documented-command
+  suite passes with the two new tests (`8 passed`).
 
 ## Changes
 
@@ -25,6 +35,19 @@
   `-wal`, and `-shm` targets.  Execution rejects active Predmarket processes,
   symlinks, directories, filesystem root, home, and workspace root, and deletes
   only validated exact targets.
+- Hardened reset execution against parent-directory TOCTOU. The reset plan
+  binds the verified parent directory device/inode; execution opens it with
+  `O_DIRECTORY | O_NOFOLLOW`, compares the opened descriptor, verifies each
+  exact basename through that descriptor without following symlinks, then uses
+  `os.unlink(..., dir_fd=...)`. It never deletes through a re-resolved target
+  path.
+- Extended active-process detection to parse argv and recognize both the
+  `predmarket` console script (including `/venv/bin/predmarket`) and
+  `python -m predmarket`.
+- Clarified `README.md`: `relations list` and `relations show` are local
+  read-only operations; `relations analyze` and `relations approve` perform
+  controlled local relationship/event writes. Polymarket access remains
+  read-only.
 - Added CLI normalization so the documented `subcommand --config PATH` form is
   accepted by the actual parser.
 
@@ -32,8 +55,9 @@
 
 | Command | Result |
 | --- | --- |
-| `pytest -q tests/integration/test_documented_commands.py` | Passed: `6 passed, 1 warning in 0.15s`. |
-| `pytest -q` | Collection failed with 5 errors because the optional `polymarket` package is absent: `ModuleNotFoundError: No module named 'polymarket'` in SDK, watch, catalog-sync, and gateway tests. No dependency boundary was changed. |
+| `pytest -q tests/integration/test_documented_commands.py` | Passed after remediation: `8 passed, 1 warning in 0.15s`. |
+| `pytest -q tests/integration/test_documented_commands.py -k reset` | Passed: `6 passed, 2 deselected, 1 warning in 0.08s`. |
+| `pytest -q` | Collection failed with 5 errors in `0.25s` because the optional `polymarket` package is absent: `ModuleNotFoundError: No module named 'polymarket'` in SDK, watch, catalog-sync, and gateway tests. No dependency boundary was changed. |
 | `python -m predmarket --help` | Passed (exit 0); showed `run`, `status`, `signals`, and `relations`. |
 | `python -m predmarket status --config config/default.yaml` | Failed: `sqlite3.OperationalError: unable to open database file`; `config/default.yaml` points to the absent `data/predmarket-v1.sqlite3`. No default user database was created for verification. |
 | `python scripts/reset_database.py --config config/default.yaml` | Passed dry run; printed `/Users/lifei/workspace/earn_money_from_prediction/data/predmarket-v1.sqlite3` and only its exact `-wal` and `-shm` siblings. No file was removed. |

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import shlex
+import stat
 import subprocess
 
 from predmarket.config import AppConfig
@@ -18,6 +20,10 @@ class ResetRefused(ValueError):
 class ResetPlan:
     main_path: Path
     targets: tuple[Path, Path, Path]
+    parent_path: Path
+    target_names: tuple[str, str, str]
+    parent_device: int
+    parent_inode: int
 
 
 def prepare_reset(config_path: Path, *, working_directory: Path | None = None) -> ResetPlan:
@@ -47,7 +53,21 @@ def prepare_reset(config_path: Path, *, working_directory: Path | None = None) -
             raise ResetRefused(f"reset target must not be a symlink: {target}")
         if target.exists() and not target.is_file():
             raise ResetRefused(f"reset target must be a file: {target}")
-    return ResetPlan(main_path=resolved, targets=targets)
+    parent_path = resolved.parent
+    try:
+        parent_stat = parent_path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise ResetRefused("could not verify reset parent directory") from error
+    if not stat.S_ISDIR(parent_stat.st_mode):
+        raise ResetRefused("reset parent directory must be a directory")
+    return ResetPlan(
+        main_path=resolved,
+        targets=targets,
+        parent_path=parent_path,
+        target_names=tuple(target.name for target in targets),
+        parent_device=parent_stat.st_dev,
+        parent_inode=parent_stat.st_ino,
+    )
 
 
 def running_predmarket_processes() -> tuple[int, ...]:
@@ -87,12 +107,59 @@ def execute_reset(plan: ResetPlan, *, running_processes: tuple[int, ...] | None 
             + ")"
         )
 
-    deleted: list[Path] = []
-    for target in plan.targets:
-        if target.exists():
-            target.unlink()
-            deleted.append(target)
-    return tuple(deleted)
+    parent_fd = _open_verified_parent(plan)
+    try:
+        existing_names = _verified_target_names(plan, parent_fd)
+        for target, name in zip(plan.targets, existing_names, strict=True):
+            if name is not None:
+                os.unlink(name, dir_fd=parent_fd)
+        return tuple(
+            target
+            for target, name in zip(plan.targets, existing_names, strict=True)
+            if name is not None
+        )
+    except OSError as error:
+        raise ResetRefused("could not safely remove validated reset target") from error
+    finally:
+        os.close(parent_fd)
+
+
+def _open_verified_parent(plan: ResetPlan) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise ResetRefused("platform cannot safely open reset parent directory")
+    try:
+        parent_fd = os.open(
+            plan.parent_path,
+            os.O_RDONLY | directory | nofollow,
+        )
+    except OSError as error:
+        raise ResetRefused("could not safely open reset parent directory") from error
+    parent_stat = os.fstat(parent_fd)
+    if (
+        parent_stat.st_dev != plan.parent_device
+        or parent_stat.st_ino != plan.parent_inode
+    ):
+        os.close(parent_fd)
+        raise ResetRefused("reset parent directory changed after validation")
+    return parent_fd
+
+
+def _verified_target_names(plan: ResetPlan, parent_fd: int) -> tuple[str | None, ...]:
+    names: list[str | None] = []
+    for target, name in zip(plan.targets, plan.target_names, strict=True):
+        try:
+            target_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            names.append(None)
+            continue
+        if stat.S_ISLNK(target_stat.st_mode):
+            raise ResetRefused(f"reset target must not be a symlink: {target}")
+        if not stat.S_ISREG(target_stat.st_mode):
+            raise ResetRefused(f"reset target must be a file: {target}")
+        names.append(name)
+    return tuple(names)
 
 
 def _contains_symlink(path: Path) -> bool:
@@ -105,9 +172,15 @@ def _contains_symlink(path: Path) -> bool:
 
 
 def _is_predmarket_command(command: str) -> bool:
-    words = command.split()
-    return "predmarket" in words or (
-        "-m" in words
-        and words.index("-m") + 1 < len(words)
-        and words[words.index("-m") + 1] == "predmarket"
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    if Path(argv[0]).name == "predmarket":
+        return True
+    return any(
+        argument == "-m" and argv[index + 1] == "predmarket"
+        for index, argument in enumerate(argv[:-1])
     )
