@@ -30,6 +30,12 @@ from predmarket.strategy.optimizer import (
     optimize_quantity,
     walk_depth,
 )
+from predmarket.strategy.decimal_context import (
+    MAX_LEVELS_PER_BOOK,
+    MAX_STRATEGY_LEGS,
+    MAX_TOTAL_BOOK_LEVELS,
+    StrategyNumericLimitError,
+)
 from predmarket.strategy.risk import (
     FailureScenario,
     OpenExposure,
@@ -305,6 +311,7 @@ def optimize_trades(
     trade_specs: tuple[tuple[Market, Token, Action], ...],
     economics: Callable[[Decimal, tuple[Trade, ...]], tuple[Decimal, Decimal]],
     risk_evaluator: Callable[[tuple[Trade, ...], Decimal], RiskResult],
+    decimal_inputs: tuple[Decimal, ...] = (),
 ) -> TradeOptimization | None:
     requirements = tuple(
         DepthRequirement(
@@ -400,6 +407,7 @@ def optimize_trades(
         expected_profit=lambda item: item.expected_profit,
         quantity=lambda item: item.quantity,
         extra_breakpoints=tuple(extra_breakpoints),
+        decimal_inputs=_strategy_decimal_inputs(context, decimal_inputs),
     )
     if selection is None:
         return None
@@ -579,3 +587,52 @@ def _exposure(item: Trade) -> OpenExposure:
         item.book,
         item.fee_schedule,
     )
+
+
+def _strategy_decimal_inputs(
+    context: StrategyContext,
+    extras: tuple[Decimal, ...],
+) -> tuple[Decimal, ...]:
+    if len(context.orderbooks) > MAX_STRATEGY_LEGS:
+        raise StrategyNumericLimitError(
+            "strategy books exceed the numeric leg limit"
+        )
+    total_levels = 0
+    for book in context.orderbooks:
+        if (
+            len(book.bids) > MAX_LEVELS_PER_BOOK
+            or len(book.asks) > MAX_LEVELS_PER_BOOK
+        ):
+            raise StrategyNumericLimitError(
+                "order-book levels exceed the strategy numeric limit"
+            )
+        total_levels += len(book.bids) + len(book.asks)
+    if total_levels > MAX_TOTAL_BOOK_LEVELS:
+        raise StrategyNumericLimitError(
+            "total order-book levels exceed the strategy numeric limit"
+        )
+    config = context.configuration
+    values: list[Decimal] = [
+        config.bankroll,
+        config.minimum_return_rate,
+        config.maximum_risk_rate,
+        config.maximum_unhedged_notional,
+        config.safety_buffer_rate,
+        config.conversion_cost,
+        Decimal("0"),
+        Decimal("1"),
+        Decimal("2"),
+        *extras,
+    ]
+    for market in context.markets:
+        if market.tick_size is not None:
+            values.append(market.tick_size)
+        if market.minimum_order_size is not None:
+            values.append(market.minimum_order_size)
+    for book in context.orderbooks:
+        values.extend((book.tick_size, book.minimum_order_size))
+        for level in (*book.bids, *book.asks):
+            values.extend((level.price, level.size))
+    for schedule in context.fee_schedules.values():
+        values.extend(schedule.parameters.values())
+    return tuple(values)

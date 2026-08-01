@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Context, Decimal, ROUND_DOWN, ROUND_FLOOR, ROUND_UP, getcontext, localcontext
 
+import pytest
+
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
 from predmarket.domain.relation import DiscoverySource, Relation, RelationStatus
-from predmarket.domain.signal import StrategyType
+from predmarket.domain.signal import DecisionReason, NotEvaluable, StrategyType
 from predmarket.strategy.binary import evaluate_binary
 from predmarket.strategy.engine import StrategyEngine
 from predmarket.strategy.implication import evaluate_implication
@@ -17,6 +20,7 @@ from predmarket.strategy.optimizer import (
     optimize_quantity,
     walk_depth,
 )
+from predmarket.strategy.decimal_context import StrategyNumericLimitError
 from predmarket.strategy.risk import (
     FailureScenario,
     OpenExposure,
@@ -179,6 +183,7 @@ def test_optimizer_public_apis_derive_precision_and_exponent_limits_from_inputs(
             minimum_quantity=Decimal("1E+39"),
             bankroll=Decimal("3"),
             evaluate=lambda quantity: (quantity * Decimal("2E-40"), quantity * Decimal("1E-40")),
+            decimal_inputs=(Decimal("2E-40"), Decimal("1E-40")),
         )
         selected = optimize_candidates(
             (requirement,),
@@ -193,6 +198,7 @@ def test_optimizer_public_apis_derive_precision_and_exponent_limits_from_inputs(
             total_capital=lambda candidate: candidate.total_capital,
             expected_profit=lambda candidate: candidate.expected_profit,
             quantity=lambda candidate: candidate.quantity,
+            decimal_inputs=(Decimal("2E-40"), Decimal("1E-40"), Decimal("3")),
         )
         return fill, points, optimized, selected
 
@@ -218,3 +224,87 @@ def test_risk_public_apis_are_isolated_from_ambient_decimal_context() -> None:
         )
 
     _assert_ambient_invariant(exercise)
+
+
+class _CustomLevelSequence(Sequence[OrderBookLevel]):
+    def __init__(self, values: tuple[OrderBookLevel, ...]) -> None:
+        self._values = values
+
+    def __getitem__(self, index):
+        return self._values[index]
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+
+class _InfiniteLevelIterator(Iterator[OrderBookLevel]):
+    def __iter__(self) -> "_InfiniteLevelIterator":
+        return self
+
+    def __next__(self) -> OrderBookLevel:
+        raise AssertionError("an iterator must be rejected before it is consumed")
+
+
+def test_walk_depth_materializes_custom_sequence_before_deriving_precision() -> None:
+    price = Decimal("0.12345678901234567890123456789012345678901234567890")
+    levels = (OrderBookLevel(price, Decimal("1")),)
+
+    expected = walk_depth(levels, Decimal("1"))
+    actual = walk_depth(_CustomLevelSequence(levels), Decimal("1"))
+
+    assert actual == expected
+    assert actual.gross_amount == price
+
+
+@pytest.mark.parametrize("invalid", ["levels", b"levels", _InfiniteLevelIterator()])
+def test_walk_depth_rejects_non_sequence_or_text_inputs_without_consuming_them(
+    invalid: object,
+) -> None:
+    with pytest.raises(ValueError, match="levels must be a bounded Sequence"):
+        walk_depth(invalid, Decimal("1"))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "book_overrides",
+    ({"ask": "1E-1000000"}, {"size": "1E+1000000"}),
+)
+def test_strategy_entry_fails_closed_on_extreme_decimal_exponents(
+    book_overrides,
+    context_factory,
+    market_factory,
+    token_factory,
+    book_factory,
+) -> None:
+    market = market_factory("bounded")
+    tokens = (
+        token_factory("bounded-yes", market.id, "Yes", 0),
+        token_factory("bounded-no", market.id, "No", 1),
+    )
+    context = context_factory(
+        StrategyType.BINARY_UNDERPRICED,
+        markets=(market,),
+        tokens=tokens,
+        orderbooks=(
+            book_factory(tokens[0].id, market.id, **book_overrides),
+            book_factory(tokens[1].id, market.id),
+        ),
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, NotEvaluable)
+    assert decision.reason_code is DecisionReason.INPUT_METADATA_MISSING
+    assert decision.context["detail"] == "strategy_numeric_limit"
+
+
+def test_low_level_decimal_policy_rejects_huge_coefficients_and_level_counts() -> None:
+    huge_coefficient = Decimal("0." + "1" * 129)
+    with pytest.raises(StrategyNumericLimitError):
+        walk_depth(
+            (OrderBookLevel(huge_coefficient, Decimal("1")),),
+            Decimal("1"),
+        )
+
+    level = OrderBookLevel(Decimal("0.5"), Decimal("1"))
+    with pytest.raises(StrategyNumericLimitError):
+        walk_depth((level,) * 2_001, Decimal("1"))

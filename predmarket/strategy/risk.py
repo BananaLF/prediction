@@ -7,7 +7,12 @@ from decimal import Decimal
 
 from predmarket.domain.fees import FeeCalculator, FeeSchedule
 from predmarket.domain.orderbook import OrderBook
-from predmarket.strategy.decimal_context import isolated_decimal_context
+from predmarket.strategy.decimal_context import (
+    MAX_FAILURE_SCENARIOS,
+    MAX_STRATEGY_LEGS,
+    bounded_sequence,
+    isolated_decimal_context,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +53,11 @@ class FailureScenario:
             raise ValueError("name must be a non-empty string")
         _nonnegative_decimal(self.capital_at_risk, "capital_at_risk")
         _nonnegative_decimal(self.unhedged_notional, "unhedged_notional")
-        materialized = tuple(self.exposures)
+        materialized = bounded_sequence(
+            self.exposures,
+            field_name="exposures",
+            max_items=MAX_STRATEGY_LEGS,
+        )
         if not materialized or any(
             not isinstance(exposure, OpenExposure) for exposure in materialized
         ):
@@ -117,7 +126,6 @@ def immediate_close_value(
     )
 
 
-@isolated_decimal_context(operation_depth=20)
 def assess_failure_scenarios(
     scenarios: tuple[FailureScenario, ...],
     *,
@@ -126,7 +134,26 @@ def assess_failure_scenarios(
 ) -> RiskResult:
     """Aggregate exact scenario losses using conservative immediate recovery."""
 
-    materialized = tuple(scenarios)
+    materialized = bounded_sequence(
+        scenarios,
+        field_name="scenarios",
+        max_items=MAX_FAILURE_SCENARIOS,
+    )
+    return _assess_failure_scenarios(
+        materialized,
+        evaluated_at_ms=evaluated_at_ms,
+        fee_max_age_seconds=fee_max_age_seconds,
+    )
+
+
+@isolated_decimal_context(operation_depth=20)
+def _assess_failure_scenarios(
+    scenarios: tuple[FailureScenario, ...],
+    *,
+    evaluated_at_ms: int,
+    fee_max_age_seconds: int,
+) -> RiskResult:
+    materialized = scenarios
     if not materialized or any(
         not isinstance(scenario, FailureScenario) for scenario in materialized
     ):

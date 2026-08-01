@@ -19,11 +19,25 @@ from predmarket.strategy.common import (
     trade,
     validate_inputs,
 )
-from predmarket.strategy.decimal_context import isolated_decimal_context
+from predmarket.strategy.decimal_context import (
+    StrategyNumericLimitError,
+    isolated_decimal_context,
+)
+
+
+def evaluate_implication(context: StrategyContext) -> StrategyDecision:
+    try:
+        return _evaluate_implication(context)
+    except StrategyNumericLimitError:
+        return not_evaluable(
+            context,
+            DecisionReason.INPUT_METADATA_MISSING,
+            "strategy_numeric_limit",
+        )
 
 
 @isolated_decimal_context(operation_depth=48)
-def evaluate_implication(context: StrategyContext) -> StrategyDecision:
+def _evaluate_implication(context: StrategyContext) -> StrategyDecision:
     if context.strategy_type is not StrategyType.LOGICAL_IMPLICATION:
         return not_evaluable(
             context, DecisionReason.INPUT_METADATA_MISSING, "implication_strategy_type_required"

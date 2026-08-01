@@ -91,6 +91,7 @@ def test_optimizer_adds_exact_bankroll_boundary_inside_a_depth_interval() -> Non
         default_quantity=Decimal("1"),
         bankroll=Decimal("2"),
         evaluate=lambda q: (q * Decimal("0.5"), q * Decimal("0.1")),
+        decimal_inputs=(Decimal("0.5"), Decimal("0.1")),
     )
 
     assert quantity == Decimal("4")
@@ -110,6 +111,7 @@ def test_optimizer_selects_maximum_profit_not_largest_quantity() -> None:
         default_quantity=Decimal("1"),
         bankroll=Decimal("10"),
         evaluate=evaluate,
+        decimal_inputs=(Decimal("1"), Decimal("0.5"), Decimal("0.4")),
     )
 
     assert quantity == Decimal("2")
@@ -125,9 +127,41 @@ def test_optimizer_returns_none_for_minimum_size_or_depth_failure() -> None:
         default_quantity=Decimal("1"),
         bankroll=Decimal("10"),
         evaluate=lambda q: (q, q),
+        decimal_inputs=(Decimal("1"),),
     )
 
     assert quantity is None
+
+
+def test_optimizer_rejects_missing_or_fake_decimal_dependency_declaration_before_callback() -> None:
+    book = _book("buy")
+
+    class Evaluator:
+        called = False
+
+        def __call__(self, quantity: Decimal) -> tuple[Decimal, Decimal]:
+            self.called = True
+            return quantity, quantity
+
+    evaluator = Evaluator()
+    common = {
+        "requirements": (DepthRequirement(book, "BUY"),),
+        "minimum_quantity": Decimal("1"),
+        "bankroll": Decimal("10"),
+        "evaluate": evaluator,
+    }
+
+    with pytest.raises(ValueError, match="decimal_inputs"):
+        optimize_quantity(**common)
+    assert evaluator.called is False
+
+    with pytest.raises(ValueError, match="decimal_inputs"):
+        optimize_quantity(**common, decimal_inputs=())
+    assert evaluator.called is False
+
+    with pytest.raises(ValueError, match="decimal_inputs"):
+        optimize_quantity(**common, decimal_inputs=(object(),))
+    assert evaluator.called is False
 
 
 def test_candidate_optimizer_inserts_constraint_boundary_before_selecting_profit() -> None:
@@ -162,6 +196,13 @@ def test_candidate_optimizer_inserts_constraint_boundary_before_selecting_profit
         total_capital=lambda candidate: candidate.total_capital,
         expected_profit=lambda candidate: candidate.expected_profit,
         quantity=lambda candidate: candidate.quantity,
+        decimal_inputs=(
+            Decimal("0.8"),
+            Decimal("0.2"),
+            Decimal("0.4"),
+            Decimal("1000"),
+            Decimal("20"),
+        ),
     )
 
     assert selection.feasible is True
@@ -202,6 +243,7 @@ def test_candidate_optimizer_evaluates_both_adjacent_decimals_at_rounded_roots(
         total_capital=lambda candidate: candidate.total_capital,
         expected_profit=lambda candidate: candidate.expected_profit,
         quantity=lambda candidate: candidate.quantity,
+        decimal_inputs=(Decimal("0.124"), Decimal("7")),
     )
 
     assert selection is not None

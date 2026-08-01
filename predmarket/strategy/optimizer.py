@@ -8,7 +8,15 @@ from decimal import Decimal
 from typing import Generic, Literal, TypeVar
 
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
-from predmarket.strategy.decimal_context import isolated_decimal_context
+from predmarket.strategy.decimal_context import (
+    MAX_DECIMAL_INPUTS,
+    MAX_LEVELS_PER_BOOK,
+    MAX_OPTIMIZER_CANDIDATES,
+    MAX_STRATEGY_LEGS,
+    StrategyNumericLimitError,
+    bounded_sequence,
+    isolated_decimal_context,
+)
 
 
 Side = Literal["BUY", "SELL"]
@@ -58,12 +66,25 @@ class CandidateSelection(Generic[T]):
     candidates: tuple[T, ...]
 
 
-@isolated_decimal_context(operation_depth=8)
 def walk_depth(
     levels: Sequence[OrderBookLevel],
     quantity: Decimal,
 ) -> DepthFill:
     """Fill exactly ``quantity`` in the supplied best-to-worst level order."""
+
+    materialized = bounded_sequence(
+        levels,
+        field_name="levels",
+        max_items=MAX_LEVELS_PER_BOOK,
+    )
+    return _walk_depth(materialized, quantity)
+
+
+@isolated_decimal_context(operation_depth=8)
+def _walk_depth(
+    levels: tuple[OrderBookLevel, ...],
+    quantity: Decimal,
+) -> DepthFill:
 
     _positive_decimal(quantity, "quantity")
     remaining = quantity
@@ -92,7 +113,6 @@ def walk_depth(
     )
 
 
-@isolated_decimal_context(operation_depth=8)
 def breakpoint_quantities(
     requirements: Sequence[DepthRequirement],
     *,
@@ -102,6 +122,21 @@ def breakpoint_quantities(
     """Return executable minimum/default/L2 boundary quantities."""
 
     materialized = _requirements(requirements)
+    return _breakpoint_quantities(
+        materialized,
+        minimum_quantity=minimum_quantity,
+        default_quantity=default_quantity,
+    )
+
+
+@isolated_decimal_context(operation_depth=8)
+def _breakpoint_quantities(
+    requirements: tuple[DepthRequirement, ...],
+    *,
+    minimum_quantity: Decimal,
+    default_quantity: Decimal,
+) -> tuple[Decimal, ...]:
+    materialized = requirements
     _positive_decimal(minimum_quantity, "minimum_quantity")
     _positive_decimal(default_quantity, "default_quantity")
     effective_minimum = max(
@@ -127,7 +162,6 @@ def breakpoint_quantities(
     return tuple(sorted(candidates))
 
 
-@isolated_decimal_context(operation_depth=20)
 def optimize_quantity(
     requirements: Sequence[DepthRequirement],
     *,
@@ -135,6 +169,7 @@ def optimize_quantity(
     bankroll: Decimal,
     evaluate: Evaluation,
     default_quantity: Decimal = Decimal("1"),
+    decimal_inputs: Sequence[Decimal] | None = None,
 ) -> Decimal | None:
     """Choose the executable candidate with maximum expected profit.
 
@@ -143,6 +178,28 @@ def optimize_quantity(
     """
 
     materialized = _requirements(requirements)
+    declared = _decimal_inputs(decimal_inputs)
+    return _optimize_quantity(
+        materialized,
+        minimum_quantity=minimum_quantity,
+        bankroll=bankroll,
+        evaluate=evaluate,
+        default_quantity=default_quantity,
+        decimal_inputs=declared,
+    )
+
+
+@isolated_decimal_context(operation_depth=20)
+def _optimize_quantity(
+    requirements: tuple[DepthRequirement, ...],
+    *,
+    minimum_quantity: Decimal,
+    bankroll: Decimal,
+    evaluate: Evaluation,
+    default_quantity: Decimal,
+    decimal_inputs: tuple[Decimal, ...],
+) -> Decimal | None:
+    materialized = requirements
     _positive_decimal(bankroll, "bankroll")
     if not callable(evaluate):
         raise ValueError("evaluate must be callable")
@@ -180,7 +237,6 @@ def optimize_quantity(
     return max(feasible, key=lambda item: (item[2], -item[1], -item[0]))[0]
 
 
-@isolated_decimal_context(operation_depth=24)
 def optimize_candidates(
     requirements: Sequence[DepthRequirement],
     *,
@@ -193,17 +249,55 @@ def optimize_candidates(
     quantity: Callable[[T], Decimal],
     default_quantity: Decimal = Decimal("1"),
     extra_breakpoints: Sequence[Decimal] = (),
+    decimal_inputs: Sequence[Decimal] | None = None,
 ) -> CandidateSelection[T] | None:
     """Evaluate complete candidates, insert exact hard-constraint roots, then optimize."""
 
     materialized = _requirements(requirements)
+    extras = bounded_sequence(
+        extra_breakpoints,
+        field_name="extra_breakpoints",
+        max_items=MAX_OPTIMIZER_CANDIDATES,
+    )
+    declared = _decimal_inputs(decimal_inputs)
+    return _optimize_candidates(
+        materialized,
+        minimum_quantity=minimum_quantity,
+        evaluate=evaluate,
+        constraint_margins=constraint_margins,
+        is_feasible=is_feasible,
+        total_capital=total_capital,
+        expected_profit=expected_profit,
+        quantity=quantity,
+        default_quantity=default_quantity,
+        extra_breakpoints=extras,
+        decimal_inputs=declared,
+    )
+
+
+@isolated_decimal_context(operation_depth=24)
+def _optimize_candidates(
+    requirements: tuple[DepthRequirement, ...],
+    *,
+    minimum_quantity: Decimal,
+    evaluate: Callable[[Decimal], T],
+    constraint_margins: Callable[[T], Mapping[str, Decimal]],
+    is_feasible: Callable[[T], bool],
+    total_capital: Callable[[T], Decimal],
+    expected_profit: Callable[[T], Decimal],
+    quantity: Callable[[T], Decimal],
+    default_quantity: Decimal,
+    extra_breakpoints: tuple[Decimal, ...],
+    decimal_inputs: tuple[Decimal, ...],
+) -> CandidateSelection[T] | None:
     base = set(
         breakpoint_quantities(
-            materialized,
+            requirements,
             minimum_quantity=minimum_quantity,
             default_quantity=default_quantity,
         )
     )
+    _candidate_count(len(base))
     if not base:
         return None
     lower_bound = min(base)
@@ -212,6 +306,7 @@ def optimize_candidates(
         _positive_decimal(value, "extra breakpoint")
         if lower_bound <= value <= upper_bound:
             base.add(value)
+            _candidate_count(len(base))
 
     evaluated: dict[Decimal, T] = {
         value: evaluate(value) for value in sorted(base)
@@ -245,6 +340,7 @@ def optimize_candidates(
             )
             if lower < root < upper:
                 root_candidates.add(root)
+                _candidate_count(len(evaluated) + len(root_candidates))
                 # Margins use <= 0 as the safe side. Evaluate the adjacent
                 # representable Decimal only in that direction, so a rounded
                 # multiplication cannot admit the mathematically unsafe side.
@@ -256,6 +352,7 @@ def optimize_candidates(
                     continue
                 if lower_bound <= adjacent <= upper_bound:
                     root_candidates.add(adjacent)
+                    _candidate_count(len(evaluated) + len(root_candidates))
     for root_candidate in root_candidates:
         evaluated[root_candidate] = evaluate(root_candidate)
 
@@ -280,7 +377,11 @@ def optimize_candidates(
 def _requirements(
     values: Sequence[DepthRequirement],
 ) -> tuple[DepthRequirement, ...]:
-    materialized = tuple(values)
+    materialized = bounded_sequence(
+        values,
+        field_name="requirements",
+        max_items=MAX_STRATEGY_LEGS,
+    )
     if not materialized or any(
         not isinstance(value, DepthRequirement) for value in materialized
     ):
@@ -289,6 +390,29 @@ def _requirements(
     if len(identities) != len(set(identities)):
         raise ValueError("depth requirements must be unique")
     return materialized
+
+
+def _decimal_inputs(values: Sequence[Decimal] | None) -> tuple[Decimal, ...]:
+    if values is None:
+        raise ValueError("decimal_inputs must be explicitly declared")
+    materialized = bounded_sequence(
+        values,
+        field_name="decimal_inputs",
+        max_items=MAX_DECIMAL_INPUTS,
+    )
+    if not materialized or any(
+        not isinstance(value, Decimal) or not value.is_finite()
+        for value in materialized
+    ):
+        raise ValueError("decimal_inputs must contain finite Decimal values")
+    return materialized
+
+
+def _candidate_count(count: int) -> None:
+    if count > MAX_OPTIMIZER_CANDIDATES:
+        raise StrategyNumericLimitError(
+            "optimizer candidate count exceeds the strategy numeric limit"
+        )
 
 
 def _evaluation(value: object) -> tuple[Decimal, Decimal]:

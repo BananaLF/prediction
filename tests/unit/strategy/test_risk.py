@@ -8,6 +8,11 @@ from predmarket.strategy.risk import (
     assess_failure_scenarios,
     immediate_close_value,
 )
+from predmarket.strategy.decimal_context import (
+    MAX_FAILURE_SCENARIOS,
+    StrategyNumericLimitError,
+)
+import pytest
 
 
 def _zero_fee() -> FeeSchedule:
@@ -143,3 +148,20 @@ def test_risk_loss_is_clamped_at_zero_when_recovery_exceeds_capital() -> None:
     )
 
     assert risk.worst_case_loss == Decimal("0")
+
+
+def test_risk_rejects_scenario_count_over_numeric_resource_policy() -> None:
+    exposure = OpenExposure(
+        "a", Decimal("1"), Decimal("0.5"), _book("a", bids=()), _zero_fee()
+    )
+    scenarios = tuple(
+        FailureScenario(f"SCENARIO_{index}", Decimal("0.5"), (exposure,), Decimal("0.5"))
+        for index in range(MAX_FAILURE_SCENARIOS + 1)
+    )
+
+    with pytest.raises(StrategyNumericLimitError):
+        assess_failure_scenarios(
+            scenarios,
+            evaluated_at_ms=1_000,
+            fee_max_age_seconds=1,
+        )

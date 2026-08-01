@@ -20,7 +20,10 @@ from predmarket.strategy.common import (
     trade,
     validate_inputs,
 )
-from predmarket.strategy.decimal_context import isolated_decimal_context
+from predmarket.strategy.decimal_context import (
+    StrategyNumericLimitError,
+    isolated_decimal_context,
+)
 
 
 _MAPPING_VERSION = "polymarket-client-0.3.0b1:v1"
@@ -40,8 +43,19 @@ _NEG_RISK_SCHEMAS = {
 }
 
 
-@isolated_decimal_context(operation_depth=48)
 def evaluate_neg_risk(context: StrategyContext) -> StrategyDecision:
+    try:
+        return _evaluate_neg_risk(context)
+    except StrategyNumericLimitError:
+        return not_evaluable(
+            context,
+            DecisionReason.INPUT_METADATA_MISSING,
+            "strategy_numeric_limit",
+        )
+
+
+@isolated_decimal_context(operation_depth=48)
+def _evaluate_neg_risk(context: StrategyContext) -> StrategyDecision:
     if context.strategy_type is not StrategyType.NEG_RISK_COMPLETE_SET:
         return not_evaluable(
             context, DecisionReason.INPUT_METADATA_MISSING, "neg_risk_strategy_type_required"
@@ -162,6 +176,7 @@ def evaluate_neg_risk(context: StrategyContext) -> StrategyDecision:
         risk_evaluator=lambda trades, capital: long_entry_risk(
             context, trades, total_capital=capital
         ),
+        decimal_inputs=(conversion_fee_rate,),
     )
     if optimized is None:
         return not_evaluable(

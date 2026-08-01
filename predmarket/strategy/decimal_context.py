@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
 from decimal import (
@@ -15,13 +15,61 @@ from decimal import (
     localcontext,
 )
 from functools import wraps
-from math import ceil, log10
-from typing import Any, Callable, ParamSpec, TypeVar
+from typing import Any, Callable, ParamSpec, TypeVar, cast
 
 
 P = ParamSpec("P")
 R = TypeVar("R")
+T = TypeVar("T")
 _ACTIVE: ContextVar[bool] = ContextVar("strategy_decimal_context_active", default=False)
+
+
+# Strategy arithmetic accepts values far beyond current exchange precision while
+# retaining a finite, auditable CPU/memory envelope.
+MAX_DECIMAL_COEFFICIENT_DIGITS = 128
+MAX_DECIMAL_SCALE = 384
+MIN_DECIMAL_ADJUSTED_EXPONENT = -384
+MAX_DECIMAL_ADJUSTED_EXPONENT = 384
+MAX_DECIMAL_INPUTS = 50_000
+MAX_COLLECTION_ITEMS = 20_000
+MAX_LEVELS_PER_BOOK = 2_000
+MAX_TOTAL_BOOK_LEVELS = 10_000
+MAX_STRATEGY_LEGS = 64
+MAX_FAILURE_SCENARIOS = 64
+MAX_OPTIMIZER_CANDIDATES = 20_000
+MAX_CONTEXT_PRECISION = 16_384
+MAX_CONTEXT_EXPONENT = 32_768
+
+
+class StrategyNumericLimitError(ValueError):
+    """Raised before arithmetic would exceed the strategy resource policy."""
+
+
+def bounded_sequence(
+    values: object,
+    *,
+    field_name: str,
+    max_items: int,
+) -> tuple[T, ...]:
+    """Materialize a genuine finite Sequence without consuming iterators."""
+
+    if (
+        isinstance(values, (str, bytes, bytearray, memoryview))
+        or not isinstance(values, Sequence)
+    ):
+        raise ValueError(f"{field_name} must be a bounded Sequence")
+    try:
+        width = len(values)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{field_name} must be a bounded Sequence") from error
+    if width > max_items:
+        raise StrategyNumericLimitError(
+            f"{field_name} exceeds the numeric limit of {max_items} items"
+        )
+    try:
+        return tuple(cast(Sequence[T], values)[index] for index in range(width))
+    except (IndexError, KeyError, TypeError) as error:
+        raise ValueError(f"{field_name} must be a stable bounded Sequence") from error
 
 
 class _Envelope:
@@ -36,69 +84,117 @@ class _Envelope:
 
     def add(self, value: object) -> None:
         if isinstance(value, Decimal):
-            if value.is_finite():
-                digits = len(value.as_tuple().digits)
-                exponent = value.as_tuple().exponent
-                adjusted = value.adjusted()
-                self.decimal_count += 1
-                self.max_digits = max(self.max_digits, digits)
-                self.min_exponent = min(self.min_exponent, exponent)
-                self.min_adjusted = min(self.min_adjusted, adjusted)
-                self.max_adjusted = max(self.max_adjusted, adjusted)
+            if not value.is_finite():
+                raise StrategyNumericLimitError(
+                    "strategy Decimal inputs must be finite"
+                )
+            digits = len(value.as_tuple().digits)
+            exponent = value.as_tuple().exponent
+            adjusted = value.adjusted()
+            scale = max(0, -exponent)
+            if digits > MAX_DECIMAL_COEFFICIENT_DIGITS:
+                raise StrategyNumericLimitError(
+                    "Decimal coefficient exceeds the strategy numeric limit"
+                )
+            if scale > MAX_DECIMAL_SCALE:
+                raise StrategyNumericLimitError(
+                    "Decimal scale exceeds the strategy numeric limit"
+                )
+            if not (
+                MIN_DECIMAL_ADJUSTED_EXPONENT
+                <= adjusted
+                <= MAX_DECIMAL_ADJUSTED_EXPONENT
+            ):
+                raise StrategyNumericLimitError(
+                    "Decimal adjusted exponent exceeds the strategy numeric limit"
+                )
+            self.decimal_count += 1
+            if self.decimal_count > MAX_DECIMAL_INPUTS:
+                raise StrategyNumericLimitError(
+                    "Decimal input count exceeds the strategy numeric limit"
+                )
+            self.max_digits = max(self.max_digits, digits)
+            self.min_exponent = min(self.min_exponent, exponent)
+            self.min_adjusted = min(self.min_adjusted, adjusted)
+            self.max_adjusted = max(self.max_adjusted, adjusted)
             return
         if value is None or isinstance(value, (str, bytes, int, float, bool, type)):
+            return
+        # Callable internals are deliberately opaque. Public optimizer APIs must
+        # declare arithmetic dependencies explicitly instead of reflecting
+        # globals, closures, bound objects, or arbitrary attributes.
+        if callable(value):
             return
         identity = id(value)
         if identity in self._seen:
             return
         self._seen.add(identity)
         if isinstance(value, Mapping):
-            self.collection_width = max(self.collection_width, len(value))
+            width = len(value)
+            self._add_collection_width(width)
             for key, item in value.items():
                 self.add(key)
                 self.add(item)
             return
         if isinstance(value, (tuple, list, set, frozenset)):
-            self.collection_width = max(self.collection_width, len(value))
+            self._add_collection_width(len(value))
             for item in value:
+                self.add(item)
+            return
+        if isinstance(value, Sequence):
+            materialized = bounded_sequence(
+                value,
+                field_name="decimal context input",
+                max_items=MAX_COLLECTION_ITEMS,
+            )
+            self._add_collection_width(len(materialized))
+            for item in materialized:
                 self.add(item)
             return
         if is_dataclass(value) and not isinstance(value, type):
             for field in fields(value):
                 self.add(getattr(value, field.name))
-            return
-        closure = getattr(value, "__closure__", None)
-        if closure:
-            for cell in closure:
-                try:
-                    self.add(cell.cell_contents)
-                except ValueError:  # empty closure cell
-                    continue
-        bound_self = getattr(value, "__self__", None)
-        if bound_self is not None and bound_self is not value:
-            self.add(bound_self)
+
+    def _add_collection_width(self, width: int) -> None:
+        if width > MAX_COLLECTION_ITEMS:
+            raise StrategyNumericLimitError(
+                "collection width exceeds the strategy numeric limit"
+            )
+        self.collection_width = max(self.collection_width, width)
 
     def context(self, operation_depth: int) -> Context:
         # Each public entry declares a conservative maximum multiplication/division
         # chain. Addition across an input collection needs only log10(width) carry
         # digits; exponent span preserves small terms when unlike magnitudes meet.
-        carry_digits = ceil(log10(self.collection_width + 1))
+        carry_digits = len(str(max(1, self.collection_width)))
         exponent_span = self.max_adjusted - self.min_exponent + 1
-        precision = min(
-            MAX_PREC,
+        precision = (
             self.max_digits * operation_depth
             + exponent_span
             + carry_digits
             + operation_depth
-            + 16,
+            + 16
         )
+        if precision > min(MAX_PREC, MAX_CONTEXT_PRECISION):
+            raise StrategyNumericLimitError(
+                "derived Decimal precision exceeds the strategy numeric limit"
+            )
         magnitude = max(abs(self.min_adjusted), abs(self.max_adjusted), 1)
         exponent_guard = magnitude * operation_depth + precision
+        minimum_exponent = self.min_exponent - exponent_guard
+        maximum_exponent = self.max_adjusted + exponent_guard
+        if (
+            minimum_exponent < max(MIN_EMIN, -MAX_CONTEXT_EXPONENT)
+            or maximum_exponent > min(MAX_EMAX, MAX_CONTEXT_EXPONENT)
+        ):
+            raise StrategyNumericLimitError(
+                "derived Decimal exponent range exceeds the strategy numeric limit"
+            )
         return Context(
             prec=precision,
             rounding=ROUND_HALF_EVEN,
-            Emin=max(MIN_EMIN, min(self.min_exponent - exponent_guard, -1)),
-            Emax=min(MAX_EMAX, max(self.max_adjusted + exponent_guard, 1)),
+            Emin=min(minimum_exponent, -1),
+            Emax=max(maximum_exponent, 1),
             capitals=1,
             clamp=0,
         )
