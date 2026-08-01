@@ -11,7 +11,7 @@ from typing import Any, Mapping, TypeAlias
 from predmarket.config import StrategyConfig
 from predmarket.domain.fees import FeeSchedule
 from predmarket.domain.json import freeze_json_object
-from predmarket.domain.market import Market, Token
+from predmarket.domain.market import Event, Market, Token
 from predmarket.domain.orderbook import OrderBook
 from predmarket.domain.relation import Relation, RelationStatus
 
@@ -232,6 +232,9 @@ class StrategyContext:
     fee_schedules: Mapping[str, FeeSchedule]
     evaluated_at: int
     configuration: StrategyConfig
+    events: tuple[Event, ...] = ()
+    fee_schedule_max_age_seconds: int | None = None
+    supported_neg_risk_types: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.strategy_type, StrategyType):
@@ -240,6 +243,7 @@ class StrategyContext:
         markets = _sorted_unique(self.markets, Market, "markets")
         tokens = _sorted_unique(self.tokens, Token, "tokens")
         orderbooks = _sorted_unique(self.orderbooks, OrderBook, "orderbooks", key="token_id")
+        events = _sorted_unique(self.events, Event, "events")
         if self.approved_implication_relation is not None and (
             not isinstance(self.approved_implication_relation, Relation)
             or self.approved_implication_relation.status is not RelationStatus.APPROVED
@@ -256,9 +260,25 @@ class StrategyContext:
             raise ValueError("evaluated_at must be a non-negative integer")
         if not isinstance(self.configuration, StrategyConfig):
             raise ValueError("configuration must be a StrategyConfig")
+        if self.fee_schedule_max_age_seconds is not None and (
+            type(self.fee_schedule_max_age_seconds) is not int
+            or self.fee_schedule_max_age_seconds < 0
+        ):
+            raise ValueError("fee_schedule_max_age_seconds must be non-negative or None")
+        supported_types = tuple(self.supported_neg_risk_types)
+        if any(not isinstance(value, str) or not value for value in supported_types):
+            raise ValueError("supported_neg_risk_types must contain non-empty strings")
+        if len(supported_types) != len(set(supported_types)):
+            raise ValueError("supported_neg_risk_types must not contain duplicates")
         object.__setattr__(self, "markets", markets)
         object.__setattr__(self, "tokens", tokens)
         object.__setattr__(self, "orderbooks", orderbooks)
+        object.__setattr__(self, "events", events)
+        object.__setattr__(
+            self,
+            "supported_neg_risk_types",
+            tuple(sorted(supported_types, key=lambda value: value.encode("utf-8"))),
+        )
         object.__setattr__(
             self,
             "fee_schedules",
