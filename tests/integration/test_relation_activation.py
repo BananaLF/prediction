@@ -17,6 +17,7 @@ from predmarket.catalog.relations import (
     RelationActivation,
     RelationAnalysis,
     RelationChangeMonitor,
+    RelationWorkflow,
     semantic_evidence_digest,
 )
 from predmarket.cli import main
@@ -356,6 +357,90 @@ async def test_analysis_rejects_semantics_changed_while_analyzer_is_running(
         assert connection.execute(
             "SELECT status, llm_analysis_json FROM relations WHERE id = 'relation-1'"
         ).fetchone() == ("NO_LLM_APPROVE", None)
+
+
+@pytest.mark.parametrize("save_fails", [False, True])
+async def test_cancelled_analysis_drains_an_admitted_real_writer_save(
+    tmp_path: Path,
+    save_fails: bool,
+) -> None:
+    database_path = tmp_path / "market.db"
+    await _seed_relation(database_path, "relation-1", analyzed=False)
+    if save_fails:
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_relation_analysis
+                BEFORE UPDATE ON relations
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced analysis failure');
+                END
+                """
+            )
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    repository = RelationRepository(database_path, writer)
+    release = asyncio.Event()
+    started = asyncio.Event()
+    active = 0
+
+    async def blocker(connection: object) -> None:
+        nonlocal active
+        active += 1
+        started.set()
+        try:
+            await release.wait()
+        finally:
+            active -= 1
+
+    blocker_task = asyncio.create_task(writer.execute(blocker))
+    await started.wait()
+    workflow_task = asyncio.create_task(
+        RelationWorkflow(
+            repository,
+            DeterministicFakeAnalyzer(
+                {
+                    "relation-1": RelationAnalysis(
+                        approved=True,
+                        confidence=Decimal("0.9"),
+                        reasoning="fixture",
+                        warnings=(),
+                    )
+                }
+            ),
+            llm_enabled=True,
+        ).analyze("relation-1", updated_at=11)
+    )
+    for _ in range(100):
+        if writer._queue.qsize() == 1:
+            break
+        await asyncio.sleep(0.001)
+    assert writer._queue.qsize() == 1
+    workflow_task.cancel()
+    await asyncio.sleep(0)
+    assert workflow_task.done() is False
+    release.set()
+    await blocker_task
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await workflow_task
+        await writer.execute(lambda connection: None)
+        assert active == 0
+        assert writer._queue.empty()
+        stored = await repository.get("relation-1")
+        assert stored is not None
+        expected = (
+            RelationStatus.NO_LLM_APPROVE
+            if save_fails
+            else RelationStatus.LLM_APPROVE
+        )
+        assert stored.status is expected
+        await asyncio.sleep(0.02)
+        assert (await repository.get("relation-1")) == stored
+    finally:
+        release.set()
+        await asyncio.gather(workflow_task, return_exceptions=True)
+        await writer.close()
 
 
 async def test_cli_cannot_approve_an_unanalyzed_relation(tmp_path: Path) -> None:

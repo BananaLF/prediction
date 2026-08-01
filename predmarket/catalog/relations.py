@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import logging
 import math
 from pathlib import Path
 import sqlite3
@@ -24,6 +25,7 @@ from predmarket.domain.relation import DiscoverySource, Relation, RelationStatus
 
 
 RelationRule = Callable[[Event, Market, Event, Market], bool]
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,10 +249,44 @@ class RelationWorkflow:
             },
             updated_at=updated_at,
         )
-        return await self._repository.save_analysis(
-            analyzed,
-            expected_semantic_digest=expected_semantic_digest,
+        return await _await_owned_analysis_save(
+            self._repository.save_analysis(
+                analyzed,
+                expected_semantic_digest=expected_semantic_digest,
+            )
         )
+
+
+async def _await_owned_analysis_save(
+    operation: Awaitable[Relation],
+) -> Relation:
+    """Do not let caller cancellation orphan an admitted writer request."""
+
+    task = asyncio.ensure_future(operation)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancellation:
+        current = asyncio.current_task()
+        if current is None or current.cancelling() == 0:
+            return task.result()
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except BaseException as error:
+            _LOGGER.error(
+                "Relation analysis save failed while caller cancellation "
+                "was pending: %s",
+                error,
+            )
+        raise cancellation
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,7 +467,7 @@ class RelationCliStore:
     ) -> Relation:
         if not isinstance(relation, Relation):
             raise TypeError("relation must be a Relation")
-        _validate_digest(expected_semantic_digest)
+        validate_semantic_digest(expected_semantic_digest)
         return await asyncio.to_thread(
             self._save_analysis_sync,
             relation,
@@ -896,9 +932,9 @@ def _snapshot_from_evidence(evidence: object) -> dict[str, object]:
     return snapshot
 
 
-def _validate_digest(value: object) -> None:
+def validate_semantic_digest(value: object) -> None:
     if (
-        not isinstance(value, str)
+        type(value) is not str
         or len(value) != 64
         or any(character not in "0123456789abcdef" for character in value)
     ):

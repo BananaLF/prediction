@@ -574,6 +574,63 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
     assert decimals == ("0.01", "1")
 
 
+@pytest.mark.parametrize(
+    "invalid_digest",
+    [
+        "",
+        "A" * 64,
+        "g" * 64,
+        "0" * 63,
+        123,
+        object(),
+    ],
+)
+async def test_relation_analysis_rejects_noncanonical_digest_before_admission(
+    tmp_path: Path,
+    invalid_digest: object,
+) -> None:
+    class AdmissionTrap:
+        calls = 0
+
+        async def execute(self, command: object) -> None:
+            self.calls += 1
+            raise AssertionError("invalid digest reached DatabaseWriter")
+
+    trap = AdmissionTrap()
+    repository = RelationRepository(tmp_path / "unused.db", trap)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        await repository.save_analysis(
+            object(),  # type: ignore[arg-type]
+            expected_semantic_digest=invalid_digest,  # type: ignore[arg-type]
+        )
+
+    assert trap.calls == 0
+
+
+async def test_relation_analysis_rejects_string_subclass_digest_before_admission(
+    tmp_path: Path,
+) -> None:
+    class Digest(str):
+        pass
+
+    class AdmissionTrap:
+        calls = 0
+
+        async def execute(self, command: object) -> None:
+            self.calls += 1
+            raise AssertionError("invalid digest reached DatabaseWriter")
+
+    trap = AdmissionTrap()
+    repository = RelationRepository(tmp_path / "unused.db", trap)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="SHA-256"):
+        await repository.save_analysis(
+            object(),  # type: ignore[arg-type]
+            expected_semantic_digest=Digest("0" * 64),
+        )
+    assert trap.calls == 0
+
+
 async def test_catalog_single_entity_write_cannot_break_event_market_consistency(
     tmp_path: Path,
 ) -> None:

@@ -16,6 +16,7 @@ from predmarket.catalog.relations import (
     capture_relation_semantics,
     relation_with_semantic_context,
     semantic_evidence_digest,
+    validate_semantic_digest,
 )
 from predmarket.domain.decimal import encode_decimal
 from predmarket.domain.fees import FeeSchedule
@@ -215,6 +216,7 @@ class RelationRepository:
     ) -> Relation:
         """Persist one analyzer result without crossing the manual gate."""
 
+        validate_semantic_digest(expected_semantic_digest)
         _require_type(relation, Relation, "relation")
         if relation.status not in {
             RelationStatus.NO_LLM_APPROVE,
