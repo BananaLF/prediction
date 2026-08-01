@@ -81,3 +81,23 @@ def test_macos_desktop_notification_escapes_double_quoted_applescript_literals(
             },
         )
     ]
+
+
+def test_macos_desktop_notification_serializes_crlf_and_linefeed_literals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    def capture_run(*args: object, **kwargs: object) -> None:
+        calls.append((*args, kwargs))
+
+    monkeypatch.setattr(notifier_module.subprocess, "run", capture_run)
+
+    macos_desktop_notification("Signal\r\nnext", "body\nnext")
+
+    assert calls[0][0] == [
+        "osascript",
+        "-e",
+        'display notification "body" & linefeed & "next" '
+        'with title "Signal" & return & linefeed & "next"',
+    ]

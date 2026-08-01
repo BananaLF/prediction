@@ -269,6 +269,14 @@ class WatchTask:
                 for token_id in self._active_token_ids
                 if token_id not in frozenset(new_token_ids)
             )
+            explicitly_closed = removed
+            if change.change_type in {
+                MarketChangeType.MARKET_DEACTIVATED,
+                MarketChangeType.EVENT_SETTLED,
+            }:
+                explicitly_closed = tuple(
+                    sorted(set(removed).union(change.token_ids), key=_utf8)
+                )
             reason = (
                 DecisionReason.EVENT_SETTLED
                 if change.change_type is MarketChangeType.EVENT_SETTLED
@@ -276,7 +284,7 @@ class WatchTask:
             )
             await self._rotate_to(
                 new_token_ids,
-                explicitly_closed=removed,
+                explicitly_closed=explicitly_closed,
                 close_reason=reason,
             )
 

@@ -123,5 +123,33 @@ def macos_desktop_notification(title: str, message: str) -> None:
 
 def _applescript_string(value: str) -> str:
     """Serialize text as an AppleScript double-quoted string literal."""
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    terms: list[str] = []
+    literal: list[str] = []
+
+    def flush_literal() -> None:
+        if literal:
+            terms.append(f'"{"".join(literal)}"')
+            literal.clear()
+
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "\\":
+            literal.append("\\\\")
+        elif character == '"':
+            literal.append('\\"')
+        elif character == "\r":
+            flush_literal()
+            if index + 1 < len(value) and value[index + 1] == "\n":
+                terms.append("return & linefeed")
+                index += 1
+            else:
+                terms.append("return")
+        elif character == "\n":
+            flush_literal()
+            terms.append("linefeed")
+        else:
+            literal.append(character)
+        index += 1
+    flush_literal()
+    return " & ".join(terms) if terms else '""'

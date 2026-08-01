@@ -1,10 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from decimal import Decimal
+from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
+from predmarket.app import _SignalManagerRouter
+from predmarket.catalog.changes import (
+    MarketChange,
+    MarketChangeQueue,
+    MarketChangeType,
+)
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
 from predmarket.domain.signal import (
@@ -13,8 +24,15 @@ from predmarket.domain.signal import (
     OpportunityCalculation,
     OpportunityPresent,
     SignalLeg,
+    StrategyType,
 )
-from predmarket.persistence.repositories import CatalogSnapshot
+from predmarket.notification.notifier import Notifier
+from predmarket.persistence.repositories import (
+    CatalogRepository,
+    CatalogSnapshot,
+    SignalRepository,
+)
+from predmarket.persistence.writer import DatabaseWriter
 from predmarket.polymarket.gateway import MarketStreamInvalidated
 from predmarket.watch.cache import CacheState
 from predmarket.watch.task import EvaluationTarget, WatchTask
@@ -197,6 +215,167 @@ class _LifecycleSignals:
         if self.open_id is not None:
             self.closed_ids.append(self.open_id)
             self.open_id = None
+
+
+async def _ignore_market_change_report(_: object) -> None:
+    return None
+
+
+def _persisted_open_signal() -> tuple[Event, Market, Token, OpportunityPresent]:
+    event = Event(
+        id="event-1",
+        title="Event",
+        status=MarketStatus.ACTIVE,
+        market_ids=("market-1",),
+        sync_generation="sync-1",
+        sync_generation_complete=True,
+    )
+    market = Market(
+        id="market-1",
+        event_id=event.id,
+        condition_id="condition-1",
+        question="Question?",
+        status=MarketStatus.ACTIVE,
+        active=True,
+        accepting_orders=True,
+        enable_orderbook=True,
+        sync_generation="sync-1",
+        sync_generation_complete=True,
+    )
+    token = Token(
+        id="token-1",
+        market_id=market.id,
+        outcome="YES",
+        position=0,
+        sync_generation="sync-1",
+        sync_generation_complete=True,
+    )
+    present = OpportunityPresent(
+        calculation=OpportunityCalculation(
+            quantity=Decimal("2"),
+            total_capital=Decimal("0.80"),
+            expected_profit=Decimal("0.20"),
+            return_rate=Decimal("0.25"),
+            worst_case_loss=Decimal("0.40"),
+            risk_rate=Decimal("0.5"),
+            unhedged_notional=Decimal("0.40"),
+        ),
+        legs=(
+            SignalLeg(
+                position=0,
+                market_id=market.id,
+                token_id=token.id,
+                action=Action.BUY,
+                quantity=Decimal("2"),
+                average_price=Decimal("0.4"),
+                worst_price=Decimal("0.4"),
+                gross_amount=Decimal("0.80"),
+                fee_amount=Decimal("0"),
+            ),
+        ),
+        evidence=(
+            OrderBook(
+                market_id=market.id,
+                token_id=token.id,
+                bids=(OrderBookLevel(Decimal("0.3"), Decimal("2")),),
+                asks=(OrderBookLevel(Decimal("0.4"), Decimal("2")),),
+                subscription_generation=1,
+                book_hash="hash-token-1",
+                exchange_timestamp=10,
+                received_timestamp=11,
+                tick_size=Decimal("0.01"),
+                minimum_order_size=Decimal("1"),
+            ),
+        ),
+    )
+    return event, market, token, present
+
+
+@pytest.mark.parametrize(
+    "change_type",
+    (MarketChangeType.MARKET_DEACTIVATED, MarketChangeType.EVENT_SETTLED),
+)
+async def test_queued_control_change_closes_persisted_signal_after_empty_restart(
+    tmp_path: Path,
+    change_type: MarketChangeType,
+) -> None:
+    database_path = tmp_path / "signals.sqlite3"
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    try:
+        catalog = CatalogRepository(database_path, writer)
+        signals = SignalRepository(database_path, writer)
+        event, market, token, present = _persisted_open_signal()
+        await catalog.save_catalog(events=(event,), markets=(market,), tokens=(token,))
+        await signals.open_signal(
+            signal_id="persisted-signal",
+            opportunity_key="BINARY_UNDERPRICED:market-1",
+            strategy_type=StrategyType.BINARY_UNDERPRICED,
+            market_ids=(market.id,),
+            relation_id=None,
+            execution_mode=ExecutionMode.IMMEDIATE_CONVERSION,
+            observed_at=1,
+            decision=present,
+        )
+        await catalog.save_catalog(
+            events=(event,),
+            markets=(
+                replace(
+                    market,
+                    status=MarketStatus.CLOSED,
+                    active=False,
+                    accepting_orders=False,
+                    enable_orderbook=False,
+                ),
+            ),
+            tokens=(token,),
+        )
+        changes = MarketChangeQueue(
+            1,
+            record_system_event=_ignore_market_change_report,
+            notify=_ignore_market_change_report,
+        )
+        watch = WatchTask(
+            gateway=object(),
+            catalog=catalog,
+            changes=changes,
+            strategy_engine=object(),
+            signal_manager=_SignalManagerRouter(
+                signals,
+                Notifier(terminal=StringIO()),
+                lambda: 2,
+            ),
+            context_source=object(),
+        )
+
+        await watch.start()
+        assert watch.active_token_ids == ()
+        await changes.put(
+            MarketChange(
+                change_id=f"queued-{change_type.value}",
+                change_type=change_type,
+                event_id=event.id,
+                market_id=None
+                if change_type is MarketChangeType.EVENT_SETTLED
+                else market.id,
+                token_ids=(token.id,),
+                occurred_at=2,
+                critical=True,
+            )
+        )
+
+        running = asyncio.create_task(watch.run())
+        try:
+            await asyncio.wait_for(changes.join(), timeout=0.1)
+            assert (
+                await signals.find_open_signal_id("BINARY_UNDERPRICED:market-1")
+                is None
+            )
+        finally:
+            await watch.close()
+            await asyncio.wait_for(running, timeout=0.1)
+    finally:
+        await writer.close()
 
 
 async def test_recovery_closes_old_signal_and_reopens_with_new_signal_id() -> None:
