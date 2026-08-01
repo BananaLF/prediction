@@ -212,6 +212,22 @@ class ReturnChangeOnCancellation(FakeChanges):
             return self.change
 
 
+class DelayedReturnChangeOnCancellation(ReturnChangeOnCancellation):
+    def __init__(self, change: MarketChange) -> None:
+        super().__init__(change)
+        self.cancel_caught = asyncio.Event()
+        self.release_result = asyncio.Event()
+
+    async def get(self) -> MarketChange:
+        self.get_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancel_caught.set()
+            await self.release_result.wait()
+            return self.change
+
+
 class FakeContextSource:
     def contexts_for(
         self,
@@ -428,6 +444,34 @@ async def test_change_returned_during_stop_reader_drain_is_claimed_once() -> Non
 
     await watch.close()
     await running
+
+    assert changes.done == 1
+    await asyncio.wait_for(changes.join(), timeout=0.1)
+
+
+async def test_double_cancel_during_stop_drain_still_claims_change_once() -> None:
+    # Catches repeated run cancellation skipping the post-drain result claim.
+    change = MarketChange(
+        change_id="double-cancel-drain",
+        change_type=MarketChangeType.MARKET_UPDATED,
+        event_id="event-1",
+        market_id="market-1",
+        token_ids=("token-1", "token-2"),
+        occurred_at=200,
+    )
+    changes = DelayedReturnChangeOnCancellation(change)
+    catalog = FakeCatalog(_catalog(first_active=False))
+    watch, _, _, _, _, _ = _watch(catalog=catalog, changes=changes)
+    running = asyncio.create_task(watch.run())
+    await changes.get_started.wait()
+    await watch.close()
+    await changes.cancel_caught.wait()
+
+    running.cancel()
+    running.cancel()
+    changes.release_result.set()
+    with pytest.raises(asyncio.CancelledError):
+        await running
 
     assert changes.done == 1
     await asyncio.wait_for(changes.join(), timeout=0.1)
@@ -800,6 +844,89 @@ async def test_double_cancelled_recovery_drains_and_closes_late_handle() -> None
     assert gateway.recovery_cancellations == 1
     assert gateway.subscriptions[1].closed is True
     await watch.close()
+
+
+async def test_handler_cancel_and_concurrent_close_cancel_gateway_only_once() -> None:
+    # Catches handler and close each propagating cancellation to one recovery target.
+    gateway = FakeGateway()
+    watch, _, _, _, _, _ = _watch(gateway=gateway)
+    await watch.start()
+    gateway.recovery_gate = asyncio.Event()
+    gateway.ignore_recovery_cancellation_count = 1
+    recovering = asyncio.create_task(
+        watch.handle_stream_message(
+            MarketStreamInvalidated(
+                reason="connection_lost",
+                token_ids=("token-1", "token-2"),
+                received_timestamp=120,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if len(gateway.subscriptions) == 2:
+            break
+
+    recovering.cancel()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if gateway.recovery_cancellations == 1:
+            break
+    closing = asyncio.create_task(watch.close())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    gateway.recovery_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await recovering
+    await closing
+
+    assert gateway.recovery_cancellations == 1
+    assert gateway.subscriptions[1].closed is True
+
+
+async def test_multiple_cancelled_close_waiters_share_one_terminal_cleanup() -> None:
+    # Catches multiple close waiters caching cancellation or cancelling recovery twice.
+    gateway = FakeGateway()
+    watch, _, _, _, _, _ = _watch(gateway=gateway)
+    await watch.start()
+    gateway.recovery_gate = asyncio.Event()
+    gateway.ignore_recovery_cancellation_count = 1
+    recovering = asyncio.create_task(
+        watch.handle_stream_message(
+            MarketStreamInvalidated(
+                reason="connection_lost",
+                token_ids=("token-1", "token-2"),
+                received_timestamp=120,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if len(gateway.subscriptions) == 2:
+            break
+
+    first = asyncio.create_task(watch.close())
+    second = asyncio.create_task(watch.close())
+    await asyncio.sleep(0)
+    first.cancel()
+    second.cancel()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if gateway.recovery_cancellations:
+            break
+    gateway.recovery_gate.set()
+    for waiter in (first, second):
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+    await recovering
+    await watch.close()
+
+    assert gateway.recovery_cancellations == 1
+    assert gateway.subscriptions[1].closed is True
 
 
 async def test_price_change_uses_local_arrival_sequence_and_evaluates_changed_token() -> None:
