@@ -178,6 +178,37 @@ class _MarkerFailingSystemEvents:
         )
 
 
+class _BlockingDegradedSystemEvents(_MarkerFailingSystemEvents):
+    def __init__(self, delegate: SystemEventRepository) -> None:
+        super().__init__(delegate)
+        self.active_reports = 0
+        self.cancelled_reports = 0
+
+    async def append(self, **values: Any) -> int:
+        if values.get("event_type") != "SYSTEM_DEGRADED":
+            return await self._delegate.append(**values)
+        self.active_reports += 1
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled_reports += 1
+            raise
+        finally:
+            self.active_reports -= 1
+        raise AssertionError("unreachable")
+
+
+class _CursorFailingSystemEvents:
+    def __init__(self, delegate: SystemEventRepository) -> None:
+        self._delegate = delegate
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
+
+    async def record_settlement_refresh_cursor(self, **_: object) -> int:
+        raise RuntimeError("forced cursor failure")
+
+
 @pytest.fixture
 async def catalog_runtime(tmp_path: Path):
     database_path = tmp_path / "catalog.db"
@@ -843,6 +874,38 @@ async def test_marker_failure_degrades_but_does_not_skip_later_critical_control(
     assert degraded[0]["details"]["failed_change_id"].endswith("market-1")
 
 
+async def test_blocked_degraded_report_cannot_delay_later_critical_control(
+    catalog_runtime,
+) -> None:
+    catalog, real_system_events = catalog_runtime
+    await _seed(catalog, ("market-2",))
+    queue = _RecordingQueue()
+    blocking_events = _BlockingDegradedSystemEvents(real_system_events)
+    task = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",)),),
+            markets=(_snapshot("market-1"),),
+            refreshed={"market-2": RuntimeError("not resolved")},
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=blocking_events,  # type: ignore[arg-type]
+        clock_ms=lambda: 705,
+        generation_factory=lambda: "sync-blocked-degraded-report",
+    )
+
+    result = await asyncio.wait_for(task.run_once(), timeout=0.2)
+
+    assert [item.change_type for item in queue.items] == [
+        MarketChangeType.MARKET_ADDED,
+        MarketChangeType.MARKET_DEACTIVATED,
+    ]
+    assert result.degraded is True
+    assert task.degraded is True
+    assert blocking_events.cancelled_reports == 1
+    assert blocking_events.active_reports == 0
+
+
 async def test_deactivated_publication_baseline_reactivation_replays_added(
     catalog_runtime,
 ) -> None:
@@ -976,6 +1039,63 @@ async def test_settlement_refresh_timeout_is_fail_closed_and_bounded(
         item.change_type is MarketChangeType.MARKET_DEACTIVATED
         for item in queue.items
     )
+
+
+async def test_cursor_failure_degrades_and_keeps_in_process_fair_progress(
+    catalog_runtime,
+) -> None:
+    catalog, real_system_events = catalog_runtime
+    await _seed(catalog, ("market-1", "market-2", "market-3"))
+    gateway = _FakeGateway(
+        events=(),
+        markets=(),
+        refreshed={
+            market_id: RuntimeError("not resolved")
+            for market_id in ("market-1", "market-2", "market-3")
+        },
+    )
+    generations = iter(("cursor-failure-1", "cursor-failure-2"))
+    task = SyncMarketTask(
+        gateway=gateway,
+        catalog=catalog,
+        changes=_RecordingQueue(),
+        system_events=_CursorFailingSystemEvents(real_system_events),  # type: ignore[arg-type]
+        clock_ms=lambda: 785,
+        generation_factory=lambda: next(generations),
+        settlement_refresh_budget=1,
+    )
+
+    first = await task.run_once()
+    second = await task.run_once()
+
+    assert gateway.refresh_calls == ["market-1", "market-2"]
+    assert first.degraded is True
+    assert first.cursor_persistence_failed is True
+    assert second.degraded is True
+    assert second.cursor_persistence_failed is True
+    assert task.degraded is True
+    assert await real_system_events.get_settlement_refresh_cursor() is None
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    (float("nan"), float("inf"), float("-inf"), 0.0, -1.0),
+)
+async def test_settlement_refresh_timeout_must_be_finite_and_positive(
+    catalog_runtime,
+    timeout: float,
+) -> None:
+    catalog, system_events = catalog_runtime
+
+    with pytest.raises(ValueError, match="finite positive"):
+        SyncMarketTask(
+            gateway=_FakeGateway(events=(), markets=()),
+            catalog=catalog,
+            changes=_RecordingQueue(),
+            system_events=system_events,
+            clock_ms=lambda: 790,
+            settlement_refresh_timeout_seconds=timeout,
+        )
 
 
 async def test_catalog_rollback_never_publishes_market_changes(

@@ -7,6 +7,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 import logging
+import math
 from typing import Any, Protocol, TypeVar
 from uuid import uuid4
 
@@ -26,6 +27,9 @@ from predmarket.polymarket.gateway import MarketSnapshot
 
 T = TypeVar("T")
 _LOGGER = logging.getLogger(__name__)
+_MARKER_WRITE_TIMEOUT_SECONDS = 0.05
+_CURSOR_WRITE_TIMEOUT_SECONDS = 0.05
+_DEGRADATION_REPORT_TIMEOUT_SECONDS = 0.05
 
 
 class _Gateway(Protocol):
@@ -64,6 +68,7 @@ class SyncResult:
     error: str | None = None
     degraded: bool = False
     publication_marker_failures: int = 0
+    cursor_persistence_failed: bool = False
 
 
 class SyncMarketTask:
@@ -87,9 +92,12 @@ class SyncMarketTask:
         if (
             isinstance(settlement_refresh_timeout_seconds, bool)
             or not isinstance(settlement_refresh_timeout_seconds, (int, float))
+            or not math.isfinite(settlement_refresh_timeout_seconds)
             or settlement_refresh_timeout_seconds <= 0
         ):
-            raise ValueError("settlement_refresh_timeout_seconds must be positive")
+            raise ValueError(
+                "settlement_refresh_timeout_seconds must be finite positive"
+            )
         self._gateway = gateway
         self._catalog = catalog
         self._changes = changes
@@ -102,6 +110,13 @@ class SyncMarketTask:
         self._settlement_refresh_timeout_seconds = float(
             settlement_refresh_timeout_seconds
         )
+        self._degraded = False
+        self._refresh_cursor_pending = False
+        self._refresh_cursor_fallback: str | None = None
+
+    @property
+    def degraded(self) -> bool:
+        return self._degraded
 
     async def run_once(self) -> SyncResult:
         occurred_at = self._now()
@@ -130,7 +145,14 @@ class SyncMarketTask:
 
         previous = await self._catalog.load_catalog()
         published_market_ids = await self._system_events.list_published_market_ids()
-        refresh_cursor = await self._system_events.get_settlement_refresh_cursor()
+        persisted_refresh_cursor = (
+            await self._system_events.get_settlement_refresh_cursor()
+        )
+        refresh_cursor = (
+            self._refresh_cursor_fallback
+            if self._refresh_cursor_pending
+            else persisted_refresh_cursor
+        )
         next_refresh_cursor: str | None = None
         if not errors:
             (
@@ -186,11 +208,19 @@ class SyncMarketTask:
                     "tokens_seen": sum(len(item.tokens) for item in snapshots),
                 },
             )
-            await self._advance_refresh_cursor(
+            cursor_error = await self._advance_refresh_cursor(
                 generation=generation,
                 cursor=next_refresh_cursor,
                 occurred_at=occurred_at,
             )
+            if cursor_error is not None:
+                error_message = f"{error_message}; {cursor_error}"
+                await self._report_degraded(
+                    occurred_at=occurred_at,
+                    errors=(cursor_error,),
+                    failed_change_ids=(),
+                    cursor_persistence_failed=True,
+                )
             return SyncResult(
                 sync_generation=generation,
                 complete=False,
@@ -200,6 +230,8 @@ class SyncMarketTask:
                 changes_published=0,
                 changes_dropped=0,
                 error=error_message,
+                degraded=self._degraded,
+                cursor_persistence_failed=cursor_error is not None,
             )
 
         prepared = _prepare_complete(
@@ -216,15 +248,9 @@ class SyncMarketTask:
             markets=prepared.markets,
             tokens=prepared.tokens,
         )
-        await self._advance_refresh_cursor(
-            generation=generation,
-            cursor=next_refresh_cursor,
-            occurred_at=occurred_at,
-        )
-
         published = 0
         dropped = 0
-        marker_failures = 0
+        admitted: list[tuple[MarketChange, tuple[str, ...]]] = []
         for change in prepared.changes:
             if await self._changes.put(change):
                 published += 1
@@ -233,37 +259,37 @@ class SyncMarketTask:
                     for market in prepared.markets
                     if market.event_id == change.event_id
                 )
-                try:
-                    await self._system_events.record_market_change_published(
-                        change,
-                        market_ids=affected_market_ids,
-                    )
-                except Exception as error:
-                    marker_failures += 1
-                    _LOGGER.error(
-                        "Publication marker failed for %s: %s",
-                        change.change_id,
-                        error,
-                    )
-                    try:
-                        await self._system_events.append(
-                            component="SYNC",
-                            severity="ERROR",
-                            event_type="SYSTEM_DEGRADED",
-                            message="Market publication baseline could not be recorded",
-                            occurred_at=occurred_at,
-                            details={
-                                "error": _error_text("marker write failed", error),
-                                "failed_change_id": change.change_id,
-                            },
-                        )
-                    except Exception as report_error:
-                        _LOGGER.error(
-                            "Publication marker degradation report failed: %s",
-                            report_error,
-                        )
+                admitted.append((change, affected_market_ids))
             else:
                 dropped += 1
+
+        marker_errors: list[str] = []
+        failed_change_ids: list[str] = []
+        for change, affected_market_ids in admitted:
+            marker_error = await self._record_publication_marker(
+                change=change,
+                market_ids=affected_market_ids,
+            )
+            if marker_error is not None:
+                marker_errors.append(marker_error)
+                failed_change_ids.append(change.change_id)
+
+        cursor_error = await self._advance_refresh_cursor(
+            generation=generation,
+            cursor=next_refresh_cursor,
+            occurred_at=occurred_at,
+        )
+        degradation_errors = tuple(
+            marker_errors
+            + ([] if cursor_error is None else [cursor_error])
+        )
+        if degradation_errors:
+            await self._report_degraded(
+                occurred_at=occurred_at,
+                errors=degradation_errors,
+                failed_change_ids=tuple(failed_change_ids),
+                cursor_persistence_failed=cursor_error is not None,
+            )
         return SyncResult(
             sync_generation=generation,
             complete=True,
@@ -272,9 +298,35 @@ class SyncMarketTask:
             tokens_seen=sum(len(item.tokens) for item in snapshots),
             changes_published=published,
             changes_dropped=dropped,
-            degraded=marker_failures > 0,
-            publication_marker_failures=marker_failures,
+            degraded=self._degraded,
+            publication_marker_failures=len(marker_errors),
+            cursor_persistence_failed=cursor_error is not None,
         )
+
+    async def _record_publication_marker(
+        self,
+        *,
+        change: MarketChange,
+        market_ids: tuple[str, ...],
+    ) -> str | None:
+        try:
+            await asyncio.wait_for(
+                self._system_events.record_market_change_published(
+                    change,
+                    market_ids=market_ids,
+                ),
+                timeout=_MARKER_WRITE_TIMEOUT_SECONDS,
+            )
+        except Exception as error:
+            self._degraded = True
+            message = _error_text("publication marker write failed", error)
+            _LOGGER.error(
+                "Publication marker failed for %s: %s",
+                change.change_id,
+                error,
+            )
+            return message
+        return None
 
     async def _advance_refresh_cursor(
         self,
@@ -282,17 +334,60 @@ class SyncMarketTask:
         generation: str,
         cursor: str | None,
         occurred_at: int,
-    ) -> None:
+    ) -> str | None:
         if cursor is None:
-            return
+            return None
         try:
-            await self._system_events.record_settlement_refresh_cursor(
-                sync_generation=generation,
-                cursor=cursor,
-                occurred_at=occurred_at,
+            await asyncio.wait_for(
+                self._system_events.record_settlement_refresh_cursor(
+                    sync_generation=generation,
+                    cursor=cursor,
+                    occurred_at=occurred_at,
+                ),
+                timeout=_CURSOR_WRITE_TIMEOUT_SECONDS,
             )
         except Exception as error:
+            self._degraded = True
+            self._refresh_cursor_pending = True
+            self._refresh_cursor_fallback = cursor
             _LOGGER.error("Settlement refresh cursor write failed: %s", error)
+            return _error_text(
+                "settlement refresh cursor persistence failed",
+                error,
+            )
+        self._refresh_cursor_pending = False
+        self._refresh_cursor_fallback = None
+        return None
+
+    async def _report_degraded(
+        self,
+        *,
+        occurred_at: int,
+        errors: tuple[str, ...],
+        failed_change_ids: tuple[str, ...],
+        cursor_persistence_failed: bool,
+    ) -> None:
+        details: dict[str, Any] = {
+            "errors": errors,
+            "failed_change_ids": failed_change_ids,
+            "cursor_persistence_failed": cursor_persistence_failed,
+        }
+        if failed_change_ids:
+            details["failed_change_id"] = failed_change_ids[0]
+        try:
+            await asyncio.wait_for(
+                self._system_events.append(
+                    component="SYNC",
+                    severity="ERROR",
+                    event_type="SYSTEM_DEGRADED",
+                    message="Catalog sync auxiliary persistence degraded",
+                    occurred_at=occurred_at,
+                    details=details,
+                ),
+                timeout=_DEGRADATION_REPORT_TIMEOUT_SECONDS,
+            )
+        except Exception as error:
+            _LOGGER.error("Catalog sync degradation report failed: %s", error)
 
     def _now(self) -> int:
         value = self._clock_ms()
