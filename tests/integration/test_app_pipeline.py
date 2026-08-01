@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from predmarket.app import Supervisor, _SignalManagerRouter
+from predmarket.app import Supervisor, _SignalManagerRouter, _SubscriptionGenerationSource
 from predmarket.config import AppConfig, DatabaseConfig, NotificationConfig
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
@@ -25,6 +25,7 @@ from predmarket.domain.signal import (
 from predmarket.notification.notifier import Notifier
 from predmarket.persistence.repositories import CatalogRepository, SignalRepository
 from predmarket.persistence.writer import DatabaseWriter
+from predmarket.watch.cache import OrderBookCache
 
 
 class _Events:
@@ -148,6 +149,66 @@ async def test_supervisor_returns_failure_when_startup_failure_notification_fail
     )
 
     assert await supervisor.run() == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ("initialize", "integrity", "writer"))
+async def test_supervisor_reports_pre_notifier_database_failures_to_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    output = StringIO()
+
+    if stage == "initialize":
+        def fail_initialize(_: Path) -> None:
+            raise RuntimeError("database initialize failed")
+
+        monkeypatch.setattr("predmarket.app.initialize_database", fail_initialize)
+    elif stage == "integrity":
+        def fail_integrity(_: Path) -> None:
+            raise RuntimeError("database integrity failed")
+
+        monkeypatch.setattr("predmarket.app.check_database_integrity", fail_integrity)
+    else:
+        async def fail_writer_start(_: DatabaseWriter) -> None:
+            raise RuntimeError("database writer failed")
+
+        monkeypatch.setattr("predmarket.app.DatabaseWriter.start", fail_writer_start)
+    supervisor = Supervisor(
+        _config(tmp_path),
+        gateway=object(),
+        terminal=output,
+        sync_task_factory=lambda **_: _Sync([]),
+        watch_task_factory=lambda **_: _Watch([], crash=False),
+    )
+
+    assert await supervisor.run() == 1
+    assert f"RUNTIME_STARTUP_FAILED: Signal service startup failed: database {stage} failed" in output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_router_revalidates_generation_source_before_database_commit(tmp_path: Path) -> None:
+    database_path = tmp_path / "signals.sqlite3"
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    try:
+        source = _SubscriptionGenerationSource()
+        router = _SignalManagerRouter(
+            SignalRepository(database_path, writer),
+            Notifier(terminal=StringIO()),
+            lambda: 1,
+            subscription_generation=source,
+        )
+        decision = _persisted_open_signal()[3]
+        with pytest.raises(ValueError, match="subscription generation is unavailable"):
+            await router.apply(decision, "BINARY_UNDERPRICED:market-1", None)
+        cache = OrderBookCache()
+        cache.begin_resync(generation=2, token_ids=("token-1",))
+        cache.apply_snapshot((replace(decision.evidence[0], subscription_generation=2),))
+        source.bind(cache)
+        with pytest.raises(ValueError, match="stale subscription generation"):
+            await router.apply(decision, "BINARY_UNDERPRICED:market-1", None)
+    finally:
+        await writer.close()
 
 
 def _persisted_open_signal() -> tuple[Event, Market, Token, OpportunityPresent]:

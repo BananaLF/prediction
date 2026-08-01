@@ -8,7 +8,7 @@ import sqlite3
 import pytest
 
 from predmarket.domain.market import MarketStatus
-from predmarket.domain.signal import ExecutionMode, StrategyType
+from predmarket.domain.signal import DecisionReason, ExecutionMode, OpportunityAbsent, StrategyType
 from predmarket.persistence.repositories import SignalRepository
 from predmarket.signals.manager import SignalManager
 from tests.unit.signals.test_manager import _catalog, _open_manager, _present
@@ -80,7 +80,26 @@ async def test_subscription_generation_is_revalidated_after_waiting_for_writer(
 
 
 @pytest.mark.asyncio
-async def test_two_managers_retry_same_revision_without_duplicate_revision(tmp_path: Path) -> None:
+async def test_missing_subscription_generation_fails_closed_before_open(tmp_path: Path) -> None:
+    writer, _catalog_repo, _signals, _manager = await _open_manager(tmp_path)
+    manager = SignalManager(
+        SignalRepository(tmp_path / "signals.db", writer),
+        strategy_type=StrategyType.BINARY_UNDERPRICED,
+        execution_mode=ExecutionMode.IMMEDIATE_CONVERSION,
+        subscription_generation=lambda _token_id: None,
+        clock=lambda: 101,
+    )
+    try:
+        with pytest.raises(ValueError, match="subscription generation is unavailable"):
+            await manager.apply(_present(), "opportunity-generation-missing", None)
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_two_managers_do_not_reapply_stale_decision_after_revision_conflict(
+    tmp_path: Path,
+) -> None:
     writer, _catalog_repo, signals, first = await _open_manager(tmp_path)
     second = SignalManager(
         SignalRepository(tmp_path / "signals.db", writer),
@@ -93,9 +112,9 @@ async def test_two_managers_retry_same_revision_without_duplicate_revision(tmp_p
         assert signal_id is not None
         results = await asyncio.gather(
             first.apply(_present(expected_profit="0.24"), "opportunity-race", 1),
-            second.apply(_present(expected_profit="0.24"), "opportunity-race", 1),
+            second.apply(_present(expected_profit="0.23"), "opportunity-race", 1),
         )
-        assert results == [signal_id, signal_id]
+        assert results == [signal_id, None]
         assert await signals.get_latest_revision(signal_id) == 2
     finally:
         await writer.close()
@@ -106,6 +125,37 @@ async def test_two_managers_retry_same_revision_without_duplicate_revision(tmp_p
             (signal_id,),
         ).fetchall()
     assert revisions == [(1, "OPENED"), (2, "UPDATED")]
+
+
+@pytest.mark.asyncio
+async def test_stale_present_does_not_reopen_signal_closed_by_competing_writer(
+    tmp_path: Path,
+) -> None:
+    writer, _catalog_repo, signals, manager = await _open_manager(tmp_path)
+    closer = SignalManager(
+        SignalRepository(tmp_path / "signals.db", writer),
+        strategy_type=StrategyType.BINARY_UNDERPRICED,
+        execution_mode=ExecutionMode.IMMEDIATE_CONVERSION,
+        clock=lambda: 101,
+    )
+    try:
+        signal_id = await manager.apply(_present(), "opportunity-close-race", None)
+        assert signal_id is not None
+        closed = await closer.apply(
+            OpportunityAbsent(
+                reason_code=DecisionReason.PROFIT_BELOW_THRESHOLD,
+                calculation=_present().calculation,
+                legs=_present().legs,
+                evidence=_present().evidence,
+            ),
+            "opportunity-close-race",
+            1,
+        )
+        assert closed == signal_id
+        assert await manager.apply(_present(expected_profit="0.24"), "opportunity-close-race", 1) is None
+        assert await signals.find_open_signal_id("opportunity-close-race") is None
+    finally:
+        await writer.close()
 
 
 @pytest.mark.asyncio

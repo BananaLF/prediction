@@ -58,6 +58,21 @@
   CPython's `default`, `always`, or `never` values.  The process-scan regression
   covers all three valid values and rejects `--check-hash-based-pycs -m -m
   predmarket`.
+- **RED (final cross-task review):** the production manager router omitted the
+  WatchTask cache generation source and treated a missing generation as valid;
+  a conflict retried its obsolete payload; and a catalog commit that crashed
+  before queue publication was not reconciled on an empty restart.  Database
+  startup failure also had no terminal notifier, while verification promised a
+  default read-only status command without a committed database.
+- **GREEN (final cross-task review):** the router now binds managers to the
+  live, VALID WatchTask cache and fails closed for missing or stale evidence
+  generations at transaction time.  Revision conflicts discard the old
+  decision, and a stale pre-close revision cannot reopen a lifecycle.  Startup
+  scans persisted OPEN signal legs against the committed watchable-token set
+  before recovery, closing unwatchable signals even without a queued change.
+  Supervisor owns a terminal-only early notifier before schema/writer startup,
+  and verification now requires an explicitly initialized temporary config for
+  `status`.
 
 ## Changes
 
@@ -94,6 +109,14 @@
   access remains read-only.
 - Added CLI normalization so the documented `subcommand --config PATH` form is
   accepted by the actual parser.
+- Added generation-source commit-time checks, no-stale-retry signal conflict
+  handling, and startup catalog reconciliation for persisted OPEN signal legs.
+  The WatchTask protocol remains compatible: recovery uses the optional router
+  capability rather than changing `WatchTask`'s required signal-manager API.
+- Added an early terminal-only startup notifier that intentionally has no
+  `SystemEventRepository` before database/schema setup succeeds.
+- Corrected `docs/VERIFICATION.md`: default config is a database-path template,
+  not a successful read-only `status` smoke test.
 
 ## Verification results
 
@@ -109,6 +132,11 @@
 | `git diff --check` | Passed. |
 | `python -m compileall -q predmarket` | Passed. |
 | temporary SQLite schema check | Passed: exactly 10 project tables, `user_version=1`, `integrity_check=ok`, and no `foreign_key_check` rows. |
+| `pytest -q tests/integration/test_signal_concurrency.py tests/unit/signals/test_manager.py tests/integration/test_app_pipeline.py tests/integration/test_documented_commands.py` | Passed: `34 passed` (pytest-asyncio deprecation warnings only). |
+| `tests/integration/test_watch_recovery.py::test_start_recovers_open_signal_when_catalog_commit_was_not_queued` | Passed with an in-memory test-only SDK import stub: `1 passed`; no production dependency or source boundary changed. Direct collection without the stub remains blocked by the absent optional package. |
+| `pytest -q` (final cross-task review) | Collection failed with 5 errors in `0.25s`, all `ModuleNotFoundError: No module named 'polymarket'`. |
+| `python -m compileall -q predmarket` (final cross-task review) | Passed. |
+| `git diff --check` (final cross-task review) | Passed. |
 
 ## Environment concerns
 

@@ -248,7 +248,7 @@ async def test_not_evaluable_closes_without_economic_or_orderbook_evidence(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_signal_manager_cas_retries_without_duplicate_revision(tmp_path: Path) -> None:
+async def test_signal_manager_rejects_stale_decision_without_duplicate_revision(tmp_path: Path) -> None:
     writer, _catalog_repo, signals, manager = await _open_manager(tmp_path)
     try:
         signal_id = await manager.apply(_present(), "opportunity-1", None)
@@ -257,7 +257,7 @@ async def test_signal_manager_cas_retries_without_duplicate_revision(tmp_path: P
             manager.apply(_present(expected_profit="0.24"), "opportunity-1", 1),
             manager.apply(_present(expected_profit="0.24"), "opportunity-1", 1),
         )
-        assert results == [signal_id, signal_id]
+        assert results == [signal_id, None]
         assert await signals.get_latest_revision(signal_id) == 2
     finally:
         await writer.close()

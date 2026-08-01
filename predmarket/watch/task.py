@@ -186,6 +186,13 @@ class WatchTask:
             snapshot = await self._catalog.load_catalog()
             token_ids = _watchable_token_ids(snapshot)
             self._active_token_ids = token_ids
+            recover_open_signals = getattr(
+                self._signal_manager, "close_unwatchable_for_active_tokens", None
+            )
+            if recover_open_signals is not None:
+                result = recover_open_signals(token_ids)
+                if inspect.isawaitable(result):
+                    await result
             if token_ids:
                 await self._recover(token_ids)
             self._started = True

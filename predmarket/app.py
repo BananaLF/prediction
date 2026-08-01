@@ -30,6 +30,7 @@ from predmarket.persistence.schema import initialize_database
 from predmarket.persistence.writer import DatabaseWriter
 from predmarket.signals.manager import SignalManager
 from predmarket.strategy.engine import StrategyEngine
+from predmarket.watch.cache import CacheState, OrderBookCache
 
 
 Clock = Callable[[], int]
@@ -57,13 +58,18 @@ class Supervisor:
         self._config = config
         self._provided_gateway = gateway
         self._provided_notifier = notifier
-        self._runtime_notifier = notifier
         self._terminal = terminal
         self._sync_task_factory = sync_task_factory
         self._watch_task_factory = watch_task_factory
         self._strategy_engine = strategy_engine
         self._sleep = sleep
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
+        # Database initialization can fail before SystemEventRepository exists.
+        # Keep this terminal-only channel available for that failure boundary.
+        self._runtime_notifier = notifier or Notifier(
+            terminal=terminal,
+            clock_ms=self._clock_ms,
+        )
 
     async def run(self) -> int:
         """Start the pipeline and return non-zero on an unexpected task exit."""
@@ -184,6 +190,10 @@ class Supervisor:
                 system_events=system_events,
                 clock_ms=self._clock_ms,
             )
+        subscription_generation = _SubscriptionGenerationSource()
+        router = _SignalManagerRouter(
+            signals, notifier, self._clock_ms, subscription_generation
+        )
         if self._watch_task_factory is None:
             from predmarket.watch.task import WatchTask
 
@@ -192,7 +202,7 @@ class Supervisor:
                 catalog=catalog,
                 changes=changes,
                 strategy_engine=self._strategy_engine or StrategyEngine(),
-                signal_manager=_SignalManagerRouter(signals, notifier, self._clock_ms),
+                signal_manager=router,
                 context_source=_ApplicationContextSource(
                     config=self._config,
                     catalog=catalog,
@@ -207,7 +217,7 @@ class Supervisor:
                 catalog=catalog,
                 changes=changes,
                 strategy_engine=self._strategy_engine or StrategyEngine(),
-                signal_manager=_SignalManagerRouter(signals, notifier, self._clock_ms),
+                signal_manager=router,
                 context_source=_ApplicationContextSource(
                     config=self._config,
                     catalog=catalog,
@@ -216,6 +226,9 @@ class Supervisor:
                     clock_ms=self._clock_ms,
                 ),
             )
+        cache = getattr(watch, "cache", None)
+        if isinstance(cache, OrderBookCache):
+            subscription_generation.bind(cache)
         return writer, gateway, notifier, sync, watch
 
     async def _sync_forever(self, sync: Any) -> None:
@@ -392,13 +405,39 @@ class _ApplicationContextSource:
         return EvaluationTarget(context, opportunity_key, expected_revision)
 
 
+class _SubscriptionGenerationSource:
+    """Read the current, complete WatchTask generation at transaction time."""
+
+    def __init__(self) -> None:
+        self._cache: OrderBookCache | None = None
+
+    def bind(self, cache: OrderBookCache) -> None:
+        self._cache = cache
+
+    def __call__(self, token_id: str) -> int | None:
+        cache = self._cache
+        if cache is None or cache.state is not CacheState.VALID:
+            return None
+        book = cache.get(token_id)
+        if book is None or book.subscription_generation != cache.generation:
+            return None
+        return cache.generation
+
+
 class _SignalManagerRouter:
     """Route each context to the manager with its immutable strategy identity."""
 
-    def __init__(self, repository: SignalRepository, notifier: Notifier, clock_ms: Clock) -> None:
+    def __init__(
+        self,
+        repository: SignalRepository,
+        notifier: Notifier,
+        clock_ms: Clock,
+        subscription_generation: Callable[[str], int | None] | None = None,
+    ) -> None:
         self._repository = repository
         self._notifier = notifier
         self._clock_ms = clock_ms
+        self._subscription_generation = subscription_generation
         self._managers: dict[tuple[StrategyType, str | None], SignalManager] = {}
         self._closure_manager = SignalManager(
             repository,
@@ -415,6 +454,11 @@ class _SignalManagerRouter:
 
     async def close_for_tokens(self, token_ids: tuple[str, ...], decision: NotEvaluable) -> None:
         await self._closure_manager.close_for_tokens(token_ids, decision)
+
+    async def close_unwatchable_for_active_tokens(
+        self, active_token_ids: tuple[str, ...]
+    ) -> None:
+        await self._closure_manager.close_unwatchable_for_active_tokens(active_token_ids)
 
     def _manager(self, opportunity_key: str) -> SignalManager:
         parts = opportunity_key.split(":", 2)
@@ -434,6 +478,7 @@ class _SignalManagerRouter:
                     else ExecutionMode.IMMEDIATE_CONVERSION
                 ),
                 relation_id=relation_id,
+                subscription_generation=self._subscription_generation,
                 notifier=self._notifier,
                 clock=self._clock_ms,
             )

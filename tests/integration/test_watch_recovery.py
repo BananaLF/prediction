@@ -378,6 +378,65 @@ async def test_queued_control_change_closes_persisted_signal_after_empty_restart
         await writer.close()
 
 
+@pytest.mark.asyncio
+async def test_start_recovers_open_signal_when_catalog_commit_was_not_queued(
+    tmp_path: Path,
+) -> None:
+    """A crash after catalog save but before queue publication is reconciled at start."""
+
+    database_path = tmp_path / "signals.sqlite3"
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    try:
+        catalog = CatalogRepository(database_path, writer)
+        signals = SignalRepository(database_path, writer)
+        event, market, token, present = _persisted_open_signal()
+        await catalog.save_catalog(events=(event,), markets=(market,), tokens=(token,))
+        await signals.open_signal(
+            signal_id="persisted-signal",
+            opportunity_key="BINARY_UNDERPRICED:market-1",
+            strategy_type=StrategyType.BINARY_UNDERPRICED,
+            market_ids=(market.id,),
+            relation_id=None,
+            execution_mode=ExecutionMode.IMMEDIATE_CONVERSION,
+            observed_at=1,
+            decision=present,
+        )
+        # Deliberately omit MarketChangeQueue.put: this is the crash window.
+        await catalog.save_catalog(
+            events=(event,),
+            markets=(
+                replace(
+                    market,
+                    status=MarketStatus.CLOSED,
+                    active=False,
+                    accepting_orders=False,
+                    enable_orderbook=False,
+                ),
+            ),
+            tokens=(token,),
+        )
+        watch = WatchTask(
+            gateway=object(),
+            catalog=catalog,
+            changes=_Changes(),
+            strategy_engine=object(),
+            signal_manager=_SignalManagerRouter(
+                signals,
+                Notifier(terminal=StringIO()),
+                lambda: 2,
+            ),
+            context_source=object(),
+        )
+
+        await watch.start()
+
+        assert watch.active_token_ids == ()
+        assert await signals.find_open_signal_id("BINARY_UNDERPRICED:market-1") is None
+    finally:
+        await writer.close()
+
+
 async def test_recovery_closes_old_signal_and_reopens_with_new_signal_id() -> None:
     # Catches a CLOSED signal ID being reused after a generation recovery barrier.
     gateway = _Gateway()

@@ -111,32 +111,29 @@ class SignalManager:
         ):
             raise ValueError("expected_revision must be a non-negative integer or None")
 
-        current_expected = expected_revision
         async with self._apply_lock:
-            for attempt in range(self._max_retries + 1):
-                self._validate_external_state(decision)
-                observed_at = self._clock()
-                if type(observed_at) is not int or observed_at < 0:
-                    raise ValueError("clock must return a non-negative integer")
-                try:
-                    result = await self._repository._writer.execute(  # noqa: SLF001
-                        lambda connection: self._apply_transaction(
-                            connection,
-                            decision=decision,
-                            opportunity_key=opportunity_key,
-                            expected_revision=current_expected,
-                            observed_at=observed_at,
-                        )
+            self._validate_external_state(decision)
+            observed_at = self._clock()
+            if type(observed_at) is not int or observed_at < 0:
+                raise ValueError("clock must return a non-negative integer")
+            try:
+                result = await self._repository._writer.execute(  # noqa: SLF001
+                    lambda connection: self._apply_transaction(
+                        connection,
+                        decision=decision,
+                        opportunity_key=opportunity_key,
+                        expected_revision=expected_revision,
+                        observed_at=observed_at,
                     )
-                except SignalRevisionConflict:
-                    if attempt >= self._max_retries:
-                        raise
-                    current_expected = await self._current_expected_revision(opportunity_key)
-                    continue
-                if result is not None and result.event_type is not None:
-                    await self._notify_after_commit(result)
-                return None if result is None else result.signal_id
-        return None
+                )
+            except SignalRevisionConflict:
+                # A decision was evaluated against an older snapshot.  It must
+                # be re-evaluated by the watcher; retrying its payload could
+                # overwrite newer evidence or resurrect a closed signal.
+                return None
+            if result is not None and result.event_type is not None:
+                await self._notify_after_commit(result)
+            return None if result is None else result.signal_id
 
     async def close_for_tokens(
         self,
@@ -166,6 +163,41 @@ class SignalManager:
             if signal_id is not None:
                 closed.append(signal_id)
         return tuple(closed)
+
+    async def close_unwatchable_for_active_tokens(
+        self, active_token_ids: Sequence[str]
+    ) -> tuple[str, ...]:
+        """Close persisted OPEN signals whose legs are absent from the catalog."""
+
+        active = frozenset(active_token_ids)
+        rows = await _read_all(
+            self._repository._path,  # noqa: SLF001
+            """
+            SELECT DISTINCT l.token_id
+            FROM arbitrage_signals AS s
+            JOIN signal_legs AS l ON l.signal_id = s.id AND l.revision = s.latest_revision
+            WHERE s.status = 'OPEN'
+            """,
+            (),
+        )
+        unavailable = tuple(
+            sorted(
+                {str(row[0]) for row in rows if str(row[0]) not in active},
+                key=lambda value: value.encode("utf-8"),
+            )
+        )
+        if not unavailable:
+            return ()
+        return await self.close_for_tokens(
+            unavailable,
+            NotEvaluable(
+                reason_code=DecisionReason.MARKET_CLOSED,
+                context={
+                    "detail": "startup catalog recovery found an unwatchable signal leg",
+                    "token_ids": unavailable,
+                },
+            ),
+        )
 
     async def _current_expected_revision(self, opportunity_key: str) -> int | None:
         signal_id = await self._repository.find_open_signal_id(opportunity_key)
@@ -258,6 +290,22 @@ class SignalManager:
 
         if not isinstance(decision, OpportunityPresent):
             return None
+        if expected_revision is not None:
+            cursor = await connection.execute(
+                """
+                SELECT latest_revision
+                FROM arbitrage_signals
+                WHERE opportunity_key = ?
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (opportunity_key,),
+            )
+            closed = await cursor.fetchone()
+            if closed is not None and int(closed[0]) != expected_revision:
+                # The OPEN row disappeared after this decision was evaluated.
+                # Do not turn an old present decision into a new lifecycle.
+                return None
         await self._validate_database_state(connection, decision)
         signal_id = uuid4().hex
         await connection.execute(
@@ -294,6 +342,8 @@ class SignalManager:
                 raise ValueError(f"market {market_id!r} is not watchable")
         for book in decision.evidence:
             generation = _generation_value(self._subscription_generation, book.token_id)
+            if self._subscription_generation is not None and generation is None:
+                raise ValueError(f"subscription generation is unavailable for {book.token_id!r}")
             if generation is not None and generation != book.subscription_generation:
                 raise ValueError(f"stale subscription generation for {book.token_id!r}")
         if self._relation_id is not None:
