@@ -7,6 +7,7 @@ import asyncio
 from collections.abc import Callable, Mapping, Sequence
 import json
 from pathlib import Path
+import sqlite3
 import sys
 import time
 from typing import TextIO
@@ -30,16 +31,39 @@ def main(
 ) -> int:
     parser = _build_parser()
     arguments = parser.parse_args(argv)
+    config = AppConfig.load(arguments.config)
+    output = sys.stdout if stdout is None else stdout
+    clock = now_ms or (lambda: time.time_ns() // 1_000_000)
+
+    if arguments.command == "run":
+        from predmarket.app import Supervisor
+
+        return asyncio.run(Supervisor(config, terminal=output).run())
+
+    if arguments.command == "status":
+        _write_json(output, _ReadOnlyCliStore(config.database.path).status())
+        return 0
+
+    if arguments.command == "signals":
+        store = _ReadOnlyCliStore(config.database.path)
+        if arguments.signals_command == "list":
+            _write_json(output, store.list_signals())
+            return 0
+        if arguments.signals_command == "show":
+            signal = store.get_signal(arguments.signal_id)
+            if signal is None:
+                raise ValueError(f"signal {arguments.signal_id!r} does not exist")
+            _write_json(output, signal)
+            return 0
+        parser.error("a signals command is required")
+
     if arguments.command != "relations":
         parser.error("a command is required")
 
-    config = AppConfig.load(arguments.config)
     store = RelationCliStore(
         config.database.path,
         busy_timeout_ms=config.database.busy_timeout_ms,
     )
-    output = sys.stdout if stdout is None else stdout
-    clock = now_ms or (lambda: time.time_ns() // 1_000_000)
 
     if arguments.relations_command == "list":
         _write_json(output, [_relation_payload(relation) for relation in store.list()])
@@ -80,6 +104,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="configuration YAML path",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("run", help="run the read-only market signal service")
+    commands.add_parser("status", help="show local service database status")
+    signals = commands.add_parser("signals", help="inspect persisted signals")
+    signal_commands = signals.add_subparsers(dest="signals_command", required=True)
+    signal_commands.add_parser("list", help="list persisted signals")
+    signal_show = signal_commands.add_parser("show", help="show one signal")
+    signal_show.add_argument("signal_id")
     relations = commands.add_parser(
         "relations",
         help="inspect, analyze, and manually approve implication relations",
@@ -144,3 +175,59 @@ def _write_json(output: TextIO, payload: object) -> None:
         ),
         file=output,
     )
+
+
+class _ReadOnlyCliStore:
+    """The CLI's dedicated read-only SQLite boundary."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = Path(path)
+
+    def status(self) -> dict[str, object]:
+        with self._connect() as connection:
+            signals = int(
+                connection.execute("SELECT COUNT(*) FROM arbitrage_signals").fetchone()[0]
+            )
+            events = int(
+                connection.execute("SELECT COUNT(*) FROM system_events").fetchone()[0]
+            )
+        return {"database": str(self._path), "signals": signals, "system_events": events}
+
+    def list_signals(self) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM arbitrage_signals ORDER BY opened_at DESC, CAST(id AS BLOB)"
+            ).fetchall()
+        return [_signal_payload(row) for row in rows]
+
+    def get_signal(self, signal_id: str) -> dict[str, object] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM arbitrage_signals WHERE id = ?", (signal_id,)
+            ).fetchone()
+        return None if row is None else _signal_payload(row)
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            f"file:{self._path}?mode=ro", uri=True, isolation_level=None
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        return connection
+
+
+def _signal_payload(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": str(row["id"]),
+        "opportunity_key": str(row["opportunity_key"]),
+        "strategy_type": str(row["strategy_type"]),
+        "market_ids": list(json.loads(str(row["market_ids_json"]))),
+        "relation_id": row["relation_id"],
+        "execution_mode": str(row["execution_mode"]),
+        "status": str(row["status"]),
+        "opened_at": int(row["opened_at"]),
+        "updated_at": int(row["updated_at"]),
+        "closed_at": row["closed_at"],
+        "close_reason": row["close_reason"],
+        "latest_revision": int(row["latest_revision"]),
+    }
