@@ -57,6 +57,7 @@ class Supervisor:
         self._config = config
         self._provided_gateway = gateway
         self._provided_notifier = notifier
+        self._runtime_notifier = notifier
         self._terminal = terminal
         self._sync_task_factory = sync_task_factory
         self._watch_task_factory = watch_task_factory
@@ -104,13 +105,16 @@ class Supervisor:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            notifier = self._provided_notifier
+            notifier = self._runtime_notifier
             if notifier is not None:
-                await notifier.notify(
-                    event_type="RUNTIME_STARTUP_FAILED",
-                    message=f"Signal service startup failed: {error}",
-                    details={"error": str(error)},
-                )
+                try:
+                    await notifier.notify(
+                        event_type="RUNTIME_STARTUP_FAILED",
+                        message=f"Signal service startup failed: {error}",
+                        details={"error": str(error)},
+                    )
+                except Exception:
+                    pass
             return 1
         finally:
             await _cancel_and_drain(tasks)
@@ -148,6 +152,7 @@ class Supervisor:
             system_events=system_events,
             clock_ms=self._clock_ms,
         )
+        self._runtime_notifier = notifier
         changes = MarketChangeQueue(
             self._config.runtime.market_change_queue_capacity,
             record_system_event=lambda overflow: self._record_overflow(
@@ -395,6 +400,13 @@ class _SignalManagerRouter:
         self._notifier = notifier
         self._clock_ms = clock_ms
         self._managers: dict[tuple[StrategyType, str | None], SignalManager] = {}
+        self._closure_manager = SignalManager(
+            repository,
+            strategy_type=StrategyType.BINARY_UNDERPRICED,
+            execution_mode=ExecutionMode.IMMEDIATE_CONVERSION,
+            notifier=notifier,
+            clock=clock_ms,
+        )
 
     async def apply(self, decision: Any, opportunity_key: str, expected_revision: int | None) -> Any:
         return await self._manager(opportunity_key).apply(
@@ -402,9 +414,7 @@ class _SignalManagerRouter:
         )
 
     async def close_for_tokens(self, token_ids: tuple[str, ...], decision: NotEvaluable) -> None:
-        await asyncio.gather(
-            *(manager.close_for_tokens(token_ids, decision) for manager in self._managers.values())
-        )
+        await self._closure_manager.close_for_tokens(token_ids, decision)
 
     def _manager(self, opportunity_key: str) -> SignalManager:
         parts = opportunity_key.split(":", 2)

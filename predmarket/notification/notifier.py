@@ -109,10 +109,19 @@ def macos_desktop_notification(title: str, message: str) -> None:
     """Best-effort macOS adapter, intentionally isolated from core runtime."""
     if not isinstance(title, str) or not isinstance(message, str):
         raise TypeError("desktop notification title and message must be strings")
-    script = f'display notification {message!r} with title {title!r}'
+    script = (
+        f"display notification {_applescript_string(message)} "
+        f"with title {_applescript_string(title)}"
+    )
     subprocess.run(
         ["osascript", "-e", script],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def _applescript_string(value: str) -> str:
+    """Serialize text as an AppleScript double-quoted string literal."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
