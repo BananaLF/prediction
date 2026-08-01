@@ -1,4 +1,5 @@
 from dataclasses import replace
+from decimal import Decimal
 
 import pytest
 
@@ -7,6 +8,7 @@ from predmarket.domain.signal import (
     DecisionReason,
     NotEvaluable,
     OpportunityPresent,
+    OpportunityAbsent,
     StrategyType,
 )
 from predmarket.strategy.neg_risk import evaluate_neg_risk
@@ -63,13 +65,118 @@ def test_neg_risk_complete_set_uses_authoritative_yes_members(
     )
 
     assert isinstance(decision, OpportunityPresent)
-    assert decision.calculation.expected_profit > 0
+    assert decision.calculation.total_capital == Decimal("7.025")
+    assert decision.calculation.expected_profit == Decimal("2.975")
     assert [leg.action for leg in decision.legs] == [
         Action.BUY,
         Action.BUY,
         Action.NEG_RISK_CONVERT,
     ]
     assert [leg.token_id for leg in decision.legs[:2]] == ["yes-a", "yes-b"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("mapping_version", "wrong-version"),
+        ("enable_neg_risk", "true"),
+        ("neg_risk_augmented", None),
+        ("cumulative_markets", 0),
+        ("neg_risk_fee_bips", None),
+        ("neg_risk_fee_bips", "2.50"),
+    ],
+)
+def test_neg_risk_requires_exact_authoritative_metadata_schema(
+    context_factory,
+    event_factory,
+    market_factory,
+    token_factory,
+    book_factory,
+    field,
+    value,
+) -> None:
+    # Catches admitting a type without its fixed SDK mapping schema and fee proof.
+    markets, tokens, books = _neg_risk_parts(market_factory, token_factory, book_factory)
+    metadata = {
+        "mapping_version": "polymarket-client-0.3.0b1:v1",
+        "enable_neg_risk": True,
+        "neg_risk_augmented": False,
+        "cumulative_markets": False,
+        "neg_risk_fee_bips": "25",
+    }
+    metadata[field] = value
+    event = event_factory(("market-a", "market-b"), metadata=metadata)
+    context = context_factory(
+        StrategyType.NEG_RISK_COMPLETE_SET,
+        markets=markets,
+        tokens=tokens,
+        orderbooks=books,
+        events=(event,),
+    )
+
+    decision = evaluate_neg_risk(context)
+
+    assert isinstance(decision, NotEvaluable)
+    assert decision.reason_code is DecisionReason.INPUT_METADATA_MISSING
+
+
+def test_neg_risk_conversion_fee_can_eliminate_profit(
+    context_factory, event_factory, market_factory, token_factory, book_factory
+) -> None:
+    # Catches ignoring authoritative neg_risk_fee_bips in economics.
+    markets, tokens, books = _neg_risk_parts(market_factory, token_factory, book_factory)
+    metadata = {
+        "mapping_version": "polymarket-client-0.3.0b1:v1",
+        "enable_neg_risk": True,
+        "neg_risk_augmented": False,
+        "cumulative_markets": False,
+        "neg_risk_fee_bips": "4000",
+    }
+    context = context_factory(
+        StrategyType.NEG_RISK_COMPLETE_SET,
+        markets=markets,
+        tokens=tokens,
+        orderbooks=books,
+        events=(event_factory(("market-a", "market-b"), metadata=metadata),),
+    )
+
+    decision = evaluate_neg_risk(context)
+
+    assert isinstance(decision, OpportunityAbsent)
+    assert decision.reason_code is DecisionReason.PROFIT_BELOW_THRESHOLD
+    assert decision.calculation.expected_profit < 0
+
+
+def test_neg_risk_supported_redeem_type_uses_redeem_action(
+    context_factory, event_factory, market_factory, token_factory, book_factory
+) -> None:
+    # Catches hard-coding NEG_RISK_CONVERT instead of the type-bound action.
+    markets, tokens, books = _neg_risk_parts(market_factory, token_factory, book_factory)
+    metadata = {
+        "mapping_version": "polymarket-client-0.3.0b1:v1",
+        "enable_neg_risk": False,
+        "neg_risk_augmented": False,
+        "cumulative_markets": False,
+        "neg_risk_fee_bips": "0",
+    }
+    event = event_factory(
+        ("market-a", "market-b"),
+        neg_risk_type="STANDARD_REDEEM",
+        metadata=metadata,
+    )
+    context = context_factory(
+        StrategyType.NEG_RISK_COMPLETE_SET,
+        markets=markets,
+        tokens=tokens,
+        orderbooks=books,
+        events=(event,),
+        supported_neg_risk_types=("STANDARD_REDEEM",),
+    )
+
+    decision = evaluate_neg_risk(context)
+
+    assert isinstance(decision, OpportunityPresent)
+    assert decision.legs[-1].action is Action.REDEEM
 
 
 @pytest.mark.parametrize(

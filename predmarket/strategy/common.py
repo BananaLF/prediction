@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from collections.abc import Callable
 from typing import Iterable
 
 from predmarket.domain.fees import FeeCalculator, FeeSchedule
@@ -23,6 +24,8 @@ from predmarket.domain.signal import (
 from predmarket.strategy.optimizer import (
     DepthFill,
     DepthRequirement,
+    CandidateSelection,
+    optimize_candidates,
     optimize_quantity,
     walk_depth,
 )
@@ -70,6 +73,21 @@ class Trade:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class EvaluatedTrades:
+    quantity: Decimal
+    trades: tuple[Trade, ...]
+    total_capital: Decimal
+    expected_profit: Decimal
+    risk: RiskResult
+
+
+@dataclass(frozen=True, slots=True)
+class TradeOptimization:
+    candidate: EvaluatedTrades
+    forced_absent_reason: DecisionReason | None = None
+
+
 def not_evaluable(
     context: StrategyContext,
     reason: DecisionReason,
@@ -90,7 +108,19 @@ def validate_inputs(
     *,
     markets: tuple[Market, ...],
     tokens: tuple[Token, ...],
+    actions: tuple[Action, ...],
 ) -> NotEvaluable | None:
+    configuration_error = validate_configuration(context)
+    if configuration_error is not None:
+        return configuration_error
+    if len(actions) != len(tokens) or any(
+        action not in {Action.BUY, Action.SELL} for action in actions
+    ):
+        return not_evaluable(
+            context,
+            DecisionReason.INPUT_METADATA_MISSING,
+            "trade_action_mapping_invalid",
+        )
     if context.fee_schedule_max_age_seconds is None:
         return not_evaluable(
             context,
@@ -173,12 +203,14 @@ def validate_inputs(
             DecisionReason.LEG_SKEW_EXCEEDED,
             "leg_exchange_timestamp_skew",
         )
-    if any(not book.asks or not book.bids for book in books):
-        return not_evaluable(
-            context,
-            DecisionReason.ORDERBOOK_INVALID,
-            "two_sided_depth_missing",
-        )
+    for book, action in zip(books, actions):
+        execution_levels = book.asks if action is Action.BUY else book.bids
+        if not execution_levels:
+            return not_evaluable(
+                context,
+                DecisionReason.ORDERBOOK_INVALID,
+                "execution_depth_missing",
+            )
 
     for token in tokens:
         schedule = context.fee_schedules.get(token.id)
@@ -200,6 +232,42 @@ def validate_inputs(
                 context,
                 DecisionReason.FEE_SCHEDULE_STALE,
                 "fee_schedule_stale",
+            )
+    return None
+
+
+def validate_configuration(context: StrategyContext) -> NotEvaluable | None:
+    config = context.configuration
+    decimal_fields = (
+        ("bankroll", config.bankroll, False, None),
+        ("minimum_return_rate", config.minimum_return_rate, True, None),
+        ("maximum_risk_rate", config.maximum_risk_rate, True, Decimal("1")),
+        ("maximum_unhedged_notional", config.maximum_unhedged_notional, True, None),
+        ("safety_buffer_rate", config.safety_buffer_rate, True, Decimal("1")),
+        ("conversion_cost", config.conversion_cost, True, None),
+    )
+    for name, value, allow_zero, maximum in decimal_fields:
+        if (
+            not isinstance(value, Decimal)
+            or not value.is_finite()
+            or value < 0
+            or (not allow_zero and value == 0)
+            or (maximum is not None and value > maximum)
+        ):
+            return not_evaluable(
+                context,
+                DecisionReason.INPUT_METADATA_MISSING,
+                f"invalid_configuration_{name}",
+            )
+    for name, value in (
+        ("maximum_book_age_ms", config.maximum_book_age_ms),
+        ("maximum_leg_skew_ms", config.maximum_leg_skew_ms),
+    ):
+        if type(value) is not int or value < 0:
+            return not_evaluable(
+                context,
+                DecisionReason.INPUT_METADATA_MISSING,
+                f"invalid_configuration_{name}",
             )
     return None
 
@@ -234,8 +302,9 @@ def optimize_trades(
     context: StrategyContext,
     *,
     trade_specs: tuple[tuple[Market, Token, Action], ...],
-    economics,
-) -> Decimal | None:
+    economics: Callable[[Decimal, tuple[Trade, ...]], tuple[Decimal, Decimal]],
+    risk_evaluator: Callable[[tuple[Trade, ...], Decimal], RiskResult],
+) -> TradeOptimization | None:
     requirements = tuple(
         DepthRequirement(
             next(book for book in context.orderbooks if book.token_id == token.id),
@@ -248,20 +317,113 @@ def optimize_trades(
         *(market.minimum_order_size or Decimal("0") for market, _, _ in trade_specs),
     )
 
-    def evaluate(quantity: Decimal) -> tuple[Decimal, Decimal]:
+    def evaluate_candidate(quantity: Decimal) -> EvaluatedTrades:
         trades = tuple(
             trade(context, market, token, action, quantity)
             for market, token, action in trade_specs
         )
-        return economics(quantity, trades)
+        total_capital, expected_profit = economics(quantity, trades)
+        risk = risk_evaluator(trades, total_capital)
+        return EvaluatedTrades(
+            quantity,
+            trades,
+            total_capital,
+            expected_profit,
+            risk,
+        )
 
-    return optimize_quantity(
+    maximum_depth = min(
+        sum((level.size for level in requirement.levels), Decimal("0"))
+        for requirement in requirements
+    )
+    if maximum_depth < minimum:
+        if maximum_depth <= 0:
+            return None
+        return TradeOptimization(
+            evaluate_candidate(maximum_depth),
+            DecisionReason.QUANTITY_BELOW_MINIMUM,
+        )
+
+    extra_breakpoints: set[Decimal] = set()
+    for requirement in requirements:
+        for levels in (requirement.book.bids, requirement.book.asks):
+            cumulative = Decimal("0")
+            for level in levels:
+                cumulative += level.size
+                if minimum <= cumulative <= maximum_depth:
+                    extra_breakpoints.add(cumulative)
+
+    def margins(candidate: EvaluatedTrades) -> dict[str, Decimal]:
+        values = {
+            "bankroll": candidate.total_capital - context.configuration.bankroll,
+            "profit": -candidate.expected_profit,
+            "return": (
+                context.configuration.minimum_return_rate * candidate.total_capital
+                - candidate.expected_profit
+            ),
+        }
+        for scenario in candidate.risk.scenarios:
+            values[f"risk:{scenario.name}"] = (
+                scenario.loss
+                - context.configuration.maximum_risk_rate * candidate.total_capital
+            )
+            values[f"unhedged:{scenario.name}"] = (
+                scenario.unhedged_notional
+                - context.configuration.maximum_unhedged_notional
+            )
+        return values
+
+    def feasible(candidate: EvaluatedTrades) -> bool:
+        return (
+            candidate.total_capital <= context.configuration.bankroll
+            and candidate.expected_profit > 0
+            and candidate.expected_profit
+            >= context.configuration.minimum_return_rate * candidate.total_capital
+            and all(
+                scenario.loss
+                <= context.configuration.maximum_risk_rate * candidate.total_capital
+                and scenario.unhedged_notional
+                <= context.configuration.maximum_unhedged_notional
+                for scenario in candidate.risk.scenarios
+            )
+        )
+
+    selection = optimize_candidates(
         requirements,
         minimum_quantity=minimum,
         default_quantity=max(Decimal("1"), minimum),
-        bankroll=context.configuration.bankroll,
-        evaluate=evaluate,
+        evaluate=evaluate_candidate,
+        constraint_margins=margins,
+        is_feasible=feasible,
+        total_capital=lambda item: item.total_capital,
+        expected_profit=lambda item: item.expected_profit,
+        quantity=lambda item: item.quantity,
+        extra_breakpoints=tuple(extra_breakpoints),
     )
+    if selection is None:
+        return None
+    if selection.feasible:
+        return TradeOptimization(selection.candidate)
+    bankroll_candidates = tuple(
+        item
+        for item in selection.candidates
+        if item.total_capital <= context.configuration.bankroll
+    )
+    if bankroll_candidates:
+        selected = max(
+            bankroll_candidates,
+            key=lambda item: (
+                item.expected_profit,
+                -item.total_capital,
+                -item.quantity,
+            ),
+        )
+        return TradeOptimization(selected)
+    selected = min(
+        selection.candidates,
+        key=lambda item: (item.total_capital, item.quantity),
+    )
+    return TradeOptimization(selected, DecisionReason.QUANTITY_BELOW_MINIMUM)
 
 
 def long_entry_risk(
@@ -278,6 +440,7 @@ def long_entry_risk(
                 "FIRST_LEG_ONLY" if index == 1 else f"PARTIAL_LEGS_{index}",
                 sum((item.entry_cost for item in prefix), Decimal("0")),
                 tuple(_exposure(item) for item in prefix),
+                sum((item.entry_cost for item in prefix), Decimal("0")),
             )
         )
     scenarios.append(
@@ -285,6 +448,7 @@ def long_entry_risk(
             "CONVERSION_FAILURE",
             total_capital,
             tuple(_exposure(item) for item in trades),
+            Decimal("0"),
         )
     )
     return assess_failure_scenarios(
@@ -318,7 +482,10 @@ def split_inventory_risk(
             for item in unsold
         )
         name = "SPLIT_ONLY" if sold_count == 0 else f"PARTIAL_SALES_{sold_count}"
-        scenarios.append(FailureScenario(name, remaining_capital, exposures))
+        unhedged = Decimal("0") if sold_count == 0 else trades[0].fill.quantity
+        scenarios.append(
+            FailureScenario(name, remaining_capital, exposures, unhedged)
+        )
     return assess_failure_scenarios(
         tuple(scenarios),
         evaluated_at_ms=context.evaluated_at,
@@ -352,14 +519,15 @@ def classify(
     calculation_value: OpportunityCalculation,
     legs: tuple[SignalLeg, ...],
     evidence: tuple[OrderBook, ...],
+    forced_reason: DecisionReason | None = None,
 ) -> StrategyDecision:
-    reason: DecisionReason | None = None
-    if (
+    reason = forced_reason
+    if reason is None and (
         calculation_value.expected_profit <= 0
         or calculation_value.return_rate < context.configuration.minimum_return_rate
     ):
         reason = DecisionReason.PROFIT_BELOW_THRESHOLD
-    elif (
+    elif reason is None and (
         calculation_value.risk_rate > context.configuration.maximum_risk_rate
         or calculation_value.unhedged_notional
         > context.configuration.maximum_unhedged_notional

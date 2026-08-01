@@ -154,6 +154,7 @@ def event_factory():
         neg_risk_type: str | None = "STANDARD",
         complete: bool = True,
         conversion_supported: bool = True,
+        metadata=None,
     ) -> Event:
         return Event(
             id=event_id,
@@ -167,7 +168,14 @@ def event_factory():
             neg_risk_type=neg_risk_type,
             neg_risk_complete=complete,
             neg_risk_conversion_supported=conversion_supported,
-            neg_risk_metadata={"mapping_version": "test-v1"},
+            neg_risk_metadata=metadata
+            or {
+                "mapping_version": "polymarket-client-0.3.0b1:v1",
+                "enable_neg_risk": True,
+                "neg_risk_augmented": False,
+                "cumulative_markets": False,
+                "neg_risk_fee_bips": "25",
+            },
             neg_risk_synced_at=1_000,
         )
 

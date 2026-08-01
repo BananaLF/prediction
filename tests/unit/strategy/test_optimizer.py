@@ -1,4 +1,5 @@
 from decimal import Decimal
+from dataclasses import dataclass
 
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
 from predmarket.strategy.optimizer import (
@@ -6,6 +7,7 @@ from predmarket.strategy.optimizer import (
     InsufficientDepth,
     breakpoint_quantities,
     optimize_quantity,
+    optimize_candidates,
     walk_depth,
 )
 
@@ -124,3 +126,41 @@ def test_optimizer_returns_none_for_minimum_size_or_depth_failure() -> None:
     )
 
     assert quantity is None
+
+
+def test_candidate_optimizer_inserts_constraint_boundary_before_selecting_profit() -> None:
+    # Catches choosing the max-profit candidate before applying a linear risk limit.
+    book = _book("buy", asks=(("0.40", "100"),))
+
+    @dataclass(frozen=True)
+    class Candidate:
+        quantity: Decimal
+        total_capital: Decimal
+        expected_profit: Decimal
+        unhedged: Decimal
+
+    def evaluate(quantity: Decimal) -> Candidate:
+        return Candidate(
+            quantity,
+            quantity * Decimal("0.8"),
+            quantity * Decimal("0.2"),
+            quantity * Decimal("0.4"),
+        )
+
+    selection = optimize_candidates(
+        (DepthRequirement(book, "BUY"),),
+        minimum_quantity=Decimal("1"),
+        default_quantity=Decimal("1"),
+        evaluate=evaluate,
+        constraint_margins=lambda candidate: {
+            "bankroll": candidate.total_capital - Decimal("1000"),
+            "unhedged": candidate.unhedged - Decimal("20"),
+        },
+        is_feasible=lambda candidate: candidate.unhedged <= Decimal("20"),
+        total_capital=lambda candidate: candidate.total_capital,
+        expected_profit=lambda candidate: candidate.expected_profit,
+        quantity=lambda candidate: candidate.quantity,
+    )
+
+    assert selection.feasible is True
+    assert selection.candidate.quantity == Decimal("50")

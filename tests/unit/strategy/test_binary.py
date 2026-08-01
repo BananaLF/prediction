@@ -31,8 +31,9 @@ def _binary_context(
     evaluated_at=1_000,
     configuration=None,
     size="10",
+    minimum="1",
 ):
-    market = market_factory("market-1")
+    market = market_factory("market-1", minimum=minimum)
     yes = token_factory("yes", market.id, "Yes", 0)
     no = token_factory("no", market.id, "No", 1)
     books = (
@@ -44,6 +45,7 @@ def _binary_context(
             exchange_timestamp=yes_time,
             received_timestamp=yes_time,
             size=size,
+            minimum=minimum,
         ),
         book_factory(
             no.id,
@@ -53,6 +55,7 @@ def _binary_context(
             exchange_timestamp=no_time,
             received_timestamp=no_time,
             size=size,
+            minimum=minimum,
         ),
     )
     return context_factory(
@@ -81,6 +84,7 @@ def test_binary_underpriced_uses_full_depth_and_exact_economics(
     assert decision.calculation.return_rate == Decimal("0.25")
     assert decision.calculation.worst_case_loss == Decimal("0.20")
     assert decision.calculation.risk_rate == Decimal("0.025")
+    assert decision.calculation.unhedged_notional == Decimal("4.00")
     assert [leg.action for leg in decision.legs] == [Action.BUY, Action.BUY, Action.MERGE]
     assert [book.token_id for book in decision.evidence] == ["no", "yes"]
 
@@ -297,3 +301,153 @@ def test_binary_applies_return_risk_and_unhedged_hard_gates(
 
     assert isinstance(decision, OpportunityAbsent)
     assert decision.reason_code is DecisionReason.RISK_ABOVE_THRESHOLD
+
+
+def test_binary_optimizer_selects_profitable_safe_quantity_below_risky_maximum(
+    context_factory,
+    market_factory,
+    token_factory,
+    book_factory,
+    strategy_config_factory,
+) -> None:
+    # Catches selecting the max-profit q before applying the unhedged hard limit.
+    context = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+        size="100",
+        configuration=strategy_config_factory(
+            maximum_unhedged_notional=Decimal("20"),
+        ),
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, OpportunityPresent)
+    assert decision.calculation.quantity == Decimal("50")
+    assert decision.calculation.unhedged_notional == Decimal("20")
+
+
+def test_buy_strategy_values_empty_reverse_depth_as_zero_recovery(
+    context_factory, market_factory, token_factory, book_factory
+) -> None:
+    # Catches requiring bids for BUY execution instead of risk-valuing them at zero.
+    context = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+        yes_bid="",
+        no_bid="",
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, OpportunityPresent)
+    assert decision.calculation.worst_case_loss == Decimal("8.00")
+    assert decision.calculation.risk_rate == Decimal("1")
+    assert "UNCLOSEABLE_EXPOSURE" in decision.calculation.risk_flags
+
+
+def test_sell_strategy_does_not_require_asks(
+    context_factory, market_factory, token_factory, book_factory
+) -> None:
+    # Catches rejecting SPLIT/SELL because an unused ask side is empty.
+    context = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+        strategy_type=StrategyType.BINARY_OVERPRICED,
+        yes_bid="0.60",
+        no_bid="0.60",
+        yes_ask="",
+        no_ask="",
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, OpportunityPresent)
+    assert decision.calculation.expected_profit == Decimal("2.00")
+
+
+def test_subminimum_visible_depth_returns_auditable_absent(
+    context_factory, market_factory, token_factory, book_factory
+) -> None:
+    # Catches mapping known quantity infeasibility to NotEvaluable.
+    context = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+        size="2",
+        minimum="3",
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, OpportunityAbsent)
+    assert decision.reason_code is DecisionReason.QUANTITY_BELOW_MINIMUM
+    assert decision.calculation.quantity == Decimal("2")
+    assert all(leg.quantity == Decimal("2") for leg in decision.legs)
+    assert decision.evidence
+
+
+def test_positive_but_insufficient_bankroll_returns_auditable_absent(
+    context_factory,
+    market_factory,
+    token_factory,
+    book_factory,
+    strategy_config_factory,
+) -> None:
+    # Catches turning a known bankroll shortfall into input invalidity.
+    context = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+        configuration=strategy_config_factory(bankroll=Decimal("0.5")),
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, OpportunityAbsent)
+    assert decision.reason_code is DecisionReason.QUANTITY_BELOW_MINIMUM
+    assert decision.calculation.quantity == Decimal("1")
+    assert decision.calculation.total_capital == Decimal("0.80")
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"bankroll": Decimal("0")},
+        {"bankroll": Decimal("NaN")},
+        {"conversion_cost": Decimal("-1")},
+        {"maximum_book_age_ms": -1},
+        {"maximum_leg_skew_ms": -1},
+        {"maximum_risk_rate": Decimal("-0.1")},
+        {"safety_buffer_rate": Decimal("1.1")},
+    ],
+)
+def test_invalid_strategy_configuration_returns_not_evaluable_without_throwing(
+    context_factory,
+    market_factory,
+    token_factory,
+    book_factory,
+    strategy_config_factory,
+    override,
+) -> None:
+    # Catches invalid but constructible configuration escaping into Watch as ValueError.
+    context = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+        configuration=strategy_config_factory(**override),
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, NotEvaluable)
+    assert decision.reason_code is DecisionReason.INPUT_METADATA_MISSING

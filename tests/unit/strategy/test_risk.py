@@ -68,9 +68,15 @@ def test_failure_risk_enumerates_partial_legs_and_conversion_failure() -> None:
 
     risk = assess_failure_scenarios(
         (
-            FailureScenario("FIRST_LEG_ONLY", Decimal("2.50"), (first,)),
-            FailureScenario("PARTIAL_LEGS", Decimal("4.50"), (first, second)),
-            FailureScenario("CONVERSION_FAILURE", Decimal("5.00"), (first, second)),
+            FailureScenario(
+                "FIRST_LEG_ONLY", Decimal("2.50"), (first,), Decimal("2.50")
+            ),
+            FailureScenario(
+                "PARTIAL_LEGS", Decimal("4.50"), (first, second), Decimal("1.25")
+            ),
+            FailureScenario(
+                "CONVERSION_FAILURE", Decimal("5.00"), (first, second), Decimal("0")
+            ),
         ),
         evaluated_at_ms=1_000,
         fee_max_age_seconds=1,
@@ -82,7 +88,7 @@ def test_failure_risk_enumerates_partial_legs_and_conversion_failure() -> None:
         ("PARTIAL_LEGS", Decimal("2.10")),
     )
     assert risk.worst_case_loss == Decimal("2.60")
-    assert risk.unhedged_notional == Decimal("4.50")
+    assert risk.unhedged_notional == Decimal("2.50")
     assert risk.risk_flags == (
         "CONVERSION_FAILURE",
         "FIRST_LEG_ONLY",
@@ -102,7 +108,11 @@ def test_failure_risk_uses_zero_recovery_when_no_immediate_close_depth_exists() 
     )
 
     risk = assess_failure_scenarios(
-        (FailureScenario("FIRST_LEG_ONLY", Decimal("1.60"), (exposure,)),),
+        (
+            FailureScenario(
+                "FIRST_LEG_ONLY", Decimal("1.60"), (exposure,), Decimal("1.60")
+            ),
+        ),
         evaluated_at_ms=1_000,
         fee_max_age_seconds=1,
     )
@@ -123,7 +133,11 @@ def test_risk_loss_is_clamped_at_zero_when_recovery_exceeds_capital() -> None:
     )
 
     risk = assess_failure_scenarios(
-        (FailureScenario("FIRST_LEG_ONLY", Decimal("0.50"), (exposure,)),),
+        (
+            FailureScenario(
+                "FIRST_LEG_ONLY", Decimal("0.50"), (exposure,), Decimal("0.50")
+            ),
+        ),
         evaluated_at_ms=1_000,
         fee_max_age_seconds=1,
     )

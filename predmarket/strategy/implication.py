@@ -48,7 +48,12 @@ def evaluate_implication(context: StrategyContext) -> StrategyDecision:
             context, DecisionReason.INPUT_METADATA_MISSING, "implication_token_mapping_incomplete"
         )
     required = (no_a, yes_b)
-    invalid = validate_inputs(context, markets=(market_a, market_b), tokens=required)
+    invalid = validate_inputs(
+        context,
+        markets=(market_a, market_b),
+        tokens=required,
+        actions=(Action.BUY, Action.BUY),
+    )
     if invalid is not None:
         return invalid
     specs = ((market_a, no_a, Action.BUY), (market_b, yes_b, Action.BUY))
@@ -60,14 +65,24 @@ def evaluate_implication(context: StrategyContext) -> StrategyDecision:
         capital = gross + fees + context.configuration.conversion_cost + safety
         return capital, quantity - capital
 
-    quantity = optimize_trades(context, trade_specs=specs, economics=economics)
-    if quantity is None:
+    optimized = optimize_trades(
+        context,
+        trade_specs=specs,
+        economics=economics,
+        risk_evaluator=lambda trades, capital: long_entry_risk(
+            context, trades, total_capital=capital
+        ),
+    )
+    if optimized is None:
         return not_evaluable(
             context, DecisionReason.ORDERBOOK_INVALID, "no_executable_quantity"
         )
-    trades = tuple(trade(context, *spec, quantity) for spec in specs)
-    total_capital, expected_profit = economics(quantity, trades)
-    risk = long_entry_risk(context, trades, total_capital=total_capital)
+    candidate = optimized.candidate
+    quantity = candidate.quantity
+    trades = candidate.trades
+    total_capital = candidate.total_capital
+    expected_profit = candidate.expected_profit
+    risk = candidate.risk
     calc = calculation(
         quantity=quantity,
         total_capital=total_capital,
@@ -89,4 +104,10 @@ def evaluate_implication(context: StrategyContext) -> StrategyDecision:
         trades[1].leg(1),
         conversion_leg(2, market_b.id, Action.REDEEM, quantity),
     )
-    return classify(context, calc, legs, tuple(item.book for item in trades))
+    return classify(
+        context,
+        calc,
+        legs,
+        tuple(item.book for item in trades),
+        optimized.forced_absent_reason,
+    )

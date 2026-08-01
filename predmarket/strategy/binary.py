@@ -53,7 +53,17 @@ def evaluate_binary(context: StrategyContext) -> StrategyDecision:
             "binary_yes_no_mapping_incomplete",
         )
     required = (yes, no)
-    invalid = validate_inputs(context, markets=(market,), tokens=required)
+    actions = (
+        (Action.BUY, Action.BUY)
+        if context.strategy_type is StrategyType.BINARY_UNDERPRICED
+        else (Action.SELL, Action.SELL)
+    )
+    invalid = validate_inputs(
+        context,
+        markets=(market,),
+        tokens=required,
+        actions=actions,
+    )
     if invalid is not None:
         return invalid
     if context.strategy_type is StrategyType.BINARY_UNDERPRICED:
@@ -75,16 +85,26 @@ def _underpriced(context, market, yes, no) -> StrategyDecision:
         capital = trading_cost + context.configuration.conversion_cost + safety
         return capital, quantity - capital
 
-    quantity = optimize_trades(context, trade_specs=specs, economics=economics)
-    if quantity is None:
+    optimized = optimize_trades(
+        context,
+        trade_specs=specs,
+        economics=economics,
+        risk_evaluator=lambda trades, capital: long_entry_risk(
+            context, trades, total_capital=capital
+        ),
+    )
+    if optimized is None:
         return not_evaluable(
             context,
             DecisionReason.ORDERBOOK_INVALID,
             "no_executable_quantity",
         )
-    trades = tuple(trade(context, *spec, quantity) for spec in specs)
-    total_capital, expected_profit = economics(quantity, trades)
-    risk = long_entry_risk(context, trades, total_capital=total_capital)
+    candidate = optimized.candidate
+    quantity = candidate.quantity
+    trades = candidate.trades
+    total_capital = candidate.total_capital
+    expected_profit = candidate.expected_profit
+    risk = candidate.risk
     calc = calculation(
         quantity=quantity,
         total_capital=total_capital,
@@ -101,7 +121,13 @@ def _underpriced(context, market, yes, no) -> StrategyDecision:
         trades[1].leg(1),
         conversion_leg(2, market.id, Action.MERGE, quantity),
     )
-    return classify(context, calc, legs, tuple(item.book for item in trades))
+    return classify(
+        context,
+        calc,
+        legs,
+        tuple(item.book for item in trades),
+        optimized.forced_absent_reason,
+    )
 
 
 def _overpriced(context, market, yes, no) -> StrategyDecision:
@@ -116,16 +142,26 @@ def _overpriced(context, market, yes, no) -> StrategyDecision:
         proceeds = sum((item.net_proceeds for item in trades), Decimal("0"))
         return capital, proceeds - capital
 
-    quantity = optimize_trades(context, trade_specs=specs, economics=economics)
-    if quantity is None:
+    optimized = optimize_trades(
+        context,
+        trade_specs=specs,
+        economics=economics,
+        risk_evaluator=lambda trades, capital: split_inventory_risk(
+            context, trades, total_capital=capital
+        ),
+    )
+    if optimized is None:
         return not_evaluable(
             context,
             DecisionReason.ORDERBOOK_INVALID,
             "no_executable_quantity",
         )
-    trades = tuple(trade(context, *spec, quantity) for spec in specs)
-    total_capital, expected_profit = economics(quantity, trades)
-    risk = split_inventory_risk(context, trades, total_capital=total_capital)
+    candidate = optimized.candidate
+    quantity = candidate.quantity
+    trades = candidate.trades
+    total_capital = candidate.total_capital
+    expected_profit = candidate.expected_profit
+    risk = candidate.risk
     calc = calculation(
         quantity=quantity,
         total_capital=total_capital,
@@ -141,4 +177,10 @@ def _overpriced(context, market, yes, no) -> StrategyDecision:
         trades[0].leg(1),
         trades[1].leg(2),
     )
-    return classify(context, calc, legs, tuple(item.book for item in trades))
+    return classify(
+        context,
+        calc,
+        legs,
+        tuple(item.book for item in trades),
+        optimized.forced_absent_reason,
+    )

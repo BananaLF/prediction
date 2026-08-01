@@ -40,11 +40,13 @@ class FailureScenario:
     name: str
     capital_at_risk: Decimal
     exposures: tuple[OpenExposure, ...]
+    unhedged_notional: Decimal
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("name must be a non-empty string")
         _nonnegative_decimal(self.capital_at_risk, "capital_at_risk")
+        _nonnegative_decimal(self.unhedged_notional, "unhedged_notional")
         materialized = tuple(self.exposures)
         if not materialized or any(
             not isinstance(exposure, OpenExposure) for exposure in materialized
@@ -139,10 +141,7 @@ def assess_failure_scenarios(
     for scenario in materialized:
         recovery = Decimal("0")
         uncloseable = Decimal("0")
-        unhedged = sum(
-            (exposure.entry_notional for exposure in scenario.exposures),
-            Decimal("0"),
-        )
+        unhedged = scenario.unhedged_notional
         for exposure in scenario.exposures:
             close = immediate_close_value(
                 exposure,
