@@ -51,6 +51,13 @@
   path and the failed path.  The parser consumes `--check-hash-based-pycs` and
   its value before locating the first `-m`; unavailable advisory locks produce
   a controlled `ResetRefused`.
+- **RED (review remediation round 5):** the parser consumed any token after
+  `--check-hash-based-pycs`, so `-m` could be treated as that option's value and
+  a second `-m predmarket` falsely identified an invalid Python command.
+- **GREEN (review remediation round 5):** the option now accepts only
+  CPython's `default`, `always`, or `never` values.  The process-scan regression
+  covers all three valid values and rejects `--check-hash-based-pycs -m -m
+  predmarket`.
 
 ## Changes
 
@@ -76,7 +83,7 @@
 - Extended active-process detection to parse argv and recognize both the
   `predmarket` console script (including `/venv/bin/predmarket`) and a Python
   interpreter with supported Python options (including
-  `--check-hash-based-pycs VALUE`) before `-m predmarket`.
+  `--check-hash-based-pycs {default,always,never}`) before `-m predmarket`.
 - Reset now reports partial filesystem deletion truthfully: all three targets
   are preflighted before unlinking, and an unlink failure identifies both the
   exact targets already deleted and the target that failed.  `fcntl` is an
@@ -92,7 +99,7 @@
 
 | Command | Result |
 | --- | --- |
-| `pytest -q tests/integration/test_documented_commands.py` | Passed after round-4 remediation: `12 passed, 1 warning in 0.74s`. |
+| `pytest -q tests/integration/test_documented_commands.py` | Passed after round-5 remediation: `12 passed, 1 warning in 0.66s`. |
 | `pytest -q tests/integration/test_documented_commands.py -k reset` | Passed: `10 passed, 2 deselected, 1 warning in 0.63s`. |
 | `pytest -q` | Collection failed with 5 errors in `0.26s` because the optional `polymarket` package is absent: `ModuleNotFoundError: No module named 'polymarket'` in SDK, watch, catalog-sync, and gateway tests. No dependency boundary was changed. |
 | `python -m predmarket --help` | Passed (exit 0); showed `run`, `status`, `signals`, and `relations`. |

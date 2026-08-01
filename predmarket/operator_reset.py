@@ -321,7 +321,14 @@ def _has_predmarket_module_entry(arguments: list[str]) -> bool:
             return False
         if argument == "-c" or argument.startswith("-c"):
             return False
-        if argument in {"-W", "-X", "--check-hash-based-pycs"}:
+        if argument == "--check-hash-based-pycs":
+            if index + 1 >= len(arguments):
+                return False
+            if arguments[index + 1] not in {"default", "always", "never"}:
+                return False
+            index += 2
+            continue
+        if argument in {"-W", "-X"}:
             if index + 1 >= len(arguments):
                 return False
             index += 2

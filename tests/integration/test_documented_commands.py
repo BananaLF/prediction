@@ -267,9 +267,20 @@ def test_reset_helper_detects_console_script_but_not_ordinary_predmarket_names(
                     "4249 python --mode -m predmarket\n"
                     "4250 /tmp/predmarket-notes.txt\n"
                     "4251 python --check-hash-based-pycs always -m predmarket run\n"
+                    "4252 python --check-hash-based-pycs default -m predmarket run\n"
+                    "4253 python --check-hash-based-pycs never -m predmarket run\n"
+                    "4254 python --check-hash-based-pycs -m -m predmarket run\n"
                 ),
             )
         ),
     )
 
-    assert running_predmarket_processes() == (4242, 4243, 4244, 4245, 4251)
+    assert running_predmarket_processes() == (
+        4242,
+        4243,
+        4244,
+        4245,
+        4251,
+        4252,
+        4253,
+    )
