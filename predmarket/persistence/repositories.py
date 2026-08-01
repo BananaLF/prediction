@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -20,6 +21,13 @@ from predmarket.domain.signal import (
     StrategyType,
 )
 from predmarket.persistence.writer import DatabaseWriter
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogSnapshot:
+    events: tuple[Event, ...]
+    markets: tuple[Market, ...]
+    tokens: tuple[Token, ...]
 
 
 class CatalogRepository:
@@ -114,6 +122,37 @@ class CatalogRepository:
             (token_id,),
         )
         return None if row is None else _token_from_row(row)
+
+    async def load_catalog(self) -> CatalogSnapshot:
+        """Read a consistent catalog view for one sync diff."""
+
+        async with aiosqlite.connect(
+            self._path,
+            isolation_level=None,
+        ) as connection:
+            connection.row_factory = aiosqlite.Row
+            await connection.execute("PRAGMA query_only = ON")
+            await connection.execute("BEGIN")
+            try:
+                event_cursor = await connection.execute(
+                    "SELECT * FROM events ORDER BY CAST(id AS BLOB)"
+                )
+                market_cursor = await connection.execute(
+                    "SELECT * FROM markets ORDER BY CAST(id AS BLOB)"
+                )
+                token_cursor = await connection.execute(
+                    "SELECT * FROM tokens ORDER BY CAST(id AS BLOB)"
+                )
+                event_rows = await event_cursor.fetchall()
+                market_rows = await market_cursor.fetchall()
+                token_rows = await token_cursor.fetchall()
+            finally:
+                await connection.execute("ROLLBACK")
+        return CatalogSnapshot(
+            events=tuple(_event_from_row(row) for row in event_rows),
+            markets=tuple(_market_from_row(row) for row in market_rows),
+            tokens=tuple(_token_from_row(row) for row in token_rows),
+        )
 
 
 class RelationRepository:
