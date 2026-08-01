@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass, replace
 import logging
 import math
@@ -27,9 +27,42 @@ from predmarket.polymarket.gateway import MarketSnapshot
 
 T = TypeVar("T")
 _LOGGER = logging.getLogger(__name__)
-_MARKER_WRITE_TIMEOUT_SECONDS = 0.05
-_CURSOR_WRITE_TIMEOUT_SECONDS = 0.05
-_DEGRADATION_REPORT_TIMEOUT_SECONDS = 0.05
+
+
+async def _await_auxiliary_write(
+    operation: Coroutine[Any, Any, T],
+    *,
+    name: str,
+) -> T:
+    """Own an admitted auxiliary write until it reaches a terminal state."""
+
+    task = asyncio.create_task(operation, name=f"catalog-auxiliary:{name}")
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancellation:
+        current = asyncio.current_task()
+        if current is None or current.cancelling() == 0:
+            return task.result()
+
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except BaseException as error:
+            _LOGGER.error(
+                "Catalog auxiliary %s failed while caller cancellation "
+                "was pending: %s",
+                name,
+                error,
+            )
+        raise cancellation
 
 
 class _Gateway(Protocol):
@@ -310,12 +343,12 @@ class SyncMarketTask:
         market_ids: tuple[str, ...],
     ) -> str | None:
         try:
-            await asyncio.wait_for(
+            await _await_auxiliary_write(
                 self._system_events.record_market_change_published(
                     change,
                     market_ids=market_ids,
                 ),
-                timeout=_MARKER_WRITE_TIMEOUT_SECONDS,
+                name=f"publication-marker:{change.change_id}",
             )
         except Exception as error:
             self._degraded = True
@@ -338,13 +371,13 @@ class SyncMarketTask:
         if cursor is None:
             return None
         try:
-            await asyncio.wait_for(
+            await _await_auxiliary_write(
                 self._system_events.record_settlement_refresh_cursor(
                     sync_generation=generation,
                     cursor=cursor,
                     occurred_at=occurred_at,
                 ),
-                timeout=_CURSOR_WRITE_TIMEOUT_SECONDS,
+                name=f"settlement-refresh-cursor:{generation}",
             )
         except Exception as error:
             self._degraded = True
@@ -375,7 +408,7 @@ class SyncMarketTask:
         if failed_change_ids:
             details["failed_change_id"] = failed_change_ids[0]
         try:
-            await asyncio.wait_for(
+            await _await_auxiliary_write(
                 self._system_events.append(
                     component="SYNC",
                     severity="ERROR",
@@ -384,7 +417,7 @@ class SyncMarketTask:
                     occurred_at=occurred_at,
                     details=details,
                 ),
-                timeout=_DEGRADATION_REPORT_TIMEOUT_SECONDS,
+                name="degradation-report",
             )
         except Exception as error:
             _LOGGER.error("Catalog sync degradation report failed: %s", error)

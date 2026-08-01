@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
+import sqlite3
 from typing import Any
 
 import pytest
@@ -178,24 +179,91 @@ class _MarkerFailingSystemEvents:
         )
 
 
-class _BlockingDegradedSystemEvents(_MarkerFailingSystemEvents):
+class _ControlledDegradedSystemEvents(_MarkerFailingSystemEvents):
     def __init__(self, delegate: SystemEventRepository) -> None:
         super().__init__(delegate)
         self.active_reports = 0
-        self.cancelled_reports = 0
+        self.report_started = asyncio.Event()
+        self.release_report = asyncio.Event()
 
     async def append(self, **values: Any) -> int:
         if values.get("event_type") != "SYSTEM_DEGRADED":
             return await self._delegate.append(**values)
         self.active_reports += 1
         try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            self.cancelled_reports += 1
-            raise
+            self.report_started.set()
+            await self.release_report.wait()
+            return await self._delegate.append(**values)
         finally:
             self.active_reports -= 1
-        raise AssertionError("unreachable")
+
+
+class _SlowWriterSystemEvents:
+    def __init__(
+        self,
+        delegate: SystemEventRepository,
+        writer: DatabaseWriter,
+    ) -> None:
+        self._delegate = delegate
+        self._writer = writer
+        self.command_started = asyncio.Event()
+        self.release_command = asyncio.Event()
+        self.active_writer_commands = 0
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
+
+    async def record_market_change_published(
+        self,
+        change: MarketChange,
+        *,
+        market_ids: tuple[str, ...] | None = None,
+    ) -> int:
+        async def slow_command(connection: object) -> None:
+            self.active_writer_commands += 1
+            self.command_started.set()
+            try:
+                await self.release_command.wait()
+            finally:
+                self.active_writer_commands -= 1
+
+        await self._writer.execute(slow_command)
+        return await self._delegate.record_market_change_published(
+            change,
+            market_ids=market_ids,
+        )
+
+
+class _FailingWriterSystemEvents:
+    def __init__(
+        self,
+        delegate: SystemEventRepository,
+        writer: DatabaseWriter,
+    ) -> None:
+        self._delegate = delegate
+        self._writer = writer
+        self._failed = False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
+
+    async def record_market_change_published(
+        self,
+        change: MarketChange,
+        *,
+        market_ids: tuple[str, ...] | None = None,
+    ) -> int:
+        if not self._failed:
+            self._failed = True
+
+            async def failing_command(connection: object) -> None:
+                raise sqlite3.OperationalError("forced marker database failure")
+
+            return await self._writer.execute(failing_command)
+        return await self._delegate.record_market_change_published(
+            change,
+            market_ids=market_ids,
+        )
 
 
 class _CursorFailingSystemEvents:
@@ -874,13 +942,13 @@ async def test_marker_failure_degrades_but_does_not_skip_later_critical_control(
     assert degraded[0]["details"]["failed_change_id"].endswith("market-1")
 
 
-async def test_blocked_degraded_report_cannot_delay_later_critical_control(
+async def test_degraded_report_runs_only_after_later_critical_control_admission(
     catalog_runtime,
 ) -> None:
     catalog, real_system_events = catalog_runtime
     await _seed(catalog, ("market-2",))
     queue = _RecordingQueue()
-    blocking_events = _BlockingDegradedSystemEvents(real_system_events)
+    controlled_events = _ControlledDegradedSystemEvents(real_system_events)
     task = SyncMarketTask(
         gateway=_FakeGateway(
             events=(_event(("market-1",)),),
@@ -889,21 +957,156 @@ async def test_blocked_degraded_report_cannot_delay_later_critical_control(
         ),
         catalog=catalog,
         changes=queue,
-        system_events=blocking_events,  # type: ignore[arg-type]
+        system_events=controlled_events,  # type: ignore[arg-type]
         clock_ms=lambda: 705,
         generation_factory=lambda: "sync-blocked-degraded-report",
     )
 
-    result = await asyncio.wait_for(task.run_once(), timeout=0.2)
+    run = asyncio.create_task(task.run_once())
+    await asyncio.wait_for(controlled_events.report_started.wait(), timeout=1)
 
     assert [item.change_type for item in queue.items] == [
         MarketChangeType.MARKET_ADDED,
         MarketChangeType.MARKET_DEACTIVATED,
     ]
+    assert run.done() is False
+    controlled_events.release_report.set()
+    result = await asyncio.wait_for(run, timeout=1)
     assert result.degraded is True
     assert task.degraded is True
-    assert blocking_events.cancelled_reports == 1
-    assert blocking_events.active_reports == 0
+    assert controlled_events.active_reports == 0
+
+
+async def test_slow_real_writer_marker_is_not_false_degradation(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "slow-marker.db"
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    catalog = CatalogRepository(database_path, writer)
+    real_system_events = SystemEventRepository(database_path, writer)
+    slow_system_events = _SlowWriterSystemEvents(real_system_events, writer)
+    run: asyncio.Task[object] | None = None
+    try:
+        run = asyncio.create_task(
+            SyncMarketTask(
+                gateway=_FakeGateway(
+                    events=(_event(("market-1",)),),
+                    markets=(_snapshot("market-1"),),
+                ),
+                catalog=catalog,
+                changes=_RecordingQueue(),
+                system_events=slow_system_events,  # type: ignore[arg-type]
+                clock_ms=lambda: 706,
+                generation_factory=lambda: "sync-slow-marker",
+            ).run_once()
+        )
+        await asyncio.wait_for(slow_system_events.command_started.wait(), timeout=1)
+        await asyncio.sleep(0.08)
+        slow_system_events.release_command.set()
+        result = await asyncio.wait_for(run, timeout=1)
+
+        assert result.degraded is False  # type: ignore[union-attr]
+        assert slow_system_events.active_writer_commands == 0
+        events = await real_system_events.read_after(0)
+        assert [event["event_type"] for event in events] == [
+            "MARKET_CHANGE_PUBLISHED"
+        ]
+    finally:
+        slow_system_events.release_command.set()
+        if run is not None:
+            await asyncio.gather(run, return_exceptions=True)
+        await writer.close()
+
+
+async def test_cancelled_sync_drains_accepted_real_writer_marker(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "cancelled-marker.db"
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    catalog = CatalogRepository(database_path, writer)
+    real_system_events = SystemEventRepository(database_path, writer)
+    slow_system_events = _SlowWriterSystemEvents(real_system_events, writer)
+    run: asyncio.Task[object] | None = None
+    try:
+        run = asyncio.create_task(
+            SyncMarketTask(
+                gateway=_FakeGateway(
+                    events=(_event(("market-1",)),),
+                    markets=(_snapshot("market-1"),),
+                ),
+                catalog=catalog,
+                changes=_RecordingQueue(),
+                system_events=slow_system_events,  # type: ignore[arg-type]
+                clock_ms=lambda: 707,
+                generation_factory=lambda: "sync-cancelled-marker",
+            ).run_once()
+        )
+        await asyncio.wait_for(slow_system_events.command_started.wait(), timeout=1)
+        run.cancel()
+        await asyncio.sleep(0)
+
+        assert run.done() is False
+        slow_system_events.release_command.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        assert slow_system_events.active_writer_commands == 0
+
+        await writer.execute(lambda connection: None)
+        before = await real_system_events.read_after(0)
+        await asyncio.sleep(0.02)
+        after = await real_system_events.read_after(0)
+        assert after == before
+        assert [event["event_type"] for event in after] == [
+            "MARKET_CHANGE_PUBLISHED"
+        ]
+    finally:
+        slow_system_events.release_command.set()
+        if run is not None:
+            await asyncio.gather(run, return_exceptions=True)
+        await writer.close()
+
+
+async def test_real_writer_marker_failure_degrades_after_critical_admissions(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "failed-marker.db"
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    catalog = CatalogRepository(database_path, writer)
+    real_system_events = SystemEventRepository(database_path, writer)
+    await _seed(catalog, ("market-2",))
+    queue = _RecordingQueue()
+    try:
+        result = await SyncMarketTask(
+            gateway=_FakeGateway(
+                events=(_event(("market-1",)),),
+                markets=(_snapshot("market-1"),),
+                refreshed={"market-2": RuntimeError("not resolved")},
+            ),
+            catalog=catalog,
+            changes=queue,
+            system_events=_FailingWriterSystemEvents(  # type: ignore[arg-type]
+                real_system_events,
+                writer,
+            ),
+            clock_ms=lambda: 708,
+            generation_factory=lambda: "sync-failed-marker",
+        ).run_once()
+
+        assert [item.change_type for item in queue.items] == [
+            MarketChangeType.MARKET_ADDED,
+            MarketChangeType.MARKET_DEACTIVATED,
+        ]
+        assert result.degraded is True
+        assert result.publication_marker_failures == 1
+        assert any(
+            event["event_type"] == "SYSTEM_DEGRADED"
+            for event in await real_system_events.read_after(0)
+        )
+    finally:
+        await writer.close()
 
 
 async def test_deactivated_publication_baseline_reactivation_replays_added(
