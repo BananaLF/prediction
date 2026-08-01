@@ -20,6 +20,17 @@
   both a `predmarket` console-script basename and `python -m predmarket`, while
   ignoring ordinary filenames and pytest invocations. The documented-command
   suite passes with the two new tests (`8 passed`).
+- **RED (review remediation round 2):** verifying a target entry with `stat`
+  and then deleting its name with `unlinkat` remains a TOCTOU: the entry can be
+  replaced by another regular file in the same verified directory between those
+  operations. The previous argv scan also treated `pytest -m predmarket` and
+  `tool --mode -m predmarket` as running collectors.
+- **GREEN (review remediation round 2):** Python/POSIX exposes no atomic
+  unlink that binds deletion to verified `st_dev`/`st_ino`, so reset execution
+  now refuses before target-entry inspection or deletion. A real temporary-path
+  regression replaces the planned SQLite target and confirms it survives.
+  Process parsing now accepts only `predmarket` as argv[0], or a Python
+  interpreter whose immediate argv is `-m predmarket`.
 
 ## Changes
 
@@ -33,21 +44,20 @@
 - Added `scripts/reset_database.py` and `predmarket.operator_reset`.  The dry
   run prints the resolved absolute configured main SQLite path and exact main,
   `-wal`, and `-shm` targets.  Execution rejects active Predmarket processes,
-  symlinks, directories, filesystem root, home, and workspace root, and deletes
-  only validated exact targets.
+  symlinks, directories, filesystem root, home, and workspace root.
 - Hardened reset execution against parent-directory TOCTOU. The reset plan
   binds the verified parent directory device/inode; execution opens it with
-  `O_DIRECTORY | O_NOFOLLOW`, compares the opened descriptor, verifies each
-  exact basename through that descriptor without following symlinks, then uses
-  `os.unlink(..., dir_fd=...)`. It never deletes through a re-resolved target
-  path.
+  `O_DIRECTORY | O_NOFOLLOW` and compares the opened descriptor.
+- Removed the unsafe `stat`-then-`os.unlink(..., dir_fd=...)` deletion path.
+  Until a platform-specific primitive can atomically unlink an exact verified
+  device/inode identity, `--execute` fails closed and removes no file.
 - Extended active-process detection to parse argv and recognize both the
-  `predmarket` console script (including `/venv/bin/predmarket`) and
-  `python -m predmarket`.
+  `predmarket` console script (including `/venv/bin/predmarket`) and a Python
+  interpreter immediately followed by `-m predmarket`.
 - Clarified `README.md`: `relations list` and `relations show` are local
-  read-only operations; `relations analyze` and `relations approve` perform
-  controlled local relationship/event writes. Polymarket access remains
-  read-only.
+  read-only operations; `relations analyze` updates only a relationship, while
+  `relations approve` updates it and records `RELATION_ACTIVATED`. Polymarket
+  access remains read-only.
 - Added CLI normalization so the documented `subcommand --config PATH` form is
   accepted by the actual parser.
 
@@ -55,8 +65,8 @@
 
 | Command | Result |
 | --- | --- |
-| `pytest -q tests/integration/test_documented_commands.py` | Passed after remediation: `8 passed, 1 warning in 0.15s`. |
-| `pytest -q tests/integration/test_documented_commands.py -k reset` | Passed: `6 passed, 2 deselected, 1 warning in 0.08s`. |
+| `pytest -q tests/integration/test_documented_commands.py` | Passed after remediation: `9 passed, 1 warning in 0.16s`. |
+| `pytest -q tests/integration/test_documented_commands.py -k reset` | Passed: `7 passed, 2 deselected, 1 warning in 0.09s`. |
 | `pytest -q` | Collection failed with 5 errors in `0.25s` because the optional `polymarket` package is absent: `ModuleNotFoundError: No module named 'polymarket'` in SDK, watch, catalog-sync, and gateway tests. No dependency boundary was changed. |
 | `python -m predmarket --help` | Passed (exit 0); showed `run`, `status`, `signals`, and `relations`. |
 | `python -m predmarket status --config config/default.yaml` | Failed: `sqlite3.OperationalError: unable to open database file`; `config/default.yaml` points to the absent `data/predmarket-v1.sqlite3`. No default user database was created for verification. |
@@ -72,5 +82,6 @@
 - The configured default database has not been initialized.  `status` is
   deliberately read-only and therefore does not create it.
 - The sandbox denies process enumeration with `ps`; the reset helper fails
-  closed when process inspection is unavailable.  Its file-deletion behavior
-  was exercised only against pytest temporary files.
+  closed when process inspection is unavailable. Python/POSIX also lacks the
+  required atomic identity-checked unlink primitive, so `--execute` is
+  intentionally unavailable and removes no file.

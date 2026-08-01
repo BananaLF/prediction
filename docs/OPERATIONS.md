@@ -35,6 +35,13 @@ Predmarket process, or if the configured main path is a directory, symlink,
 filesystem root, user home directory, or repository root.  It deletes no other
 file and cannot accept a wildcard or directory target.
 
+The current Python/POSIX implementation has no supported atomic unlink operation
+that binds deletion to a previously verified file identity.  Consequently,
+`--execute` fails closed with a refusal and removes nothing; do not replace it
+with shell deletion.  The dry run remains available to identify the configured
+path safely.  A deletion-capable reset requires a future platform-specific
+identity-checked unlink primitive and matching regression tests.
+
 ## Signal semantics
 
 Signals are observations, not orders.  A `CLOSED` signal means that its

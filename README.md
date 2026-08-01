@@ -19,10 +19,10 @@ python -m predmarket relations list --config config/default.yaml
 ```
 
 `run` is the long-running collector.  `status`, `signals`, and `relations list`
-or `relations show` read the local SQLite database.  `relations analyze` and
-`relations approve` are controlled local writes: they update relationship and
-event records but never mutate Polymarket.  See [the project
-guide](docs/PROJECT-GUIDE.md) for the schema and
+or `relations show` read the local SQLite database.  `relations analyze` is a
+controlled local relationship update.  `relations approve` updates the
+relationship and records a `RELATION_ACTIVATED` event.  Neither command mutates
+Polymarket.  See [the project guide](docs/PROJECT-GUIDE.md) for the schema and
 [operations](docs/OPERATIONS.md) for safe lifecycle and reset procedures.
 
 ## Safety boundary

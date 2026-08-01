@@ -82,7 +82,7 @@ def _reset_config(tmp_path: Path, database_path: Path) -> Path:
     return config
 
 
-def test_documented_reset_helper_only_removes_exact_temporary_sqlite_files(
+def test_documented_reset_helper_refuses_delete_without_atomic_identity_unlink(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "reset.sqlite3"
@@ -93,8 +93,9 @@ def test_documented_reset_helper_only_removes_exact_temporary_sqlite_files(
     plan = prepare_reset(_reset_config(tmp_path, database))
 
     assert plan.main_path == database
-    assert execute_reset(plan, running_processes=()) == siblings
-    assert all(not path.exists() for path in siblings)
+    with pytest.raises(ResetRefused, match="atomic unlink by verified file identity"):
+        execute_reset(plan, running_processes=())
+    assert [path.read_text() for path in siblings] == ["test database content"] * 3
 
 
 def test_reset_helper_refuses_a_configured_directory(tmp_path: Path) -> None:
@@ -140,6 +141,20 @@ def test_reset_helper_refuses_parent_directory_replaced_by_symlink(
     ] == ["neighbor must survive"] * 3
 
 
+def test_reset_helper_preserves_target_replaced_after_reset_plan(tmp_path: Path) -> None:
+    database = tmp_path / "reset.sqlite3"
+    database.write_text("validated database")
+    plan = prepare_reset(_reset_config(tmp_path, database))
+
+    database.unlink()
+    database.write_text("replacement must survive")
+
+    with pytest.raises(ResetRefused, match="atomic unlink by verified file identity"):
+        execute_reset(plan, running_processes=())
+
+    assert database.read_text() == "replacement must survive"
+
+
 def test_reset_helper_detects_a_running_predmarket_process(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "predmarket.operator_reset.subprocess.run",
@@ -166,11 +181,14 @@ def test_reset_helper_detects_console_script_but_not_ordinary_predmarket_names(
                 returncode=0,
                 stdout=(
                     "4242 /venv/bin/predmarket run --config config/default.yaml\n"
-                    "4243 python -m pytest tests/predmarket/test_reset.py\n"
-                    "4244 /tmp/predmarket-notes.txt\n"
+                    "4243 /venv/bin/python3 -m predmarket run\n"
+                    "4244 pytest -m predmarket tests/test_reset.py\n"
+                    "4245 tool --mode -m predmarket\n"
+                    "4246 python --mode -m predmarket\n"
+                    "4247 /tmp/predmarket-notes.txt\n"
                 ),
             )
         ),
     )
 
-    assert running_predmarket_processes() == (4242,)
+    assert running_predmarket_processes() == (4242, 4243)

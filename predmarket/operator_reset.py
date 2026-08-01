@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import shlex
 import stat
 import subprocess
+from typing import Callable
 
 from predmarket.config import AppConfig
 
@@ -24,6 +26,9 @@ class ResetPlan:
     target_names: tuple[str, str, str]
     parent_device: int
     parent_inode: int
+
+
+IdentitySafeUnlinker = Callable[[int, str, int, int], None]
 
 
 def prepare_reset(config_path: Path, *, working_directory: Path | None = None) -> ResetPlan:
@@ -109,14 +114,19 @@ def execute_reset(plan: ResetPlan, *, running_processes: tuple[int, ...] | None 
 
     parent_fd = _open_verified_parent(plan)
     try:
-        existing_names = _verified_target_names(plan, parent_fd)
-        for target, name in zip(plan.targets, existing_names, strict=True):
-            if name is not None:
-                os.unlink(name, dir_fd=parent_fd)
+        identity_unlinker = _identity_safe_unlinker()
+        if identity_unlinker is None:
+            raise ResetRefused(
+                "platform does not provide atomic unlink by verified file identity"
+            )
+        existing_targets = _verified_target_identities(plan, parent_fd)
+        for identity in existing_targets:
+            if identity is not None:
+                identity_unlinker(parent_fd, identity[0], identity[1], identity[2])
         return tuple(
             target
-            for target, name in zip(plan.targets, existing_names, strict=True)
-            if name is not None
+            for target, identity in zip(plan.targets, existing_targets, strict=True)
+            if identity is not None
         )
     except OSError as error:
         raise ResetRefused("could not safely remove validated reset target") from error
@@ -146,20 +156,35 @@ def _open_verified_parent(plan: ResetPlan) -> int:
     return parent_fd
 
 
-def _verified_target_names(plan: ResetPlan, parent_fd: int) -> tuple[str | None, ...]:
-    names: list[str | None] = []
+def _verified_target_identities(
+    plan: ResetPlan,
+    parent_fd: int,
+) -> tuple[tuple[str, int, int] | None, ...]:
+    identities: list[tuple[str, int, int] | None] = []
     for target, name in zip(plan.targets, plan.target_names, strict=True):
         try:
             target_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
-            names.append(None)
+            identities.append(None)
             continue
         if stat.S_ISLNK(target_stat.st_mode):
             raise ResetRefused(f"reset target must not be a symlink: {target}")
         if not stat.S_ISREG(target_stat.st_mode):
             raise ResetRefused(f"reset target must be a file: {target}")
-        names.append(name)
-    return tuple(names)
+        identities.append((name, target_stat.st_dev, target_stat.st_ino))
+    return tuple(identities)
+
+
+def _identity_safe_unlinker() -> IdentitySafeUnlinker | None:
+    """Return an unlink primitive that atomically checks the verified identity.
+
+    POSIX ``unlinkat`` (and Python's ``os.unlink(..., dir_fd=...)``) identifies
+    the entry by name only.  It cannot attach a checked ``st_dev``/``st_ino`` to
+    deletion, so using it after ``stat`` reintroduces the target-entry race.
+    Python exposes no supported primitive with that atomic contract on this
+    platform.  Keep reset fail-closed until such a primitive is available.
+    """
+    return None
 
 
 def _contains_symlink(path: Path) -> bool:
@@ -178,9 +203,16 @@ def _is_predmarket_command(command: str) -> bool:
         return False
     if not argv:
         return False
-    if Path(argv[0]).name == "predmarket":
+    executable = Path(argv[0]).name
+    if executable == "predmarket":
         return True
-    return any(
-        argument == "-m" and argv[index + 1] == "predmarket"
-        for index, argument in enumerate(argv[:-1])
+    return (
+        _is_python_interpreter(executable)
+        and len(argv) >= 3
+        and argv[1] == "-m"
+        and argv[2] == "predmarket"
     )
+
+
+def _is_python_interpreter(executable: str) -> bool:
+    return re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable) is not None
