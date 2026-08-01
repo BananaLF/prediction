@@ -30,7 +30,7 @@ def main(
     now_ms: Callable[[], int] | None = None,
 ) -> int:
     parser = _build_parser()
-    arguments = parser.parse_args(argv)
+    arguments = parser.parse_args(_normalize_config_position(argv))
     config = AppConfig.load(arguments.config)
     output = sys.stdout if stdout is None else stdout
     clock = now_ms or (lambda: time.time_ns() // 1_000_000)
@@ -93,6 +93,19 @@ def main(
         _write_json(output, _relation_payload(relation))
         return 0
     parser.error("a relations command is required")
+
+
+def _normalize_config_position(argv: Sequence[str] | None) -> list[str]:
+    """Accept the documented ``COMMAND --config PATH`` form as well as global options."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    try:
+        config_index = arguments.index("--config")
+    except ValueError:
+        return arguments
+    if config_index + 1 >= len(arguments):
+        return arguments
+    config = arguments[config_index : config_index + 2]
+    return config + arguments[:config_index] + arguments[config_index + 2 :]
 
 
 def _build_parser() -> argparse.ArgumentParser:
