@@ -47,6 +47,38 @@ class StrategyNumericLimitError(ValueError):
     """Raised before arithmetic would exceed the strategy resource policy."""
 
 
+def validate_strategy_decimal(
+    value: object,
+    *,
+    field_name: str,
+) -> Decimal:
+    """Validate one Decimal against the shared strategy numeric policy."""
+
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise StrategyNumericLimitError(f"{field_name} must be a finite Decimal")
+    digits = len(value.as_tuple().digits)
+    exponent = value.as_tuple().exponent
+    adjusted = value.adjusted()
+    scale = max(0, -exponent)
+    if digits > MAX_DECIMAL_COEFFICIENT_DIGITS:
+        raise StrategyNumericLimitError(
+            f"{field_name} coefficient exceeds the strategy numeric limit"
+        )
+    if scale > MAX_DECIMAL_SCALE:
+        raise StrategyNumericLimitError(
+            f"{field_name} scale exceeds the strategy numeric limit"
+        )
+    if not (
+        MIN_DECIMAL_ADJUSTED_EXPONENT
+        <= adjusted
+        <= MAX_DECIMAL_ADJUSTED_EXPONENT
+    ):
+        raise StrategyNumericLimitError(
+            f"{field_name} adjusted exponent exceeds the strategy numeric limit"
+        )
+    return value
+
+
 def bounded_sequence(
     values: object,
     *,
@@ -88,30 +120,10 @@ class _Envelope:
 
     def add(self, value: object) -> None:
         if isinstance(value, Decimal):
-            if not value.is_finite():
-                raise StrategyNumericLimitError(
-                    "strategy Decimal inputs must be finite"
-                )
+            validate_strategy_decimal(value, field_name="strategy Decimal input")
             digits = len(value.as_tuple().digits)
             exponent = value.as_tuple().exponent
             adjusted = value.adjusted()
-            scale = max(0, -exponent)
-            if digits > MAX_DECIMAL_COEFFICIENT_DIGITS:
-                raise StrategyNumericLimitError(
-                    "Decimal coefficient exceeds the strategy numeric limit"
-                )
-            if scale > MAX_DECIMAL_SCALE:
-                raise StrategyNumericLimitError(
-                    "Decimal scale exceeds the strategy numeric limit"
-                )
-            if not (
-                MIN_DECIMAL_ADJUSTED_EXPONENT
-                <= adjusted
-                <= MAX_DECIMAL_ADJUSTED_EXPONENT
-            ):
-                raise StrategyNumericLimitError(
-                    "Decimal adjusted exponent exceeds the strategy numeric limit"
-                )
             self.decimal_count += 1
             if self.decimal_count > MAX_DECIMAL_INPUTS:
                 raise StrategyNumericLimitError(

@@ -16,9 +16,12 @@ from predmarket.strategy.optimizer import (
 )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Evaluation:
     name: str
+    quantity: Decimal
+    total_capital: Decimal
+    expected_profit: Decimal
 
 
 _GLOBAL_DELTA = Decimal("1E-300")
@@ -33,14 +36,94 @@ def _candidate(
     margin: str,
     feasible: bool,
 ) -> QuantityCandidate[_Evaluation]:
+    evaluation = _Evaluation(
+        name,
+        Decimal(quantity),
+        Decimal(capital),
+        Decimal(profit),
+    )
     return QuantityCandidate(
-        evaluation=_Evaluation(name),
-        quantity=Decimal(quantity),
-        total_capital=Decimal(capital),
-        expected_profit=Decimal(profit),
+        evaluation=evaluation,
+        quantity=evaluation.quantity,
+        total_capital=evaluation.total_capital,
+        expected_profit=evaluation.expected_profit,
         constraint_margins=(("hard", Decimal(margin)),),
         feasible=feasible,
     )
+
+
+@pytest.mark.parametrize(
+    ("margin", "feasible"),
+    (("1", True), ("-1", False)),
+)
+def test_quantity_candidate_rejects_forged_feasibility(
+    margin: str,
+    feasible: bool,
+) -> None:
+    # Catches trusting a caller-provided feasibility flag over hard margins.
+    evaluation = _Evaluation(
+        "forged",
+        Decimal("1"),
+        Decimal("1"),
+        Decimal("1"),
+    )
+
+    with pytest.raises(ValueError, match="feasible"):
+        QuantityCandidate(
+            evaluation=evaluation,
+            quantity=evaluation.quantity,
+            total_capital=evaluation.total_capital,
+            expected_profit=evaluation.expected_profit,
+            constraint_margins=(("hard", Decimal(margin)),),
+            feasible=feasible,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "forged_value"),
+    (("total_capital", Decimal("2")), ("expected_profit", Decimal("2"))),
+)
+def test_quantity_candidate_rejects_economics_that_disagree_with_evaluation(
+    field_name: str,
+    forged_value: Decimal,
+) -> None:
+    # Catches selecting by wrapper economics while returning a different payload.
+    evaluation = _Evaluation(
+        "canonical",
+        Decimal("1"),
+        Decimal("1"),
+        Decimal("1"),
+    )
+    values = {
+        "quantity": evaluation.quantity,
+        "total_capital": evaluation.total_capital,
+        "expected_profit": evaluation.expected_profit,
+    }
+    values[field_name] = forged_value
+
+    with pytest.raises(ValueError, match=field_name):
+        QuantityCandidate(
+            evaluation=evaluation,
+            constraint_margins=(("hard", Decimal("-1")),),
+            feasible=True,
+            **values,
+        )
+
+
+def test_selector_revalidates_evaluation_economics_before_selection() -> None:
+    # Catches a mutable evaluation diverging after candidate construction.
+    candidate = _candidate(
+        "changed",
+        quantity="1",
+        capital="1",
+        profit="1",
+        margin="-1",
+        feasible=True,
+    )
+    candidate.evaluation.expected_profit = Decimal("2")
+
+    with pytest.raises(ValueError, match="expected_profit"):
+        select_candidates((candidate,))
 
 
 def test_selector_uses_only_closed_candidate_data_under_any_ambient_context() -> None:
@@ -81,6 +164,65 @@ def test_root_generation_is_data_only_and_preserves_safe_adjacent_quantity() -> 
     assert roots[0] < roots[1]
 
 
+@pytest.mark.parametrize(
+    ("power", "coefficient_digits", "limit_name"),
+    ((300, 301, "coefficient"), (425, 426, "scale")),
+)
+def test_terminating_root_preflights_decimal_policy_before_materialization(
+    power: int,
+    coefficient_digits: int,
+    limit_name: str,
+) -> None:
+    # The exact root is 1 + 1 / 2**power and every input remains policy-valid.
+    upper_margin = 2**power - 1
+    exact_coefficient = (2**power + 1) * 5**power
+    assert len(str(upper_margin)) <= 128
+    assert len(str(exact_coefficient)) == coefficient_digits
+    candidates = (
+        _candidate(
+            "lower",
+            quantity="1",
+            capital="1",
+            profit="1",
+            margin="-1",
+            feasible=True,
+        ),
+        _candidate(
+            "upper",
+            quantity="2",
+            capital="2",
+            profit="2",
+            margin=str(upper_margin),
+            feasible=False,
+        ),
+    )
+
+    with localcontext(Context(prec=1, rounding=ROUND_DOWN, Emin=-9, Emax=9)) as ambient:
+        before = (
+            ambient.prec,
+            ambient.rounding,
+            ambient.Emin,
+            ambient.Emax,
+            ambient.flags.copy(),
+            ambient.traps.copy(),
+        )
+        with pytest.raises(
+            StrategyNumericLimitError,
+            match=f"root {limit_name}",
+        ):
+            constraint_root_quantities(candidates)
+        after = (
+            ambient.prec,
+            ambient.rounding,
+            ambient.Emin,
+            ambient.Emax,
+            ambient.flags.copy(),
+            ambient.traps.copy(),
+        )
+
+    assert after == before
+
+
 def _oversized_book() -> OrderBook:
     levels = tuple(
         OrderBookLevel(Decimal(index) / Decimal("10000"), Decimal("1"))
@@ -105,9 +247,17 @@ def test_data_optimizer_preflights_nested_oversized_books_before_selection() -> 
     @dataclass(frozen=True)
     class Payload:
         book: OrderBook
+        quantity: Decimal
+        total_capital: Decimal
+        expected_profit: Decimal
 
     candidate = QuantityCandidate(
-        evaluation=Payload(_oversized_book()),
+        evaluation=Payload(
+            _oversized_book(),
+            Decimal("1"),
+            Decimal("1"),
+            Decimal("1"),
+        ),
         quantity=Decimal("1"),
         total_capital=Decimal("1"),
         expected_profit=Decimal("1"),

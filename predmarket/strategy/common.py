@@ -420,19 +420,7 @@ def _quantity_candidate(
             scenario.unhedged_notional
             - context.configuration.maximum_unhedged_notional
         )
-    feasible = (
-        candidate.total_capital <= context.configuration.bankroll
-        and candidate.expected_profit > 0
-        and candidate.expected_profit
-        >= context.configuration.minimum_return_rate * candidate.total_capital
-        and all(
-            scenario.loss
-            <= context.configuration.maximum_risk_rate * candidate.total_capital
-            and scenario.unhedged_notional
-            <= context.configuration.maximum_unhedged_notional
-            for scenario in candidate.risk.scenarios
-        )
-    )
+    feasible = all(margin <= 0 for margin in margins.values())
     return QuantityCandidate(
         evaluation=candidate,
         quantity=candidate.quantity,
