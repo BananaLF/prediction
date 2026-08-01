@@ -129,6 +129,8 @@ class FakeGateway:
         self.subscriptions: list[FakeSubscription] = []
         self.recovery_gate: asyncio.Event | None = None
         self.ignore_recovery_cancellation = False
+        self.ignore_recovery_cancellation_count = 0
+        self.recovery_cancellations = 0
         self.recovery_cancelled = asyncio.Event()
         self.subscription_factory = FakeSubscription
 
@@ -140,13 +142,18 @@ class FakeGateway:
         subscription = self.subscription_factory(generation)
         self.subscriptions.append(subscription)
         if self.recovery_gate is not None:
-            try:
-                await self.recovery_gate.wait()
-            except asyncio.CancelledError:
-                self.recovery_cancelled.set()
-                if not self.ignore_recovery_cancellation:
-                    raise
-                await self.recovery_gate.wait()
+            remaining = self.ignore_recovery_cancellation_count
+            if self.ignore_recovery_cancellation and remaining == 0:
+                remaining = 1
+            while not self.recovery_gate.is_set():
+                try:
+                    await self.recovery_gate.wait()
+                except asyncio.CancelledError:
+                    self.recovery_cancellations += 1
+                    self.recovery_cancelled.set()
+                    if remaining == 0:
+                        raise
+                    remaining -= 1
         return SimpleNamespace(
             order_books=tuple(_book(token_id, generation) for token_id in normalized),
             subscription=subscription,
@@ -177,6 +184,32 @@ class FakeChanges:
 
     async def join(self) -> None:
         await self.joined.wait()
+
+
+class CancelOnReturnChanges(FakeChanges):
+    def __init__(self) -> None:
+        super().__init__()
+        self.outer_task: asyncio.Task[Any] | None = None
+
+    async def get(self) -> MarketChange:
+        change = await super().get()
+        assert self.outer_task is not None
+        asyncio.get_running_loop().call_soon(self.outer_task.cancel)
+        return change
+
+
+class ReturnChangeOnCancellation(FakeChanges):
+    def __init__(self, change: MarketChange) -> None:
+        super().__init__()
+        self.change = change
+        self.get_started = asyncio.Event()
+
+    async def get(self) -> MarketChange:
+        self.get_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return self.change
 
 
 class FakeContextSource:
@@ -213,6 +246,8 @@ class FakeSignals:
     def __init__(self) -> None:
         self.applied: list[tuple[Any, str, int | None]] = []
         self.closed: list[tuple[tuple[str, ...], NotEvaluable]] = []
+        self.close_entered = asyncio.Event()
+        self.close_gate: asyncio.Event | None = None
 
     async def apply(
         self,
@@ -229,6 +264,9 @@ class FakeSignals:
         decision: NotEvaluable,
     ) -> None:
         self.closed.append((token_ids, decision))
+        self.close_entered.set()
+        if self.close_gate is not None:
+            await self.close_gate.wait()
 
 
 def _watch(
@@ -343,6 +381,54 @@ async def test_acquired_change_is_acknowledged_once_when_reader_cleanup_is_cance
     with pytest.raises(asyncio.CancelledError):
         await running
     assert subscription.reader_finished.is_set()
+    assert changes.done == 1
+    await asyncio.wait_for(changes.join(), timeout=0.1)
+
+
+async def test_change_result_is_claimed_when_outer_wait_is_simultaneously_cancelled() -> None:
+    # Catches a completed get result bypassing acknowledgement via wait cancellation.
+    changes = CancelOnReturnChanges()
+    catalog = FakeCatalog(_catalog(first_active=False))
+    watch, _, _, _, _, _ = _watch(catalog=catalog, changes=changes)
+    running = asyncio.create_task(watch.run())
+    changes.outer_task = running
+    await changes.items.put(
+        MarketChange(
+            change_id="simultaneous-cancel",
+            change_type=MarketChangeType.MARKET_UPDATED,
+            event_id="event-1",
+            market_id="market-1",
+            token_ids=("token-1", "token-2"),
+            occurred_at=200,
+        )
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    assert changes.done == 1
+    await asyncio.wait_for(changes.join(), timeout=0.1)
+
+
+async def test_change_returned_during_stop_reader_drain_is_claimed_once() -> None:
+    # Catches get producing its owned item while stop cancels pending readers.
+    change = MarketChange(
+        change_id="return-during-drain",
+        change_type=MarketChangeType.MARKET_UPDATED,
+        event_id="event-1",
+        market_id="market-1",
+        token_ids=("token-1", "token-2"),
+        occurred_at=200,
+    )
+    changes = ReturnChangeOnCancellation(change)
+    catalog = FakeCatalog(_catalog(first_active=False))
+    watch, _, _, _, _, _ = _watch(catalog=catalog, changes=changes)
+    running = asyncio.create_task(watch.run())
+    await changes.get_started.wait()
+
+    await watch.close()
+    await running
+
     assert changes.done == 1
     await asyncio.wait_for(changes.join(), timeout=0.1)
 
@@ -629,6 +715,93 @@ async def test_cancelled_recovery_handler_closes_noncooperative_late_session() -
     await watch.close()
 
 
+async def test_close_during_signal_closure_forbids_late_rotation_recovery() -> None:
+    # Catches rotation starting recovery after close cleanup already observed none.
+    gateway = FakeGateway()
+    catalog = FakeCatalog(_catalog())
+    signals = FakeSignals()
+    signals.close_gate = asyncio.Event()
+    watch, _, _, _, _, _ = _watch(
+        gateway=gateway,
+        catalog=catalog,
+        signals=signals,
+    )
+    await watch.start()
+    catalog.snapshot = _catalog(second_market=True)
+    gateway.recovery_gate = asyncio.Event()
+    rotating = asyncio.create_task(
+        watch.handle_market_change(
+            MarketChange(
+                change_id="late-rotation",
+                change_type=MarketChangeType.MARKET_ADDED,
+                event_id="event-1",
+                market_id="market-2",
+                token_ids=("token-3", "token-4"),
+                occurred_at=200,
+            )
+        )
+    )
+    await signals.close_entered.wait()
+
+    closing = asyncio.create_task(watch.close())
+    await asyncio.sleep(0)
+    signals.close_gate.set()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if rotating.done() or len(gateway.subscriptions) > 1:
+            break
+    late_recovery_started = len(gateway.subscriptions) > 1
+    gateway.recovery_gate.set()
+    await rotating
+    await closing
+
+    assert late_recovery_started is False
+    assert len(gateway.subscriptions) == 1
+    assert gateway.subscriptions[0].closed is True
+
+
+async def test_double_cancelled_recovery_drains_and_closes_late_handle() -> None:
+    # Catches a second caller cancellation killing the owned recovery cleanup.
+    gateway = FakeGateway()
+    watch, _, _, _, _, _ = _watch(gateway=gateway)
+    await watch.start()
+    gateway.recovery_gate = asyncio.Event()
+    gateway.ignore_recovery_cancellation_count = 2
+    recovering = asyncio.create_task(
+        watch.handle_stream_message(
+            MarketStreamInvalidated(
+                reason="connection_lost",
+                token_ids=("token-1", "token-2"),
+                received_timestamp=120,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if len(gateway.subscriptions) == 2:
+            break
+
+    recovering.cancel()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if gateway.recovery_cancellations == 1:
+            break
+    recovering.cancel()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if gateway.recovery_cancellations == 2:
+            break
+    gateway.recovery_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await recovering
+
+    assert gateway.recovery_cancellations == 1
+    assert gateway.subscriptions[1].closed is True
+    await watch.close()
+
+
 async def test_price_change_uses_local_arrival_sequence_and_evaluates_changed_token() -> None:
     # Catches valid canonical deltas failing to reach affected strategy routing.
     watch, _, _, _, strategy, _ = _watch()
@@ -665,7 +838,15 @@ async def test_price_change_uses_local_arrival_sequence_and_evaluates_changed_to
 
 @pytest.mark.parametrize(
     "timestamp",
-    [None, "malformed", "2026-08-01T00:00:00", -1, 253_402_300_800_000],
+    [
+        None,
+        "malformed",
+        "2026-08-01T00:00:00",
+        "0001-01-01T00:00:00+14:00",
+        "9999-12-31T23:59:59.999-14:00",
+        -1,
+        253_402_300_800_000,
+    ],
 )
 async def test_invalid_exchange_timestamp_fails_closed_without_received_fallback(
     timestamp: object,

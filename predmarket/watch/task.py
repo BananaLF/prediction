@@ -32,6 +32,9 @@ from predmarket.watch.cache import (
 )
 
 
+_NO_CHANGE = object()
+
+
 class _Gateway(Protocol):
     async def recover_market_session(
         self,
@@ -177,14 +180,19 @@ class WatchTask:
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                 except BaseException:
-                    await _cancel_and_drain(tasks)
+                    try:
+                        await _cancel_and_drain(tasks)
+                    finally:
+                        claimed = _claim_completed_change(change_task)
+                        if claimed is not _NO_CHANGE:
+                            self._changes.task_done()
                     raise
 
-                change: MarketChange | None = None
-                if change_task in done:
-                    change = change_task.result()
+                change: object = _claim_completed_change(change_task)
                 try:
                     await _cancel_and_drain(pending)
+                    if change is _NO_CHANGE:
+                        change = _claim_completed_change(change_task)
                     if stop_task in done or self._closed:
                         continue
 
@@ -202,10 +210,10 @@ class WatchTask:
                                 mapping_version="watch-synthetic-v1",
                             )
                         await self.handle_stream_message(message)
-                    if change is not None:
+                    if change is not _NO_CHANGE:
                         await self.handle_market_change(change)
                 finally:
-                    if change is not None:
+                    if change is not _NO_CHANGE:
                         self._changes.task_done()
         finally:
             await self.close()
@@ -313,8 +321,21 @@ class WatchTask:
         if recovery is not None and not recovery.done():
             recovery.cancel()
         if recovery is not None:
-            await asyncio.gather(recovery, return_exceptions=True)
+            try:
+                await _drain_owned_recovery(recovery)
+            except BaseException:
+                pass
         async with self._operation_lock:
+            # _recover() cannot register after the monotonic stop gate. Holding
+            # operation ownership here proves no handler/session is still in
+            # the install window.
+            recovery = self._recovery_task
+            if recovery is not None and not recovery.done():
+                recovery.cancel()
+                try:
+                    await _drain_owned_recovery(recovery)
+                except BaseException:
+                    pass
             subscription, self._subscription = self._subscription, None
             if subscription is not None:
                 await _close_owned(subscription)
@@ -412,6 +433,8 @@ class WatchTask:
             await self._recover(token_ids)
 
     async def _recover(self, token_ids: tuple[str, ...]) -> None:
+        if self._closed or self._stop_event.is_set():
+            return
         session: Any | None = None
         recovery = asyncio.create_task(
             self._gateway.recover_market_session(token_ids),
@@ -420,25 +443,30 @@ class WatchTask:
         self._recovery_task = recovery
         try:
             try:
-                session = await recovery
-            except asyncio.CancelledError:
-                if self._closed and (
-                    asyncio.current_task() is None
-                    or asyncio.current_task().cancelling() == 0
-                ):
+                session = await asyncio.shield(recovery)
+            except asyncio.CancelledError as cancellation:
+                current = asyncio.current_task()
+                caller_cancelled = current is not None and current.cancelling() > 0
+                if not recovery.done():
+                    recovery.cancel()
+                try:
+                    late_session = await _drain_owned_recovery(recovery)
+                except BaseException:
+                    if caller_cancelled:
+                        raise cancellation
+                    if self._closed or self._stop_event.is_set():
+                        return
+                    raise
+                if late_session is not None:
+                    await _close_owned(late_session.subscription)
+                if caller_cancelled:
+                    raise cancellation
+                if self._closed or self._stop_event.is_set():
                     return
-                recovery.cancel()
-                await asyncio.gather(recovery, return_exceptions=True)
                 raise
-            finally:
-                if self._recovery_task is recovery:
-                    self._recovery_task = None
-            current = asyncio.current_task()
-            if current is not None and current.cancelling() > 0:
+            if self._closed or self._stop_event.is_set():
                 await _close_owned(session.subscription)
-                raise asyncio.CancelledError
-            if self._closed:
-                await _close_owned(session.subscription)
+                session = None
                 return
             generation = session.subscription_generation
             if type(generation) is not int or generation <= self._cache.generation:
@@ -451,7 +479,10 @@ class WatchTask:
             if session is not None:
                 await _close_owned(session.subscription)
             raise
-        if self._closed:
+        finally:
+            if self._recovery_task is recovery:
+                self._recovery_task = None
+        if self._closed or self._stop_event.is_set():
             await self._close_current_subscription()
             return
         await self._evaluate_tokens(token_ids)
@@ -565,23 +596,56 @@ def _timestamp_ms(value: object) -> int:
             raise ValueError("exchange timestamp is out of range")
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
+        except (ValueError, OverflowError, OSError):
             raise ValueError("exchange timestamp is malformed") from None
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise ValueError("exchange timestamp must contain an explicit offset")
-        if parsed.microsecond % 1000:
-            raise ValueError("exchange timestamp must have millisecond precision")
-        epoch = datetime(1970, 1, 1, tzinfo=UTC)
-        delta = parsed.astimezone(UTC) - epoch
-        milliseconds = (
-            delta.days * 86_400_000
-            + delta.seconds * 1000
-            + delta.microseconds // 1000
-        )
+        try:
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError(
+                    "exchange timestamp must contain an explicit offset"
+                )
+            if parsed.microsecond % 1000:
+                raise ValueError(
+                    "exchange timestamp must have millisecond precision"
+                )
+            epoch = datetime(1970, 1, 1, tzinfo=UTC)
+            delta = parsed.astimezone(UTC) - epoch
+            milliseconds = (
+                delta.days * 86_400_000
+                + delta.seconds * 1000
+                + delta.microseconds // 1000
+            )
+        except (OverflowError, OSError):
+            raise ValueError("exchange timestamp is out of range") from None
         if 0 <= milliseconds <= maximum:
             return milliseconds
         raise ValueError("exchange timestamp is out of range")
     raise ValueError("exchange timestamp is missing or has an invalid type")
+
+
+def _claim_completed_change(task: asyncio.Task[Any]) -> object:
+    """Claim a successfully returned queue item without an intervening await."""
+
+    if not task.done() or task.cancelled():
+        return _NO_CHANGE
+    if task.exception() is not None:
+        return _NO_CHANGE
+    return task.result()
+
+
+async def _drain_owned_recovery(task: asyncio.Task[Any]) -> Any | None:
+    """Repeated caller cancellation cannot kill or orphan gateway cleanup."""
+
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    if task.cancelled():
+        return None
+    exception = task.exception()
+    if exception is not None:
+        raise exception
+    return task.result()
 
 
 async def _close_owned(subscription: Any) -> None:
