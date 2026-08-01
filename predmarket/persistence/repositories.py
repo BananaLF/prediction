@@ -162,50 +162,108 @@ class RelationRepository:
         self._writer = writer
 
     async def save(self, relation: Relation) -> None:
+        """Persist a newly discovered, unreviewed relation.
+
+        Repeated discovery is idempotent and can never regress an analyzed or
+        manually approved row. LLM analysis has a separate write boundary;
+        manual approval belongs to the independent relations CLI.
+        """
+
         _require_type(relation, Relation, "relation")
+        if relation.status is not RelationStatus.NO_LLM_APPROVE:
+            raise ValueError("discovered relation status must be NO_LLM_APPROVE")
+        if relation.llm_confidence is not None or relation.llm_analysis is not None:
+            raise ValueError("discovered relation must not contain LLM analysis")
 
         async def command(connection: aiosqlite.Connection) -> None:
+            await connection.execute(
+                """
+                INSERT INTO relations (
+                    id, market_a_id, market_b_id, status, discovery_source,
+                    llm_confidence, llm_analysis_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(market_a_id, market_b_id) DO NOTHING
+                """,
+                _relation_values(relation),
+            )
             cursor = await connection.execute(
-                "SELECT status FROM relations WHERE id = ?",
+                """
+                SELECT market_a_id, market_b_id
+                FROM relations WHERE id = ?
+                """,
                 (relation.id,),
             )
             row = await cursor.fetchone()
-            previous = None if row is None else RelationStatus(row[0])
-            if (
-                previous is None
-                and relation.status is not RelationStatus.NO_LLM_APPROVE
+            if row is None or (row[0], row[1]) != (
+                relation.market_a_id,
+                relation.market_b_id,
             ):
-                raise ValueError(
-                    "initial relation status must be NO_LLM_APPROVE"
-                )
+                raise ValueError("relation ID conflicts with another implication")
+
+        await self._writer.execute(command)
+
+    async def save_analysis(self, relation: Relation) -> None:
+        """Persist one analyzer result without crossing the manual gate."""
+
+        _require_type(relation, Relation, "relation")
+        if relation.status not in {
+            RelationStatus.NO_LLM_APPROVE,
+            RelationStatus.LLM_APPROVE,
+        }:
+            raise ValueError("analysis cannot set relation status APPROVED")
+        if relation.llm_confidence is None or relation.llm_analysis is None:
+            raise ValueError("analysis result is required")
+        approved = relation.llm_analysis.get("approved")
+        if type(approved) is not bool:
+            raise ValueError("analysis approved decision must be a boolean")
+        expected_status = (
+            RelationStatus.LLM_APPROVE
+            if approved
+            else RelationStatus.NO_LLM_APPROVE
+        )
+        if relation.status is not expected_status:
+            raise ValueError("analysis decision does not match relation status")
+
+        async def command(connection: aiosqlite.Connection) -> None:
+            cursor = await connection.execute(
+                """
+                SELECT market_a_id, market_b_id, status, discovery_source,
+                       created_at, updated_at
+                FROM relations WHERE id = ?
+                """,
+                (relation.id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise ValueError(f"relation {relation.id!r} does not exist")
+            if RelationStatus(row[2]) is not RelationStatus.NO_LLM_APPROVE:
+                raise ValueError("analysis requires relation status NO_LLM_APPROVE")
             if (
-                previous is not None
-                and relation.status
-                not in {previous, _next_relation_status(previous)}
+                row[0] != relation.market_a_id
+                or row[1] != relation.market_b_id
+                or DiscoverySource(row[3]) is not relation.discovery_source
+                or row[4] != relation.created_at
             ):
-                raise ValueError(
-                    f"invalid persisted relation transition: "
-                    f"{previous.value} -> {relation.status.value}"
-                )
-            await connection.execute(_UPSERT_RELATION, _relation_values(relation))
-            if (
-                previous is RelationStatus.LLM_APPROVE
-                and relation.status is RelationStatus.APPROVED
-            ):
-                await connection.execute(
-                    """
-                    INSERT INTO system_events (
-                        component, severity, event_type, message,
-                        details_json, occurred_at
-                    ) VALUES ('STRATEGY', 'INFO', 'RELATION_ACTIVATED', ?,
-                              ?, ?)
-                    """,
-                    (
-                        f"Relation {relation.id} activated",
-                        _encode_json_object({"relation_id": relation.id}),
-                        relation.updated_at,
-                    ),
-                )
+                raise ValueError("analysis cannot change relation identity")
+            if relation.updated_at < row[5]:
+                raise ValueError("analysis updated_at must not move backwards")
+            updated = await connection.execute(
+                """
+                UPDATE relations
+                SET status = ?, llm_confidence = ?, llm_analysis_json = ?,
+                    updated_at = ?
+                WHERE id = ? AND status = 'NO_LLM_APPROVE'
+                """,
+                (
+                    relation.status.value,
+                    encode_decimal(relation.llm_confidence),
+                    _encode_json_object(relation.llm_analysis),
+                    relation.updated_at,
+                    relation.id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("relation changed concurrently during analysis")
 
         await self._writer.execute(command)
 
@@ -720,22 +778,6 @@ ON CONFLICT(id) DO UPDATE SET
     updated_at = excluded.updated_at
 """
 
-_UPSERT_RELATION = """
-INSERT INTO relations (
-    id, market_a_id, market_b_id, status, discovery_source,
-    llm_confidence, llm_analysis_json, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-    market_a_id = excluded.market_a_id,
-    market_b_id = excluded.market_b_id,
-    status = excluded.status,
-    discovery_source = excluded.discovery_source,
-    llm_confidence = excluded.llm_confidence,
-    llm_analysis_json = excluded.llm_analysis_json,
-    updated_at = excluded.updated_at
-"""
-
-
 def _event_values(event: Event) -> tuple[Any, ...]:
     return (
         event.id,
@@ -1014,13 +1056,6 @@ def _typed_tuple(
 def _require_type(value: Any, item_type: type[Any], field_name: str) -> None:
     if not isinstance(value, item_type):
         raise ValueError(f"{field_name} must be a {item_type.__name__}")
-
-
-def _next_relation_status(status: RelationStatus) -> RelationStatus | None:
-    return {
-        RelationStatus.NO_LLM_APPROVE: RelationStatus.LLM_APPROVE,
-        RelationStatus.LLM_APPROVE: RelationStatus.APPROVED,
-    }.get(status)
 
 
 async def _validate_event_markets(

@@ -490,7 +490,7 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
             RelationStatus.LLM_APPROVE,
             RelationStatus.APPROVED,
         ):
-            with pytest.raises(ValueError, match="initial"):
+            with pytest.raises(ValueError, match="NO_LLM_APPROVE"):
                 await relations.save(
                     Relation(
                         id=f"relation-bad-{invalid_initial_status.value}",
@@ -506,12 +506,23 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
             RelationStatus.LLM_APPROVE,
             updated_at=3,
         )
+        llm_approved = replace(
+            llm_approved,
+            llm_confidence=Decimal("0.8"),
+            llm_analysis={
+                "approved": True,
+                "reasoning": "fixture",
+                "warnings": (),
+            },
+        )
         approved = llm_approved.transition_to(
             RelationStatus.APPROVED,
             updated_at=4,
         )
-        await relations.save(llm_approved)
-        await relations.save(approved)
+        await relations.save_analysis(llm_approved)
+        await relations.save(relation)
+        with pytest.raises(ValueError, match="NO_LLM_APPROVE"):
+            await relations.save(approved)
         stored_market = await catalog.get_market("market-1")
         stored_relation = await relations.get("relation-1")
         activation_events = await system_events.read_after(0)
@@ -519,14 +530,8 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
         await writer.close()
 
     assert stored_market == market
-    assert stored_relation == approved
-    assert tuple(
-        (
-            event["event_type"],
-            event["details"],
-        )
-        for event in activation_events
-    ) == (("RELATION_ACTIVATED", {"relation_id": "relation-1"}),)
+    assert stored_relation == llm_approved
+    assert activation_events == ()
     with sqlite3.connect(database_path) as connection:
         encoded = connection.execute(
             "SELECT market_ids_json, neg_risk_metadata_json FROM events"
