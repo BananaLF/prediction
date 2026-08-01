@@ -39,16 +39,21 @@ other file and cannot accept a wildcard or directory target.
 `--execute` is executable.  It fixes and rechecks the parent directory by
 device/inode and `O_DIRECTORY | O_NOFOLLOW`, takes non-blocking exclusive
 advisory locks on that directory and every opened regular target, compares each
-target's planned device/inode, then deletes only verified exact basenames using
-the parent descriptor.  A target that changed since planning, or is symlinked
-or non-regular, causes refusal before deletion.
+target's planned device/inode before it begins any deletion, then deletes only
+verified exact basenames using the parent descriptor.  A target that changed
+since planning, or is symlinked or non-regular, causes refusal before deletion.
+The three sibling deletions are not a filesystem transaction: if an unlink
+fails after an earlier deletion, the helper exits with `reset partially
+completed`, listing the deleted paths and the failed path.
 
 Darwin/POSIX does not expose an unlink primitive bound atomically to an opened
 inode.  The locks serialize cooperating operators, and the owner-only directory
 requirement excludes other users, but an adversarial same-UID process that
 ignores advisory locks can still replace a basename after final verification.
 Do not use this operator procedure in that threat model; see `SECURITY.md` for
-the full boundary.  Never substitute shell deletion.
+the full boundary.  The helper also requires POSIX `O_DIRECTORY`, `O_NOFOLLOW`,
+and `fcntl.flock`; platforms without them refuse before changing files.  Never
+substitute shell deletion.
 
 ## Signal semantics
 

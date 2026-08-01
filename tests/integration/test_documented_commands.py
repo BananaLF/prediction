@@ -98,6 +98,38 @@ def test_documented_reset_helper_deletes_exact_temporary_sqlite_files(
     assert all(not path.exists() for path in siblings)
 
 
+def test_reset_helper_reports_paths_deleted_before_an_unlink_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "reset.sqlite3"
+    siblings = (database, Path(f"{database}-wal"), Path(f"{database}-shm"))
+    for path in siblings:
+        path.write_text("test database content")
+    plan = prepare_reset(_reset_config(tmp_path, database))
+    original_unlink = os.unlink
+
+    def fail_on_wal(name: str, *, dir_fd: int | None = None) -> None:
+        if name == siblings[1].name:
+            raise PermissionError("simulated WAL unlink failure")
+        original_unlink(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr("predmarket.operator_reset.os.unlink", fail_on_wal)
+
+    with pytest.raises(
+        ResetRefused,
+        match=(
+            rf"reset partially completed; deleted: {re.escape(str(database))}; "
+            rf"failed: {re.escape(str(siblings[1]))}"
+        ),
+    ):
+        execute_reset(plan, running_processes=())
+
+    assert not database.exists()
+    assert siblings[1].exists()
+    assert siblings[2].exists()
+
+
 def test_documented_reset_script_executes_only_in_a_temporary_directory(
     tmp_path: Path,
 ) -> None:
@@ -185,6 +217,21 @@ def test_reset_helper_preserves_target_replaced_after_reset_plan(tmp_path: Path)
     assert database.read_text() == "replacement must survive"
 
 
+def test_reset_helper_refuses_when_advisory_locks_are_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "reset.sqlite3"
+    database.write_text("validated database")
+    plan = prepare_reset(_reset_config(tmp_path, database))
+    monkeypatch.setattr("predmarket.operator_reset.fcntl", None)
+
+    with pytest.raises(ResetRefused, match="advisory locks"):
+        execute_reset(plan, running_processes=())
+
+    assert database.exists()
+
+
 def test_reset_helper_detects_a_running_predmarket_process(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "predmarket.operator_reset.subprocess.run",
@@ -219,9 +266,10 @@ def test_reset_helper_detects_console_script_but_not_ordinary_predmarket_names(
                     "4248 tool --mode -m predmarket\n"
                     "4249 python --mode -m predmarket\n"
                     "4250 /tmp/predmarket-notes.txt\n"
+                    "4251 python --check-hash-based-pycs always -m predmarket run\n"
                 ),
             )
         ),
     )
 
-    assert running_predmarket_processes() == (4242, 4243, 4244, 4245)
+    assert running_predmarket_processes() == (4242, 4243, 4244, 4245, 4251)

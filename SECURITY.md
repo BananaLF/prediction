@@ -37,10 +37,13 @@ directory or wildcard target.
 The reset plan records the parent directory device/inode and the initial
 device/inode of each exact target.  Execution reopens the parent by descriptor
 with `O_DIRECTORY | O_NOFOLLOW`, takes non-blocking exclusive advisory locks on
-that directory and each opened regular target, rechecks the identities, and
-unlinks only exact basenames through the verified parent descriptor.  This
-prevents path drift, parent-directory replacement, symlinks, and changes made
-before execution.
+that directory and each opened regular target, and rechecks every identity
+before it starts any unlink.  It then unlinks only exact basenames through the
+verified parent descriptor.  This prevents path drift, parent-directory
+replacement, symlinks, and changes made before execution.  SQLite sibling
+deletion is not one filesystem transaction: if an unlink fails after an earlier
+unlink, the helper exits with `reset partially completed`, listing every deleted
+path and the path whose unlink failed.
 
 Darwin/POSIX has no supported unlink-by-file-descriptor operation that can
 atomically bind the final unlink to a checked inode.  The procedure therefore
@@ -49,3 +52,6 @@ exact target in the narrow interval between final verification and unlink.  It
 is not safe for a shared or adversarial same-account directory; use an
 owner-only database directory, stop Predmarket, and do not run another local
 tool that mutates those three names during reset.
+
+The helper requires POSIX `O_DIRECTORY`, `O_NOFOLLOW`, and `fcntl.flock`.
+Platforms that cannot provide them refuse the reset before deleting files.

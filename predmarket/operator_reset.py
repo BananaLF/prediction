@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import fcntl
 import os
 from pathlib import Path
 import re
 import shlex
 import stat
 import subprocess
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised by the fail-closed lock guard.
+    fcntl = None
 
 from predmarket.config import AppConfig
 
@@ -130,13 +134,22 @@ def execute_reset(plan: ResetPlan, *, running_processes: tuple[int, ...] | None 
 
     parent_fd = _open_verified_parent(plan)
     target_descriptors: tuple[tuple[str, int] | None, ...] = ()
+    deleted_targets: list[Path] = []
     try:
         _lock_parent_directory(parent_fd)
         target_descriptors = _verified_target_descriptors(plan, parent_fd)
-        for descriptor in target_descriptors:
+        for target, descriptor in zip(plan.targets, target_descriptors, strict=True):
             if descriptor is not None:
                 name, _ = descriptor
-                os.unlink(name, dir_fd=parent_fd)
+                try:
+                    os.unlink(name, dir_fd=parent_fd)
+                except OSError as error:
+                    deleted = ", ".join(str(path) for path in deleted_targets) or "none"
+                    raise ResetRefused(
+                        "reset partially completed; "
+                        f"deleted: {deleted}; failed: {target}"
+                    ) from error
+                deleted_targets.append(target)
         return tuple(
             target
             for target, descriptor in zip(plan.targets, target_descriptors, strict=True)
@@ -175,6 +188,8 @@ def _open_verified_parent(plan: ResetPlan) -> int:
 
 def _lock_parent_directory(parent_fd: int) -> None:
     """Serialize cooperating reset operators on the verified directory inode."""
+    if fcntl is None:
+        raise ResetRefused("platform cannot provide reset advisory locks")
     try:
         fcntl.flock(parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as error:
@@ -259,6 +274,9 @@ def _open_target(
 
 
 def _lock_target_file(target_fd: int) -> None:
+    if fcntl is None:
+        os.close(target_fd)
+        raise ResetRefused("platform cannot provide reset advisory locks")
     try:
         fcntl.flock(target_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as error:
@@ -303,7 +321,9 @@ def _has_predmarket_module_entry(arguments: list[str]) -> bool:
             return False
         if argument == "-c" or argument.startswith("-c"):
             return False
-        if argument in {"-W", "-X"}:
+        if argument in {"-W", "-X", "--check-hash-based-pycs"}:
+            if index + 1 >= len(arguments):
+                return False
             index += 2
             continue
         if argument.startswith("-W") or argument.startswith("-X"):

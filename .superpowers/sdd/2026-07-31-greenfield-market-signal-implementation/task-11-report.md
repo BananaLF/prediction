@@ -41,6 +41,16 @@
   operators.  A target replaced after planning is refused before deletion.
   Python option parsing recognizes the supported pre-`-m` options while still
   rejecting pytest, another Python module, and non-Python commands.
+- **RED (review remediation round 4):** an unlink failure after an earlier
+  sibling deletion was reported only as a generic refusal.  The argv parser
+  also skipped the valid Python option `--check-hash-based-pycs always`, and a
+  non-POSIX import failed before reset could refuse safely.
+- **GREEN (review remediation round 4):** reset completes descriptor, identity,
+  and advisory-lock preflight for every target before its first unlink.  A
+  monkeypatched second unlink failure now reports the already deleted exact
+  path and the failed path.  The parser consumes `--check-hash-based-pycs` and
+  its value before locating the first `-m`; unavailable advisory locks produce
+  a controlled `ResetRefused`.
 
 ## Changes
 
@@ -65,7 +75,12 @@
   hostile-same-UID replacement race remains a documented platform boundary.
 - Extended active-process detection to parse argv and recognize both the
   `predmarket` console script (including `/venv/bin/predmarket`) and a Python
-  interpreter with supported Python options before `-m predmarket`.
+  interpreter with supported Python options (including
+  `--check-hash-based-pycs VALUE`) before `-m predmarket`.
+- Reset now reports partial filesystem deletion truthfully: all three targets
+  are preflighted before unlinking, and an unlink failure identifies both the
+  exact targets already deleted and the target that failed.  `fcntl` is an
+  optional import; a platform without advisory locks refuses before deletion.
 - Clarified `README.md`: `relations list` and `relations show` are local
   read-only operations; `relations analyze` updates only a relationship, while
   `relations approve` updates it and records `RELATION_ACTIVATED`. Polymarket
@@ -77,8 +92,8 @@
 
 | Command | Result |
 | --- | --- |
-| `pytest -q tests/integration/test_documented_commands.py` | Passed after round-3 remediation: `10 passed, 1 warning in 0.69s`. |
-| `pytest -q tests/integration/test_documented_commands.py -k reset` | Passed: `8 passed, 2 deselected, 1 warning in 0.60s`. |
+| `pytest -q tests/integration/test_documented_commands.py` | Passed after round-4 remediation: `12 passed, 1 warning in 0.74s`. |
+| `pytest -q tests/integration/test_documented_commands.py -k reset` | Passed: `10 passed, 2 deselected, 1 warning in 0.63s`. |
 | `pytest -q` | Collection failed with 5 errors in `0.26s` because the optional `polymarket` package is absent: `ModuleNotFoundError: No module named 'polymarket'` in SDK, watch, catalog-sync, and gateway tests. No dependency boundary was changed. |
 | `python -m predmarket --help` | Passed (exit 0); showed `run`, `status`, `signals`, and `relations`. |
 | `python -m predmarket status --config config/default.yaml` | Failed: `sqlite3.OperationalError: unable to open database file`; `config/default.yaml` points to the absent `data/predmarket-v1.sqlite3`. No default user database was created for verification. |
@@ -101,3 +116,5 @@
   path drift, symlinks, parent replacement, and cooperative concurrency, but
   not a hostile same-UID process that races an exact basename after final
   verification while disregarding advisory locks.
+- On platforms without `fcntl.flock`, importing the helper still succeeds but
+  reset fails closed before any target can be unlinked.
