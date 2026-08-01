@@ -35,16 +35,21 @@ from predmarket.watch.cache import (
 _NO_CHANGE = object()
 
 
+class WatchCleanupError(RuntimeError):
+    """An owned watcher resource could not reach a confirmed closed state."""
+
+
 @dataclass(frozen=True, slots=True)
 class _RecoveryCleanupResult:
     cancelled: bool = False
-    error: BaseException | None = None
+    error: Exception | None = None
 
 
 @dataclass(slots=True)
 class _OwnedRecovery:
     target: asyncio.Task[Any]
     cleanup_task: asyncio.Task[_RecoveryCleanupResult] | None = None
+    pending_subscription: Any | None = None
 
 
 class _Gateway(Protocol):
@@ -327,23 +332,50 @@ class WatchTask:
         self._closed = True
         self._stop_event.set()
         if self._close_task is None:
+            owner = self._recovery_owner
+            if owner is not None:
+                _prepare_recovery_cleanup_retry(owner)
             self._close_task = asyncio.create_task(self._finish_close())
-        await _await_owned_task(self._close_task)
+        close_task = self._close_task
+        try:
+            await _await_owned_task(close_task)
+        except Exception:
+            if self._close_task is close_task:
+                self._close_task = None
+            raise
 
     async def _finish_close(self) -> None:
+        cleanup_error: Exception | None = None
         owner = self._recovery_owner
         if owner is not None:
-            await _wait_recovery_cleanup(_ensure_recovery_cleanup(owner))
+            terminal = await _wait_recovery_cleanup(_ensure_recovery_cleanup(owner))
+            cleanup_error = terminal.error
         async with self._operation_lock:
             # _recover() cannot register after the monotonic stop gate. Holding
             # operation ownership here proves no handler/session is still in
             # the install window.
             owner = self._recovery_owner
             if owner is not None:
-                await _wait_recovery_cleanup(_ensure_recovery_cleanup(owner))
-            subscription, self._subscription = self._subscription, None
+                terminal = await _wait_recovery_cleanup(
+                    _ensure_recovery_cleanup(owner)
+                )
+                if cleanup_error is None:
+                    cleanup_error = terminal.error
+                if terminal.error is None and owner.pending_subscription is None:
+                    if self._recovery_owner is owner:
+                        self._recovery_owner = None
+            subscription = self._subscription
             if subscription is not None:
-                await _close_owned(subscription)
+                try:
+                    await _close_owned(subscription)
+                except Exception as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                else:
+                    if self._subscription is subscription:
+                        self._subscription = None
+        if cleanup_error is not None:
+            raise cleanup_error
 
     async def _apply_price_change(self, message: MarketStreamEvent) -> None:
         raw_changes = message.payload.get("price_changes")
@@ -459,18 +491,18 @@ class WatchTask:
                 )
                 if caller_cancelled:
                     raise cancellation
-                if self._closed or self._stop_event.is_set():
-                    return
                 if terminal.error is not None:
                     raise terminal.error
+                if self._closed or self._stop_event.is_set():
+                    return
                 raise
             if owner.cleanup_task is not None:
                 terminal = await _wait_recovery_cleanup(owner.cleanup_task)
                 session = None
-                if self._closed or self._stop_event.is_set():
-                    return
                 if terminal.error is not None:
                     raise terminal.error
+                if self._closed or self._stop_event.is_set():
+                    return
                 raise asyncio.CancelledError
             if self._closed or self._stop_event.is_set():
                 await _close_owned(session.subscription)
@@ -488,7 +520,10 @@ class WatchTask:
                 await _close_owned(session.subscription)
             raise
         finally:
-            if self._recovery_owner is owner:
+            if (
+                self._recovery_owner is owner
+                and owner.pending_subscription is None
+            ):
                 self._recovery_owner = None
         if self._closed or self._stop_event.is_set():
             await self._close_current_subscription()
@@ -647,32 +682,54 @@ def _ensure_recovery_cleanup(
 
     if owner.cleanup_task is None:
         owner.cleanup_task = asyncio.create_task(
-            _finish_recovery_cleanup(owner.target),
+            _finish_recovery_cleanup(owner),
             name="watch:cleanup-recovery",
         )
     return owner.cleanup_task
 
 
+def _prepare_recovery_cleanup_retry(owner: _OwnedRecovery) -> None:
+    """Allow a new close call to retry one retained, unclosed SDK handle."""
+
+    cleanup = owner.cleanup_task
+    if cleanup is None or not cleanup.done() or cleanup.cancelled():
+        return
+    terminal = cleanup.result()
+    if terminal.error is not None and owner.pending_subscription is not None:
+        owner.cleanup_task = None
+
+
 async def _finish_recovery_cleanup(
-    target: asyncio.Task[Any],
+    owner: _OwnedRecovery,
 ) -> _RecoveryCleanupResult:
-    if not target.done():
-        target.cancel()
-    while not target.done():
-        try:
-            await asyncio.shield(target)
-        except asyncio.CancelledError:
-            continue
-    if target.cancelled():
-        return _RecoveryCleanupResult(cancelled=True)
-    exception = target.exception()
-    if exception is not None:
-        return _RecoveryCleanupResult(error=exception)
-    session = target.result()
+    target = owner.target
+    if owner.pending_subscription is None:
+        if not target.done():
+            target.cancel()
+        while not target.done():
+            try:
+                await asyncio.shield(target)
+            except asyncio.CancelledError:
+                continue
+        if target.cancelled():
+            return _RecoveryCleanupResult(cancelled=True)
+        exception = target.exception()
+        if exception is not None:
+            if isinstance(exception, Exception):
+                return _RecoveryCleanupResult(error=exception)
+            return _RecoveryCleanupResult(
+                error=WatchCleanupError(
+                    f"gateway recovery cleanup failed: {type(exception).__name__}"
+                )
+            )
+        session = target.result()
+        owner.pending_subscription = session.subscription
+    subscription = owner.pending_subscription
     try:
-        await _close_owned(session.subscription)
-    except BaseException as error:
+        await _close_owned(subscription)
+    except Exception as error:
         return _RecoveryCleanupResult(error=error)
+    owner.pending_subscription = None
     return _RecoveryCleanupResult()
 
 
@@ -698,7 +755,13 @@ async def _close_owned(subscription: Any) -> None:
     except asyncio.CancelledError as cancellation:
         current = asyncio.current_task()
         if current is None or current.cancelling() == 0:
-            return task.result()
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            raise WatchCleanupError(
+                "SDK subscription cleanup cancelled internally"
+            ) from None
         while not task.done():
             try:
                 await asyncio.shield(task)
@@ -708,7 +771,7 @@ async def _close_owned(subscription: Any) -> None:
                 break
         try:
             task.result()
-        except asyncio.CancelledError:
+        except BaseException:
             pass
         raise cancellation
 

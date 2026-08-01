@@ -104,6 +104,33 @@ class FakeSubscription:
         self.closed = True
 
 
+class FailOnceCloseSubscription(FakeSubscription):
+    def __init__(self, generation: int) -> None:
+        super().__init__(generation)
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.subscription_generation == 2 and self.close_calls == 1:
+            raise RuntimeError("late close failed")
+        self.closed = True
+
+
+class SelfCancellingCloseSubscription(FakeSubscription):
+    def __init__(self, generation: int) -> None:
+        super().__init__(generation)
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.subscription_generation == 2 and self.close_calls == 1:
+            current = asyncio.current_task()
+            assert current is not None
+            current.cancel()
+            await asyncio.sleep(0)
+        self.closed = True
+
+
 class CancellationDelayedSubscription(FakeSubscription):
     def __init__(self, generation: int) -> None:
         super().__init__(generation)
@@ -927,6 +954,120 @@ async def test_multiple_cancelled_close_waiters_share_one_terminal_cleanup() -> 
 
     assert gateway.recovery_cancellations == 1
     assert gateway.subscriptions[1].closed is True
+
+
+async def test_late_recovery_close_failure_reaches_handler_and_shared_close_waiters_then_retries() -> None:
+    # Catches a failed late-handle close being reported as successful and forgotten.
+    gateway = FakeGateway()
+    gateway.subscription_factory = FailOnceCloseSubscription
+    watch, _, _, _, _, _ = _watch(gateway=gateway)
+    await watch.start()
+    gateway.recovery_gate = asyncio.Event()
+    gateway.ignore_recovery_cancellation_count = 1
+    recovering = asyncio.create_task(
+        watch.handle_stream_message(
+            MarketStreamInvalidated(
+                reason="connection_lost",
+                token_ids=("token-1", "token-2"),
+                received_timestamp=120,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if len(gateway.subscriptions) == 2:
+            break
+
+    first_close = asyncio.create_task(watch.close())
+    second_close = asyncio.create_task(watch.close())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if gateway.recovery_cancellations == 1:
+            break
+    gateway.recovery_gate.set()
+
+    results = await asyncio.gather(
+        recovering,
+        first_close,
+        second_close,
+        return_exceptions=True,
+    )
+    assert [type(result) for result in results] == [RuntimeError] * 3
+    assert [str(result) for result in results] == ["late close failed"] * 3
+    late = gateway.subscriptions[1]
+    assert isinstance(late, FailOnceCloseSubscription)
+    assert late.closed is False
+    assert late.close_calls == 1
+    assert watch._recovery_owner is not None
+
+    await watch.close()
+
+    assert late.closed is True
+    assert late.close_calls == 2
+    assert watch._recovery_owner is None
+    assert gateway.recovery_cancellations == 1
+
+
+async def test_late_recovery_self_cancel_is_normalized_and_retryable() -> None:
+    # Catches an SDK close self-cancellation being cached as caller cancellation.
+    gateway = FakeGateway()
+    gateway.subscription_factory = SelfCancellingCloseSubscription
+    watch, _, _, _, _, _ = _watch(gateway=gateway)
+    await watch.start()
+    gateway.recovery_gate = asyncio.Event()
+    gateway.ignore_recovery_cancellation_count = 1
+    recovering = asyncio.create_task(
+        watch.handle_stream_message(
+            MarketStreamInvalidated(
+                reason="connection_lost",
+                token_ids=("token-1", "token-2"),
+                received_timestamp=120,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if len(gateway.subscriptions) == 2:
+            break
+
+    closing = asyncio.create_task(watch.close())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if gateway.recovery_cancellations == 1:
+            break
+    gateway.recovery_gate.set()
+
+    handler_result, close_result = await asyncio.gather(
+        recovering,
+        closing,
+        return_exceptions=True,
+    )
+    assert isinstance(handler_result, RuntimeError)
+    assert isinstance(close_result, RuntimeError)
+    assert not isinstance(handler_result, asyncio.CancelledError)
+    assert not isinstance(close_result, asyncio.CancelledError)
+    assert str(handler_result) == "SDK subscription cleanup cancelled internally"
+    assert str(close_result) == "SDK subscription cleanup cancelled internally"
+    owner = watch._recovery_owner
+    assert owner is not None
+    assert owner.cleanup_task is not None
+    assert owner.cleanup_task.cancelled() is False
+    assert not isinstance(owner.cleanup_task.result().error, asyncio.CancelledError)
+    late = gateway.subscriptions[1]
+    assert isinstance(late, SelfCancellingCloseSubscription)
+    assert late.closed is False
+    assert late.close_calls == 1
+
+    await watch.close()
+
+    assert late.closed is True
+    assert late.close_calls == 2
+    assert watch._recovery_owner is None
+    assert gateway.recovery_cancellations == 1
 
 
 async def test_price_change_uses_local_arrival_sequence_and_evaluates_changed_token() -> None:
