@@ -15,7 +15,7 @@ from predmarket.domain.signal import DecisionReason, NotEvaluable
 from predmarket.persistence.repositories import CatalogSnapshot
 from predmarket.polymarket.gateway import MarketStreamEvent, MarketStreamInvalidated
 from predmarket.watch.cache import CacheState
-from predmarket.watch.task import EvaluationTarget, WatchTask
+from predmarket.watch.task import EvaluationTarget, WatchTask, _timestamp_ms
 
 
 def _market(market_id: str, event_id: str = "event-1", *, active: bool = True) -> Market:
@@ -104,22 +104,49 @@ class FakeSubscription:
         self.closed = True
 
 
+class CancellationDelayedSubscription(FakeSubscription):
+    def __init__(self, generation: int) -> None:
+        super().__init__(generation)
+        self.read_cancelled = asyncio.Event()
+        self.release_reader = asyncio.Event()
+        self.reader_finished = asyncio.Event()
+
+    async def __anext__(self):
+        try:
+            await self.items.get()
+            raise AssertionError("no stream item expected")
+        except asyncio.CancelledError:
+            self.read_cancelled.set()
+            await self.release_reader.wait()
+            self.reader_finished.set()
+            raise
+
+
 class FakeGateway:
     def __init__(self) -> None:
         self.generations = 0
         self.requests: list[tuple[str, ...]] = []
         self.subscriptions: list[FakeSubscription] = []
         self.recovery_gate: asyncio.Event | None = None
+        self.ignore_recovery_cancellation = False
+        self.recovery_cancelled = asyncio.Event()
+        self.subscription_factory = FakeSubscription
 
     async def recover_market_session(self, token_ids: tuple[str, ...]):
         self.generations += 1
         generation = self.generations
         normalized = tuple(token_ids)
         self.requests.append(normalized)
-        subscription = FakeSubscription(generation)
+        subscription = self.subscription_factory(generation)
         self.subscriptions.append(subscription)
         if self.recovery_gate is not None:
-            await self.recovery_gate.wait()
+            try:
+                await self.recovery_gate.wait()
+            except asyncio.CancelledError:
+                self.recovery_cancelled.set()
+                if not self.ignore_recovery_cancellation:
+                    raise
+                await self.recovery_gate.wait()
         return SimpleNamespace(
             order_books=tuple(_book(token_id, generation) for token_id in normalized),
             subscription=subscription,
@@ -139,12 +166,17 @@ class FakeChanges:
     def __init__(self) -> None:
         self.items: asyncio.Queue[MarketChange] = asyncio.Queue()
         self.done = 0
+        self.joined = asyncio.Event()
 
     async def get(self) -> MarketChange:
         return await self.items.get()
 
     def task_done(self) -> None:
         self.done += 1
+        self.joined.set()
+
+    async def join(self) -> None:
+        await self.joined.wait()
 
 
 class FakeContextSource:
@@ -242,7 +274,10 @@ async def test_run_subscribes_all_initial_watchable_tokens_and_evaluates_after_r
     watch, _, _, _, strategy, _ = _watch(gateway=gateway)
 
     task = asyncio.create_task(watch.run())
-    await asyncio.sleep(0)
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if gateway.requests:
+            break
 
     assert gateway.requests == [("token-1", "token-2")]
     assert strategy.calls == []
@@ -257,6 +292,59 @@ async def test_run_subscribes_all_initial_watchable_tokens_and_evaluates_after_r
     assert {call.changed_token_id for call in strategy.calls} == {"token-1", "token-2"}
     await _cancel(task)
     assert gateway.subscriptions[0].closed is True
+
+
+async def test_close_wakes_run_with_no_active_tokens() -> None:
+    # Catches a no-subscription run loop remaining blocked forever in changes.get().
+    catalog = FakeCatalog(_catalog(first_active=False))
+    watch, _, _, _, _, _ = _watch(catalog=catalog)
+    running = asyncio.create_task(watch.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if watch.active_token_ids == ():
+            break
+
+    await watch.close()
+
+    await asyncio.wait_for(asyncio.shield(running), timeout=0.1)
+    assert running.done() is True
+
+
+async def test_acquired_change_is_acknowledged_once_when_reader_cleanup_is_cancelled() -> None:
+    # Catches cancellation between successful queue get and pending-reader cleanup.
+    gateway = FakeGateway()
+    gateway.subscription_factory = CancellationDelayedSubscription
+    changes = FakeChanges()
+    watch, _, _, _, _, _ = _watch(gateway=gateway, changes=changes)
+    running = asyncio.create_task(watch.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if gateway.subscriptions:
+            break
+    subscription = gateway.subscriptions[0]
+    assert isinstance(subscription, CancellationDelayedSubscription)
+    await changes.items.put(
+        MarketChange(
+            change_id="ack-change",
+            change_type=MarketChangeType.MARKET_UPDATED,
+            event_id="event-1",
+            market_id="market-1",
+            token_ids=("token-1", "token-2"),
+            occurred_at=200,
+        )
+    )
+    await subscription.read_cancelled.wait()
+
+    running.cancel()
+    await asyncio.sleep(0)
+    assert changes.done == 0
+
+    subscription.release_reader.set()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert subscription.reader_finished.is_set()
+    assert changes.done == 1
+    await asyncio.wait_for(changes.join(), timeout=0.1)
 
 
 async def test_market_add_rebuilds_subscription_and_closes_old_generation() -> None:
@@ -355,6 +443,45 @@ async def test_old_generation_stream_message_is_ignored() -> None:
     await watch.close()
 
 
+async def test_future_generation_fails_closed_and_recovers_without_applying_message() -> None:
+    # Catches an ownership violation being silently treated as a late old message.
+    watch, gateway, _, _, _, signals = _watch()
+    await watch.start()
+
+    await watch.handle_stream_message(
+        MarketStreamEvent(
+            event_type="price_change",
+            market_id="market-1",
+            payload={
+                "timestamp": 110,
+                "price_changes": [
+                    {
+                        "token_id": "token-1",
+                        "side": "BUY",
+                        "price": "0.41",
+                        "size": "9",
+                        "hash": "future-hash",
+                    }
+                ],
+            },
+            received_timestamp=111,
+            subscription_generation=2,
+            mapping_version="mapping-v1",
+        )
+    )
+
+    assert gateway.subscriptions[0].closed is True
+    assert watch.cache.generation == 2
+    assert watch.cache.state is CacheState.VALID
+    assert signals.closed[-1][1].reason_code is DecisionReason.ORDERBOOK_INVALID
+    book = watch.cache.get("token-1")
+    assert book is not None
+    assert tuple((level.price, level.size) for level in book.bids) == (
+        (Decimal("0.40"), Decimal("3")),
+    )
+    await watch.close()
+
+
 async def test_sdk_invalidation_closes_before_rest_recovery_and_never_evaluates_invalid() -> None:
     # Catches OPEN signals surviving a disconnect or strategy crossing the REST barrier.
     gateway = FakeGateway()
@@ -384,6 +511,121 @@ async def test_sdk_invalidation_closes_before_rest_recovery_and_never_evaluates_
 
     assert watch.cache.state is CacheState.VALID
     assert len(strategy.calls) > before
+    await watch.close()
+
+
+async def test_close_cancels_recovery_and_closes_late_session_without_evaluation() -> None:
+    # Catches close returning while a non-cooperative recovery later installs a handle.
+    gateway = FakeGateway()
+    watch, _, _, _, strategy, _ = _watch(gateway=gateway)
+    await watch.start()
+    baseline_calls = len(strategy.calls)
+    gateway.recovery_gate = asyncio.Event()
+    gateway.ignore_recovery_cancellation = True
+    recovering = asyncio.create_task(
+        watch.handle_stream_message(
+            MarketStreamInvalidated(
+                reason="connection_lost",
+                token_ids=("token-1", "token-2"),
+                received_timestamp=120,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if len(gateway.subscriptions) == 2:
+            break
+
+    closing = asyncio.create_task(watch.close())
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if gateway.recovery_cancelled.is_set():
+            break
+
+    assert closing.done() is False
+    assert gateway.recovery_cancelled.is_set()
+    gateway.recovery_gate.set()
+    await closing
+    await recovering
+
+    assert gateway.subscriptions[1].closed is True
+    assert watch.cache.state is CacheState.INVALID
+    assert len(strategy.calls) == baseline_calls
+
+
+async def test_cancelled_close_waits_for_owned_recovery_and_handle_cleanup() -> None:
+    # Catches caller cancellation orphaning the late SDK recovery session.
+    gateway = FakeGateway()
+    watch, _, _, _, _, _ = _watch(gateway=gateway)
+    await watch.start()
+    gateway.recovery_gate = asyncio.Event()
+    gateway.ignore_recovery_cancellation = True
+    recovering = asyncio.create_task(
+        watch.handle_stream_message(
+            MarketStreamInvalidated(
+                reason="connection_lost",
+                token_ids=("token-1", "token-2"),
+                received_timestamp=120,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if len(gateway.subscriptions) == 2:
+            break
+
+    closing = asyncio.create_task(watch.close())
+    await asyncio.sleep(0)
+    closing.cancel()
+    await asyncio.sleep(0)
+    assert closing.done() is False
+
+    gateway.recovery_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    await recovering
+
+    assert gateway.subscriptions[1].closed is True
+    assert all(subscription.closed for subscription in gateway.subscriptions)
+
+
+async def test_cancelled_recovery_handler_closes_noncooperative_late_session() -> None:
+    # Catches direct handler cancellation losing a session returned after cancellation.
+    gateway = FakeGateway()
+    watch, _, _, _, _, _ = _watch(gateway=gateway)
+    await watch.start()
+    gateway.recovery_gate = asyncio.Event()
+    gateway.ignore_recovery_cancellation = True
+    recovering = asyncio.create_task(
+        watch.handle_stream_message(
+            MarketStreamInvalidated(
+                reason="connection_lost",
+                token_ids=("token-1", "token-2"),
+                received_timestamp=120,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if len(gateway.subscriptions) == 2:
+            break
+
+    recovering.cancel()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if gateway.recovery_cancelled.is_set():
+            break
+    gateway.recovery_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await recovering
+
+    assert gateway.subscriptions[1].closed is True
     await watch.close()
 
 
@@ -419,6 +661,55 @@ async def test_price_change_uses_local_arrival_sequence_and_evaluates_changed_to
     assert len(strategy.calls) == before + 1
     assert strategy.calls[-1].changed_token_id == "token-1"
     await watch.close()
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [None, "malformed", "2026-08-01T00:00:00", -1, 253_402_300_800_000],
+)
+async def test_invalid_exchange_timestamp_fails_closed_without_received_fallback(
+    timestamp: object,
+) -> None:
+    # Catches unknown/stale exchange time being forged from local receipt time.
+    watch, gateway, _, _, _, signals = _watch()
+    await watch.start()
+
+    await watch.handle_stream_message(
+        MarketStreamEvent(
+            event_type="price_change",
+            market_id="market-1",
+            payload={
+                "timestamp": timestamp,
+                "price_changes": [
+                    {
+                        "token_id": "token-1",
+                        "side": "BUY",
+                        "price": "0.41",
+                        "size": "9",
+                        "hash": "post-hash",
+                    }
+                ],
+            },
+            received_timestamp=999_999,
+            subscription_generation=1,
+            mapping_version="mapping-v1",
+        )
+    )
+
+    assert gateway.subscriptions[0].closed is True
+    assert signals.closed[-1][1].reason_code is DecisionReason.ORDERBOOK_INVALID
+    assert watch.cache.generation == 2
+    book = watch.cache.get("token-1")
+    assert book is not None
+    assert book.exchange_timestamp == 100
+    assert book.exchange_timestamp != 999_999
+    await watch.close()
+
+
+def test_nonfinite_exchange_timestamp_is_rejected_by_parser() -> None:
+    # Catches non-finite numeric timestamps reaching freshness calculations.
+    with pytest.raises(ValueError, match="exchange timestamp"):
+        _timestamp_ms(float("inf"))
 
 
 async def test_event_settled_removes_tokens_and_closes_with_settlement_reason() -> None:

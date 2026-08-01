@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 import inspect
 from typing import Any, Protocol
 
@@ -132,6 +132,9 @@ class WatchTask:
         self._started = False
         self._closed = False
         self._operation_lock = asyncio.Lock()
+        self._stop_event = asyncio.Event()
+        self._close_task: asyncio.Task[None] | None = None
+        self._recovery_task: asyncio.Task[Any] | None = None
 
     @property
     def cache(self) -> OrderBookCache:
@@ -155,47 +158,54 @@ class WatchTask:
             self._started = True
 
     async def run(self) -> None:
-        await self.start()
         try:
+            await self.start()
             while not self._closed:
                 change_task = asyncio.create_task(self._changes.get())
+                stop_task = asyncio.create_task(self._stop_event.wait())
                 stream_task: asyncio.Task[Any] | None = None
                 if self._subscription is not None:
                     stream_task = asyncio.create_task(anext(self._subscription))
-                tasks = (change_task,) if stream_task is None else (change_task, stream_task)
+                tasks = (
+                    (change_task, stop_task)
+                    if stream_task is None
+                    else (change_task, stop_task, stream_task)
+                )
                 try:
                     done, pending = await asyncio.wait(
                         tasks,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                 except BaseException:
-                    for task in tasks:
-                        task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    await _cancel_and_drain(tasks)
                     raise
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
 
-                # A stream invalidation closes evidence before a simultaneous
-                # catalog update can attempt to reuse it.
-                if stream_task is not None and stream_task in done:
-                    try:
-                        message = stream_task.result()
-                    except StopAsyncIteration:
-                        message = MarketStreamInvalidated(
-                            reason="sdk_handle_ended",
-                            token_ids=self._active_token_ids,
-                            received_timestamp=0,
-                            subscription_generation=self._cache.generation,
-                            mapping_version="watch-synthetic-v1",
-                        )
-                    await self.handle_stream_message(message)
+                change: MarketChange | None = None
                 if change_task in done:
                     change = change_task.result()
-                    try:
+                try:
+                    await _cancel_and_drain(pending)
+                    if stop_task in done or self._closed:
+                        continue
+
+                    # A stream invalidation closes evidence before a
+                    # simultaneous catalog update can attempt to reuse it.
+                    if stream_task is not None and stream_task in done:
+                        try:
+                            message = stream_task.result()
+                        except StopAsyncIteration:
+                            message = MarketStreamInvalidated(
+                                reason="sdk_handle_ended",
+                                token_ids=self._active_token_ids,
+                                received_timestamp=0,
+                                subscription_generation=self._cache.generation,
+                                mapping_version="watch-synthetic-v1",
+                            )
+                        await self.handle_stream_message(message)
+                    if change is not None:
                         await self.handle_market_change(change)
-                    finally:
+                finally:
+                    if change is not None:
                         self._changes.task_done()
         finally:
             await self.close()
@@ -236,7 +246,13 @@ class WatchTask:
         if not isinstance(message, (MarketStreamEvent, MarketStreamInvalidated)):
             raise TypeError("message must be a mapped gateway stream message")
         async with self._operation_lock:
-            if self._closed or message.subscription_generation != self._cache.generation:
+            if self._closed or message.subscription_generation < self._cache.generation:
+                return
+            if message.subscription_generation > self._cache.generation:
+                await self._invalidate_close_recover(
+                    DecisionReason.ORDERBOOK_INVALID,
+                    detail="unexpected_future_generation",
+                )
                 return
             if isinstance(message, MarketStreamInvalidated):
                 await self._invalidate_close_recover(
@@ -286,12 +302,22 @@ class WatchTask:
             )
 
     async def close(self) -> None:
-        if self._closed:
-            return
         self._closed = True
-        subscription, self._subscription = self._subscription, None
-        if subscription is not None:
-            await _close_owned(subscription)
+        self._stop_event.set()
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._finish_close())
+        await _await_owned_task(self._close_task)
+
+    async def _finish_close(self) -> None:
+        recovery = self._recovery_task
+        if recovery is not None and not recovery.done():
+            recovery.cancel()
+        if recovery is not None:
+            await asyncio.gather(recovery, return_exceptions=True)
+        async with self._operation_lock:
+            subscription, self._subscription = self._subscription, None
+            if subscription is not None:
+                await _close_owned(subscription)
 
     async def _apply_price_change(self, message: MarketStreamEvent) -> None:
         raw_changes = message.payload.get("price_changes")
@@ -317,7 +343,6 @@ class WatchTask:
                 raise ValueError("price change entries must be mappings")
             exchange_timestamp = _timestamp_ms(
                 message.payload.get("timestamp"),
-                fallback=message.received_timestamp,
             )
             self._cache.apply_delta(
                 deltas,
@@ -388,8 +413,33 @@ class WatchTask:
 
     async def _recover(self, token_ids: tuple[str, ...]) -> None:
         session: Any | None = None
+        recovery = asyncio.create_task(
+            self._gateway.recover_market_session(token_ids),
+            name="watch:recover-market-session",
+        )
+        self._recovery_task = recovery
         try:
-            session = await self._gateway.recover_market_session(token_ids)
+            try:
+                session = await recovery
+            except asyncio.CancelledError:
+                if self._closed and (
+                    asyncio.current_task() is None
+                    or asyncio.current_task().cancelling() == 0
+                ):
+                    return
+                recovery.cancel()
+                await asyncio.gather(recovery, return_exceptions=True)
+                raise
+            finally:
+                if self._recovery_task is recovery:
+                    self._recovery_task = None
+            current = asyncio.current_task()
+            if current is not None and current.cancelling() > 0:
+                await _close_owned(session.subscription)
+                raise asyncio.CancelledError
+            if self._closed:
+                await _close_owned(session.subscription)
+                return
             generation = session.subscription_generation
             if type(generation) is not int or generation <= self._cache.generation:
                 raise RuntimeError("gateway recovery generation must increase")
@@ -401,6 +451,9 @@ class WatchTask:
             if session is not None:
                 await _close_owned(session.subscription)
             raise
+        if self._closed:
+            await self._close_current_subscription()
+            return
         await self._evaluate_tokens(token_ids)
 
     async def _close_current_subscription(self) -> None:
@@ -429,24 +482,28 @@ class WatchTask:
         await self._signal_manager.close_for_tokens(normalized, decision)
 
     async def _evaluate_tokens(self, token_ids: Sequence[str]) -> None:
-        if self._cache.state is not CacheState.VALID:
+        if self._closed or self._cache.state is not CacheState.VALID:
             return
         books = self._cache.view()
         for token_id in tuple(sorted(set(token_ids), key=_utf8)):
-            if self._cache.state is not CacheState.VALID:
+            if self._closed or self._cache.state is not CacheState.VALID:
                 return
             targets = self._context_source.contexts_for(token_id, books)
             if inspect.isawaitable(targets):
                 targets = await targets
+            if self._closed or self._cache.state is not CacheState.VALID:
+                return
             materialized = tuple(targets)
             if any(not isinstance(target, EvaluationTarget) for target in materialized):
                 raise TypeError("context source must return EvaluationTarget values")
             for target in materialized:
-                if self._cache.state is not CacheState.VALID:
+                if self._closed or self._cache.state is not CacheState.VALID:
                     return
                 decision = self._strategy_engine.evaluate(target.context)
                 if inspect.isawaitable(decision):
                     decision = await decision
+                if self._closed or self._cache.state is not CacheState.VALID:
+                    return
                 if not isinstance(decision, StrategyDecision.__args__):
                     raise TypeError("strategy engine returned an invalid decision")
                 await self._signal_manager.apply(
@@ -494,20 +551,37 @@ def _required_string(value: object, name: str) -> str:
     return value
 
 
-def _timestamp_ms(value: object, *, fallback: int) -> int:
-    if type(value) is int and value >= 0:
-        return value
+def _timestamp_ms(value: object) -> int:
+    maximum = 253_402_300_799_999
+    if type(value) is int:
+        if 0 <= value <= maximum:
+            return value
+        raise ValueError("exchange timestamp is out of range")
     if isinstance(value, str):
         if value.isdigit():
-            return int(value)
+            parsed_epoch = int(value)
+            if parsed_epoch <= maximum:
+                return parsed_epoch
+            raise ValueError("exchange timestamp is out of range")
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
-            pass
-        else:
-            if parsed.tzinfo is not None:
-                return int(parsed.timestamp() * 1000)
-    return fallback
+            raise ValueError("exchange timestamp is malformed") from None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("exchange timestamp must contain an explicit offset")
+        if parsed.microsecond % 1000:
+            raise ValueError("exchange timestamp must have millisecond precision")
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        delta = parsed.astimezone(UTC) - epoch
+        milliseconds = (
+            delta.days * 86_400_000
+            + delta.seconds * 1000
+            + delta.microseconds // 1000
+        )
+        if 0 <= milliseconds <= maximum:
+            return milliseconds
+        raise ValueError("exchange timestamp is out of range")
+    raise ValueError("exchange timestamp is missing or has an invalid type")
 
 
 async def _close_owned(subscription: Any) -> None:
@@ -531,6 +605,52 @@ async def _close_owned(subscription: Any) -> None:
             task.result()
         except asyncio.CancelledError:
             pass
+        raise cancellation
+
+
+async def _await_owned_task(task: asyncio.Task[None]) -> None:
+    """Wait for lifecycle cleanup even when its public waiter is cancelled."""
+
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError as cancellation:
+        current = asyncio.current_task()
+        if current is None or current.cancelling() == 0:
+            return task.result()
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        raise cancellation
+
+
+async def _cancel_and_drain(tasks: Sequence[asyncio.Task[Any]]) -> None:
+    """Cancel loop-owned readers and never orphan cancellation-delayed tasks."""
+
+    materialized = tuple(tasks)
+    if not materialized:
+        return
+    for task in materialized:
+        if not task.done():
+            task.cancel()
+    waiter = asyncio.gather(*materialized, return_exceptions=True)
+    cancellation: asyncio.CancelledError | None = None
+    while not waiter.done():
+        try:
+            await asyncio.shield(waiter)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            continue
+    waiter.result()
+    if cancellation is not None:
         raise cancellation
 
 
