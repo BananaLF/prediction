@@ -11,6 +11,7 @@ from typing import Any
 
 import aiosqlite
 
+from predmarket.catalog.changes import MarketChange, MarketChangeType
 from predmarket.domain.decimal import encode_decimal
 from predmarket.domain.fees import FeeSchedule
 from predmarket.domain.market import Event, Market, MarketStatus, Token
@@ -451,6 +452,74 @@ class SystemEventRepository:
             return int(cursor.lastrowid)
 
         return await self._writer.execute(command)
+
+    async def record_market_change_published(self, change: MarketChange) -> int:
+        """Idempotently record an admitted Watch publication baseline."""
+
+        if not isinstance(change, MarketChange):
+            raise TypeError("change must be a MarketChange")
+        if change.change_type not in {
+            MarketChangeType.MARKET_ADDED,
+            MarketChangeType.MARKET_UPDATED,
+        }:
+            raise ValueError("only added or updated changes form a watch baseline")
+        if change.market_id is None:
+            raise ValueError("published market change must identify a market")
+        details = _encode_json_object(
+            {
+                "change_id": change.change_id,
+                "change_type": change.change_type.value,
+                "event_id": change.event_id,
+                "market_id": change.market_id,
+                "sync_generation": change.change_id.rsplit(":", 2)[0],
+                "token_ids": change.token_ids,
+            }
+        )
+
+        async def command(connection: aiosqlite.Connection) -> int:
+            cursor = await connection.execute(
+                """
+                SELECT id FROM system_events
+                WHERE event_type = 'MARKET_CHANGE_PUBLISHED'
+                  AND json_extract(details_json, '$.change_id') = ?
+                ORDER BY id
+                LIMIT 1
+                """,
+                (change.change_id,),
+            )
+            row = await cursor.fetchone()
+            if row is not None:
+                return int(row[0])
+            cursor = await connection.execute(
+                """
+                INSERT INTO system_events (
+                    component, severity, event_type, message,
+                    details_json, occurred_at
+                ) VALUES ('SYNC', 'INFO', 'MARKET_CHANGE_PUBLISHED', ?, ?, ?)
+                """,
+                (
+                    f"Market change {change.change_id} admitted to Watch queue",
+                    details,
+                    change.occurred_at,
+                ),
+            )
+            assert cursor.lastrowid is not None
+            return int(cursor.lastrowid)
+
+        return await self._writer.execute(command)
+
+    async def list_published_market_ids(self) -> frozenset[str]:
+        rows = await _fetch_all(
+            self._path,
+            """
+            SELECT DISTINCT json_extract(details_json, '$.market_id') AS market_id
+            FROM system_events
+            WHERE event_type = 'MARKET_CHANGE_PUBLISHED'
+              AND json_type(details_json, '$.market_id') = 'text'
+            ORDER BY CAST(market_id AS BLOB)
+            """,
+        )
+        return frozenset(str(row["market_id"]) for row in rows)
 
     async def read_after(
         self,

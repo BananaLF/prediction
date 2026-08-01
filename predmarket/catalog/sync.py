@@ -30,6 +30,8 @@ class _Gateway(Protocol):
 
     async def list_active_markets(self) -> tuple[MarketSnapshot, ...]: ...
 
+    async def refresh_market(self, market_id: str) -> MarketSnapshot: ...
+
 
 class _ChangeSink(Protocol):
     async def put(self, change: MarketChange) -> bool: ...
@@ -105,6 +107,16 @@ class SyncMarketTask:
                 errors.append(validation_error)
 
         previous = await self._catalog.load_catalog()
+        published_market_ids = await self._system_events.list_published_market_ids()
+        if not errors:
+            resolved_snapshots, refresh_error = await _refresh_missing_markets(
+                gateway=self._gateway,
+                previous=previous,
+                active_snapshots=snapshots,
+            )
+            snapshots.extend(resolved_snapshots)
+            if refresh_error is not None:
+                errors.append(refresh_error)
         if not errors:
             validation_error = _validate_complete_source(
                 events=events,
@@ -160,6 +172,7 @@ class SyncMarketTask:
             previous=previous,
             generation=generation,
             occurred_at=occurred_at,
+            published_market_ids=published_market_ids,
         )
         # One writer transaction completes before any Watch-visible change.
         await self._catalog.save_catalog(
@@ -173,6 +186,11 @@ class SyncMarketTask:
         for change in prepared.changes:
             if await self._changes.put(change):
                 published += 1
+                if change.change_type in {
+                    MarketChangeType.MARKET_ADDED,
+                    MarketChangeType.MARKET_UPDATED,
+                }:
+                    await self._system_events.record_market_change_published(change)
             else:
                 dropped += 1
         return SyncResult(
@@ -258,6 +276,42 @@ def _validated_snapshots(
     return snapshots, None
 
 
+async def _refresh_missing_markets(
+    *,
+    gateway: _Gateway,
+    previous: CatalogSnapshot,
+    active_snapshots: Sequence[MarketSnapshot],
+) -> tuple[list[MarketSnapshot], str | None]:
+    active_ids = {snapshot.market.id for snapshot in active_snapshots}
+    resolved: list[MarketSnapshot] = []
+    for old_market in sorted(previous.markets, key=lambda item: _utf8(item.id)):
+        if (
+            old_market.id in active_ids
+            or old_market.resolved_at is not None
+            or old_market.status not in {MarketStatus.ACTIVE, MarketStatus.CLOSED}
+        ):
+            continue
+        try:
+            refreshed = await gateway.refresh_market(old_market.id)
+        except Exception:
+            # Missing from the complete active listing is enough to deactivate,
+            # but a failed enrichment request is never settlement proof.
+            continue
+        if not isinstance(refreshed, MarketSnapshot):
+            continue
+        market = refreshed.market
+        if market.id != old_market.id:
+            continue
+        if market.status is MarketStatus.ACTIVE and market.active:
+            return [], (
+                f"market {market.id} remained active during missing-market "
+                "refresh"
+            )
+        if market.status is MarketStatus.RESOLVED and market.resolved_at is not None:
+            resolved.append(refreshed)
+    return resolved, None
+
+
 def _validate_complete_source(
     *,
     events: Sequence[Event],
@@ -265,13 +319,19 @@ def _validate_complete_source(
     previous: CatalogSnapshot,
 ) -> str | None:
     event_ids = {event.id for event in events}
+    old_event_ids = {event.id for event in previous.events}
     markets_by_event: dict[str, list[str]] = defaultdict(list)
     old_market_ids_by_event: dict[str, set[str]] = defaultdict(set)
     for old_market in previous.markets:
         old_market_ids_by_event[old_market.event_id].add(old_market.id)
     for snapshot in snapshots:
         market = snapshot.market
-        if market.event_id not in event_ids:
+        authoritative_resolved = (
+            market.status is MarketStatus.RESOLVED
+            and market.resolved_at is not None
+            and market.event_id in old_event_ids
+        )
+        if market.event_id not in event_ids and not authoritative_resolved:
             return (
                 f"market {market.id} references event {market.event_id} "
                 "missing from the complete generation"
@@ -317,6 +377,7 @@ def _prepare_complete(
     previous: CatalogSnapshot,
     generation: str,
     occurred_at: int,
+    published_market_ids: frozenset[str],
 ) -> _PreparedCatalog:
     old_events = {event.id: event for event in previous.events}
     old_markets = {market.id: market for market in previous.markets}
@@ -345,9 +406,18 @@ def _prepare_complete(
                 updated_at=occurred_at,
             )
             continue
-        event = incoming_events[item.market.event_id]
+        event = incoming_events.get(item.market.event_id) or old_events[
+            item.market.event_id
+        ]
         market = item.market
-        if event.status is not MarketStatus.ACTIVE or event.resolved_at is not None:
+        authoritative_market_resolution = (
+            market.status is MarketStatus.RESOLVED
+            and market.resolved_at is not None
+        )
+        if not authoritative_market_resolution and (
+            event.status is not MarketStatus.ACTIVE
+            or event.resolved_at is not None
+        ):
             market = replace(
                 market,
                 status=(
@@ -379,12 +449,31 @@ def _prepare_complete(
         incoming = incoming_events.get(event_id)
         if incoming is None:
             assert old is not None
+            related_markets = tuple(
+                market
+                for market in final_markets.values()
+                if market.event_id == event_id
+            )
+            fully_resolved = bool(related_markets) and all(
+                market.status is MarketStatus.RESOLVED
+                and market.resolved_at is not None
+                for market in related_markets
+            )
             event = replace(
                 old,
                 status=(
                     MarketStatus.RESOLVED
-                    if old.resolved_at is not None
+                    if fully_resolved
                     else MarketStatus.CLOSED
+                ),
+                resolved_at=(
+                    max(
+                        market.resolved_at
+                        for market in related_markets
+                        if market.resolved_at is not None
+                    )
+                    if fully_resolved
+                    else old.resolved_at
                 ),
                 neg_risk_complete=False,
             )
@@ -426,6 +515,7 @@ def _prepare_complete(
         tokens=final_tokens,
         generation=generation,
         occurred_at=occurred_at,
+        published_market_ids=published_market_ids,
     )
     return _PreparedCatalog(
         events=_ordered(final_events.values()),
@@ -593,6 +683,7 @@ def _catalog_changes(
     tokens: dict[str, Token],
     generation: str,
     occurred_at: int,
+    published_market_ids: frozenset[str],
 ) -> tuple[MarketChange, ...]:
     old_events = {event.id: event for event in previous.events}
     old_markets = {market.id: market for market in previous.markets}
@@ -640,9 +731,25 @@ def _catalog_changes(
         old = old_markets.get(market_id)
         old_watchable = old is not None and _watchable(old)
         watchable = _watchable(market)
+        old_event = None if old is None else old_events.get(old.event_id)
+        prior_generation_incomplete = old is not None and (
+            not old.sync_generation_complete
+            or old_event is None
+            or not old_event.sync_generation_complete
+            or any(
+                not token.sync_generation_complete
+                for token in old_tokens_by_market[market_id]
+            )
+        )
         change_type: MarketChangeType | None = None
         critical = False
-        if old is None and watchable:
+        if watchable and prior_generation_incomplete:
+            if market_id in published_market_ids:
+                change_type = MarketChangeType.MARKET_UPDATED
+                critical = True
+            else:
+                change_type = MarketChangeType.MARKET_ADDED
+        elif old is None and watchable:
             change_type = MarketChangeType.MARKET_ADDED
         elif old_watchable and not watchable:
             change_type = MarketChangeType.MARKET_DEACTIVATED
@@ -650,7 +757,6 @@ def _catalog_changes(
         elif not old_watchable and watchable:
             change_type = MarketChangeType.MARKET_ADDED
         elif watchable and old is not None:
-            old_event = old_events.get(old.event_id)
             event = events[market.event_id]
             market_changed = _market_signature(old) != _market_signature(market)
             event_changed = (

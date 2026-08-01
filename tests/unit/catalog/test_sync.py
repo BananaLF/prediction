@@ -91,8 +91,13 @@ def _snapshot(
 class _FakeGateway:
     events: Any
     markets: Any
+    refreshed: dict[str, Any] | None = None
     event_calls: int = 0
     market_calls: int = 0
+    refresh_calls: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        self.refresh_calls = []
 
     async def list_active_events(self) -> tuple[Event, ...]:
         self.event_calls += 1
@@ -106,17 +111,33 @@ class _FakeGateway:
             raise self.markets
         return tuple(self.markets)
 
+    async def refresh_market(self, market_id: str) -> MarketSnapshot:
+        assert self.refresh_calls is not None
+        self.refresh_calls.append(market_id)
+        value = None if self.refreshed is None else self.refreshed.get(market_id)
+        if isinstance(value, BaseException):
+            raise value
+        if value is None:
+            raise RuntimeError(f"no refresh fixture for {market_id}")
+        return value
+
 
 class _RecordingQueue:
-    def __init__(self, repository: CatalogRepository | None = None) -> None:
+    def __init__(
+        self,
+        repository: CatalogRepository | None = None,
+        *,
+        admit: bool = True,
+    ) -> None:
         self.items: list[MarketChange] = []
         self._repository = repository
+        self._admit = admit
 
     async def put(self, change: MarketChange) -> bool:
         if self._repository is not None and change.market_id is not None:
             assert await self._repository.get_market(change.market_id) is not None
         self.items.append(change)
-        return True
+        return self._admit
 
 
 class _FailingCatalog:
@@ -222,6 +243,203 @@ async def test_complete_generation_deactivates_only_missing_market(
         MarketChangeType.MARKET_DEACTIVATED
     ]
     assert queue.items[0].market_id == "market-2"
+
+
+async def test_all_authoritatively_resolved_event_markets_publish_event_settled(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    await _seed(catalog, ("market-1", "market-2"))
+    resolved = {
+        market_id: MarketSnapshot(
+            market=replace(
+                _snapshot(market_id).market,
+                status=MarketStatus.RESOLVED,
+                active=False,
+                accepting_orders=False,
+                enable_orderbook=False,
+                resolved_at=600,
+            ),
+            tokens=_snapshot(market_id).tokens,
+            mapping_version=MAPPING_VERSION,
+        )
+        for market_id in ("market-1", "market-2")
+    }
+    gateway = _FakeGateway(events=(), markets=(), refreshed=resolved)
+    queue = _RecordingQueue()
+    task = SyncMarketTask(
+        gateway=gateway,
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 610,
+        generation_factory=lambda: "sync-settled",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is True
+    event = await catalog.get_event("event-1")
+    assert event is not None
+    assert event.status is MarketStatus.RESOLVED
+    assert event.resolved_at == 600
+    assert gateway.refresh_calls == ["market-1", "market-2"]
+    assert [change.change_type for change in queue.items] == [
+        MarketChangeType.EVENT_SETTLED
+    ]
+
+
+@pytest.mark.parametrize(
+    "second_refresh",
+    [
+        RuntimeError("refresh failed"),
+        MarketSnapshot(
+            market=replace(
+                _snapshot("market-2").market,
+                status=MarketStatus.CLOSED,
+                active=False,
+                accepting_orders=False,
+                enable_orderbook=False,
+            ),
+            tokens=_snapshot("market-2").tokens,
+            mapping_version=MAPPING_VERSION,
+        ),
+    ],
+)
+async def test_missing_event_is_not_guessed_settled_without_all_resolved_proof(
+    catalog_runtime,
+    second_refresh: object,
+) -> None:
+    catalog, system_events = catalog_runtime
+    await _seed(catalog, ("market-1", "market-2"))
+    first = _snapshot("market-1")
+    resolved_first = MarketSnapshot(
+        market=replace(
+            first.market,
+            status=MarketStatus.RESOLVED,
+            active=False,
+            accepting_orders=False,
+            enable_orderbook=False,
+            resolved_at=620,
+        ),
+        tokens=first.tokens,
+        mapping_version=MAPPING_VERSION,
+    )
+    queue = _RecordingQueue()
+    task = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(),
+            markets=(),
+            refreshed={
+                "market-1": resolved_first,
+                "market-2": second_refresh,
+            },
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 630,
+        generation_factory=lambda: "sync-not-settled",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is True
+    event = await catalog.get_event("event-1")
+    assert event is not None
+    assert event.status is MarketStatus.CLOSED
+    assert event.resolved_at is None
+    assert MarketChangeType.EVENT_SETTLED not in {
+        change.change_type for change in queue.items
+    }
+    assert all(
+        change.change_type is MarketChangeType.MARKET_DEACTIVATED
+        for change in queue.items
+    )
+
+
+async def test_missing_market_refresh_still_active_makes_generation_incomplete(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    await _seed(catalog, ("market-1",))
+    queue = _RecordingQueue()
+    task = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(),
+            markets=(),
+            refreshed={"market-1": _snapshot("market-1")},
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 640,
+        generation_factory=lambda: "sync-active-refresh-race",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is False
+    market = await catalog.get_market("market-1")
+    assert market is not None
+    assert market.status is MarketStatus.ACTIVE
+    assert market.active is True
+    assert queue.items == []
+
+
+async def test_closed_unresolved_market_is_refreshed_until_later_resolution(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    await _seed(catalog, ("market-1",))
+    first = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(),
+            markets=(),
+            refreshed={"market-1": RuntimeError("not resolved yet")},
+        ),
+        catalog=catalog,
+        changes=_RecordingQueue(),
+        system_events=system_events,
+        clock_ms=lambda: 650,
+        generation_factory=lambda: "sync-first-closed",
+    )
+    assert (await first.run_once()).complete is True
+    assert (await catalog.get_market("market-1")).status is MarketStatus.CLOSED  # type: ignore[union-attr]
+
+    snapshot = _snapshot("market-1")
+    resolved = MarketSnapshot(
+        market=replace(
+            snapshot.market,
+            status=MarketStatus.RESOLVED,
+            active=False,
+            accepting_orders=False,
+            enable_orderbook=False,
+            resolved_at=660,
+        ),
+        tokens=snapshot.tokens,
+        mapping_version=MAPPING_VERSION,
+    )
+    queue = _RecordingQueue()
+    gateway = _FakeGateway(
+        events=(),
+        markets=(),
+        refreshed={"market-1": resolved},
+    )
+    second = SyncMarketTask(
+        gateway=gateway,
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 670,
+        generation_factory=lambda: "sync-later-resolved",
+    )
+
+    assert (await second.run_once()).complete is True
+    assert gateway.refresh_calls == ["market-1"]
+    assert [item.change_type for item in queue.items] == [
+        MarketChangeType.EVENT_SETTLED
+    ]
 
 
 async def test_complete_generation_rejects_unknown_declared_event_member(
@@ -402,6 +620,166 @@ async def test_repeated_complete_generation_is_an_idempotent_upsert(
     assert len(stored.markets) == 1
     assert len(stored.tokens) == 2
     assert stored.markets[0].sync_generation == "sync-2"
+
+
+async def test_complete_after_new_incomplete_replays_added_after_restart(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    snapshot = _snapshot("market-1")
+    incomplete = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",)),),
+            markets=(snapshot, object()),
+        ),
+        catalog=catalog,
+        changes=_RecordingQueue(),
+        system_events=system_events,
+        clock_ms=lambda: 410,
+        generation_factory=lambda: "sync-incomplete-new",
+    )
+    assert (await incomplete.run_once()).complete is False
+
+    queue = _RecordingQueue()
+    recovered = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",)),),
+            markets=(snapshot,),
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 420,
+        generation_factory=lambda: "sync-complete-new",
+    )
+
+    assert (await recovered.run_once()).complete is True
+    assert [(item.change_type, item.market_id) for item in queue.items] == [
+        (MarketChangeType.MARKET_ADDED, "market-1")
+    ]
+
+
+async def test_complete_after_existing_incomplete_replays_critical_update(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    original = _snapshot("market-1", question="Original?")
+    first_queue = _RecordingQueue()
+    first = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",), title="Original event"),),
+            markets=(original,),
+        ),
+        catalog=catalog,
+        changes=first_queue,
+        system_events=system_events,
+        clock_ms=lambda: 430,
+        generation_factory=lambda: "sync-first-complete",
+    )
+    assert (await first.run_once()).complete is True
+    assert first_queue.items[0].change_type is MarketChangeType.MARKET_ADDED
+
+    changed = _snapshot("market-1", question="Changed?")
+    incomplete = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",), title="Changed event"),),
+            markets=(changed, object()),
+        ),
+        catalog=catalog,
+        changes=_RecordingQueue(),
+        system_events=system_events,
+        clock_ms=lambda: 440,
+        generation_factory=lambda: "sync-existing-incomplete",
+    )
+    assert (await incomplete.run_once()).complete is False
+
+    queue = _RecordingQueue()
+    recovered = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",), title="Changed event"),),
+            markets=(changed,),
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 450,
+        generation_factory=lambda: "sync-existing-recovered",
+    )
+
+    assert (await recovered.run_once()).complete is True
+    assert len(queue.items) == 1
+    assert queue.items[0].change_type is MarketChangeType.MARKET_UPDATED
+    assert queue.items[0].critical is True
+
+
+async def test_dropped_added_is_not_recorded_as_publication_baseline(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    snapshot = _snapshot("market-1")
+    dropped = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",)),),
+            markets=(snapshot,),
+        ),
+        catalog=catalog,
+        changes=_RecordingQueue(admit=False),
+        system_events=system_events,
+        clock_ms=lambda: 460,
+        generation_factory=lambda: "sync-dropped",
+    )
+    result = await dropped.run_once()
+    assert result.changes_dropped == 1
+
+    incomplete = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",)),),
+            markets=(snapshot, object()),
+        ),
+        catalog=catalog,
+        changes=_RecordingQueue(),
+        system_events=system_events,
+        clock_ms=lambda: 470,
+        generation_factory=lambda: "sync-after-drop-incomplete",
+    )
+    assert (await incomplete.run_once()).complete is False
+
+    queue = _RecordingQueue()
+    recovered = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",)),),
+            markets=(snapshot,),
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 480,
+        generation_factory=lambda: "sync-after-drop-complete",
+    )
+    await recovered.run_once()
+
+    assert queue.items[0].change_type is MarketChangeType.MARKET_ADDED
+
+
+async def test_publication_marker_is_idempotent_by_change_identity(
+    catalog_runtime,
+) -> None:
+    _, system_events = catalog_runtime
+    change = MarketChange(
+        change_id="sync-1:MARKET_ADDED:market-1",
+        change_type=MarketChangeType.MARKET_ADDED,
+        event_id="event-1",
+        market_id="market-1",
+        token_ids=("token-1", "token-2"),
+        occurred_at=490,
+    )
+
+    first_id = await system_events.record_market_change_published(change)
+    second_id = await system_events.record_market_change_published(change)
+
+    assert second_id == first_id
+    rows = await system_events.read_after(0)
+    assert [row["event_type"] for row in rows] == ["MARKET_CHANGE_PUBLISHED"]
 
 
 async def test_catalog_rollback_never_publishes_market_changes(
