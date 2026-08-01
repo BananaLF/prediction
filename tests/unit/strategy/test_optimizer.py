@@ -1,6 +1,8 @@
 from decimal import Decimal
 from dataclasses import dataclass
 
+import pytest
+
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
 from predmarket.strategy.optimizer import (
     DepthRequirement,
@@ -164,3 +166,46 @@ def test_candidate_optimizer_inserts_constraint_boundary_before_selecting_profit
 
     assert selection.feasible is True
     assert selection.candidate.quantity == Decimal("50")
+
+
+@pytest.mark.parametrize(
+    ("constraint_name", "safe_below"),
+    [("bankroll", True), ("risk_rate", True), ("return", False)],
+)
+def test_candidate_optimizer_evaluates_both_adjacent_decimals_at_rounded_roots(
+    constraint_name: str,
+    safe_below: bool,
+) -> None:
+    # Catches retaining only the rounded root when the safe side is one ulp away.
+    book = _book("buy", asks=(("0.40", "100"),))
+
+    @dataclass(frozen=True)
+    class Candidate:
+        quantity: Decimal
+        total_capital: Decimal
+        expected_profit: Decimal
+
+    def evaluate(quantity: Decimal) -> Candidate:
+        objective = quantity if safe_below else -quantity
+        return Candidate(quantity, quantity, objective)
+
+    def margin(candidate: Candidate) -> Decimal:
+        raw = candidate.quantity * Decimal("0.124") - Decimal("7")
+        return raw if safe_below else -raw
+
+    selection = optimize_candidates(
+        (DepthRequirement(book, "BUY"),),
+        minimum_quantity=Decimal("1"),
+        evaluate=evaluate,
+        constraint_margins=lambda candidate: {constraint_name: margin(candidate)},
+        is_feasible=lambda candidate: margin(candidate) <= 0,
+        total_capital=lambda candidate: candidate.total_capital,
+        expected_profit=lambda candidate: candidate.expected_profit,
+        quantity=lambda candidate: candidate.quantity,
+    )
+
+    assert selection is not None
+    assert selection.candidate.quantity > Decimal("56")
+    assert selection.candidate.quantity < Decimal("57")
+    assert margin(selection.candidate) <= 0
+    assert any(margin(candidate) > 0 for candidate in selection.candidates)

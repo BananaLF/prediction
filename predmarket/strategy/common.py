@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import Iterable
 
 from predmarket.domain.fees import FeeCalculator, FeeSchedule
+from predmarket.domain.decimal import encode_decimal
 from predmarket.domain.market import Market, MarketStatus, Token
 from predmarket.domain.orderbook import OrderBook
 from predmarket.domain.signal import (
@@ -423,7 +424,19 @@ def optimize_trades(
         selection.candidates,
         key=lambda item: (item.total_capital, item.quantity),
     )
-    return TradeOptimization(selected, DecisionReason.QUANTITY_BELOW_MINIMUM)
+    return TradeOptimization(selected, DecisionReason.INSUFFICIENT_CAPITAL)
+
+
+def feasibility_details(
+    context: StrategyContext,
+    optimized: TradeOptimization,
+) -> dict[str, str]:
+    if optimized.forced_absent_reason is DecisionReason.INSUFFICIENT_CAPITAL:
+        return {
+            "available_bankroll": encode_decimal(context.configuration.bankroll),
+            "required_capital": encode_decimal(optimized.candidate.total_capital),
+        }
+    return {}
 
 
 def long_entry_risk(
@@ -543,6 +556,7 @@ def conversion_leg(
     market_id: str,
     action: Action,
     quantity: Decimal,
+    fee_amount: Decimal = Decimal("0"),
 ) -> SignalLeg:
     return SignalLeg(
         position=position,
@@ -553,7 +567,7 @@ def conversion_leg(
         average_price=None,
         worst_price=None,
         gross_amount=quantity,
-        fee_amount=Decimal("0"),
+        fee_amount=fee_amount,
     )
 
 

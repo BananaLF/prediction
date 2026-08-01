@@ -73,6 +73,8 @@ def test_neg_risk_complete_set_uses_authoritative_yes_members(
         Action.NEG_RISK_CONVERT,
     ]
     assert [leg.token_id for leg in decision.legs[:2]] == ["yes-a", "yes-b"]
+    assert decision.legs[-1].fee_amount == Decimal("0.025")
+    assert sum((leg.fee_amount for leg in decision.legs), Decimal("0")) == Decimal("0.025")
 
 
 @pytest.mark.parametrize(
@@ -177,6 +179,7 @@ def test_neg_risk_supported_redeem_type_uses_redeem_action(
 
     assert isinstance(decision, OpportunityPresent)
     assert decision.legs[-1].action is Action.REDEEM
+    assert decision.legs[-1].fee_amount == Decimal("0")
 
 
 @pytest.mark.parametrize(

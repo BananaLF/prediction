@@ -159,6 +159,7 @@ CREATE TABLE arbitrage_signals (
                 'PROFIT_BELOW_THRESHOLD',
                 'RISK_ABOVE_THRESHOLD',
                 'INSUFFICIENT_DEPTH',
+                'INSUFFICIENT_CAPITAL',
                 'MARKET_CLOSED',
                 'EVENT_SETTLED',
                 'ORDERBOOK_INVALID',

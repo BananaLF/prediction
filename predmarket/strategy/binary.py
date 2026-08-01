@@ -16,6 +16,7 @@ from predmarket.strategy.common import (
     calculation,
     classify,
     conversion_leg,
+    feasibility_details,
     long_entry_risk,
     not_evaluable,
     optimize_trades,
@@ -114,6 +115,7 @@ def _underpriced(context, market, yes, no) -> StrategyDecision:
             "execution_mode": "IMMEDIATE_CONVERSION",
             "minimum_proceeds": encode_decimal(quantity),
             "strategy_type": context.strategy_type.value,
+            **feasibility_details(context, optimized),
         },
     )
     legs = (
@@ -170,6 +172,7 @@ def _overpriced(context, market, yes, no) -> StrategyDecision:
         details={
             "execution_mode": "IMMEDIATE_CONVERSION",
             "strategy_type": context.strategy_type.value,
+            **feasibility_details(context, optimized),
         },
     )
     legs = (

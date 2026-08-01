@@ -329,6 +329,37 @@ def test_binary_optimizer_selects_profitable_safe_quantity_below_risky_maximum(
     assert decision.calculation.unhedged_notional == Decimal("20")
 
 
+def test_binary_optimizer_keeps_nonterminating_unhedged_root_on_safe_side(
+    context_factory,
+    market_factory,
+    token_factory,
+    book_factory,
+    strategy_config_factory,
+) -> None:
+    # Catches a rounded root landing one ulp outside and falling back to q=1.
+    context = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+        yes_ask="0.124",
+        no_ask="0.50",
+        yes_bid="0.12",
+        no_bid="0.49",
+        size="100",
+        configuration=strategy_config_factory(
+            maximum_unhedged_notional=Decimal("7"),
+        ),
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, OpportunityPresent)
+    assert decision.calculation.quantity > Decimal("56")
+    assert decision.calculation.unhedged_notional <= Decimal("7")
+    assert (decision.calculation.quantity + Decimal("1E-25")) * Decimal("0.124") > Decimal("7")
+
+
 def test_buy_strategy_values_empty_reverse_depth_as_zero_recovery(
     context_factory, market_factory, token_factory, book_factory
 ) -> None:
@@ -413,9 +444,11 @@ def test_positive_but_insufficient_bankroll_returns_auditable_absent(
     decision = evaluate_binary(context)
 
     assert isinstance(decision, OpportunityAbsent)
-    assert decision.reason_code is DecisionReason.QUANTITY_BELOW_MINIMUM
+    assert decision.reason_code is DecisionReason.INSUFFICIENT_CAPITAL
     assert decision.calculation.quantity == Decimal("1")
     assert decision.calculation.total_capital == Decimal("0.80")
+    assert decision.calculation.details["required_capital"] == "0.8"
+    assert decision.calculation.details["available_bankroll"] == "0.5"
 
 
 @pytest.mark.parametrize(

@@ -12,6 +12,7 @@ from predmarket.strategy.common import (
     calculation,
     classify,
     conversion_leg,
+    feasibility_details,
     long_entry_risk,
     not_evaluable,
     optimize_trades,
@@ -183,10 +184,18 @@ def evaluate_neg_risk(context: StrategyContext) -> StrategyDecision:
             "conversion_action": conversion_action.value,
             "conversion_fee_rate": encode_decimal(conversion_fee_rate),
             "strategy_type": context.strategy_type.value,
+            **feasibility_details(context, optimized),
         },
     )
+    conversion_fee = quantity * conversion_fee_rate
     legs = tuple(item.leg(index) for index, item in enumerate(trades)) + (
-        conversion_leg(len(trades), markets[0].id, conversion_action, quantity),
+        conversion_leg(
+            len(trades),
+            markets[0].id,
+            conversion_action,
+            quantity,
+            conversion_fee,
+        ),
     )
     return classify(
         context,

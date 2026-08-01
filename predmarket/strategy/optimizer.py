@@ -228,7 +228,7 @@ def optimize_candidates(
         margins_by_quantity[value] = margins
 
     assert margin_names is not None
-    roots: set[Decimal] = set()
+    root_candidates: set[Decimal] = set()
     for lower, upper in zip(ordered_base, ordered_base[1:]):
         for name in margin_names:
             lower_margin = margins_by_quantity[lower][name]
@@ -239,9 +239,20 @@ def optimize_candidates(
                 (-lower_margin) * (upper - lower) / (upper_margin - lower_margin)
             )
             if lower < root < upper:
-                roots.add(root)
-    for root in roots:
-        evaluated[root] = evaluate(root)
+                root_candidates.add(root)
+                # Margins use <= 0 as the safe side. Evaluate the adjacent
+                # representable Decimal only in that direction, so a rounded
+                # multiplication cannot admit the mathematically unsafe side.
+                if lower_margin <= 0 < upper_margin:
+                    adjacent = root.next_minus()
+                elif upper_margin <= 0 < lower_margin:
+                    adjacent = root.next_plus()
+                else:
+                    continue
+                if lower_bound <= adjacent <= upper_bound:
+                    root_candidates.add(adjacent)
+    for root_candidate in root_candidates:
+        evaluated[root_candidate] = evaluate(root_candidate)
 
     candidates = tuple(evaluated.values())
     feasible_candidates = tuple(item for item in candidates if is_feasible(item))

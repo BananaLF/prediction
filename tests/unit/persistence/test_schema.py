@@ -143,6 +143,27 @@ def test_initialize_database_creates_exact_schema_v1_and_wal(tmp_path: Path) -> 
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
 
+def test_schema_accepts_insufficient_capital_as_stable_close_reason(tmp_path: Path) -> None:
+    # Catches domain/schema reason drift before SignalManager persists a closure.
+    database_path = tmp_path / "market.db"
+    initialize_database(database_path)
+
+    with _connect(database_path) as connection:
+        _insert_catalog(connection)
+        _insert_signal(connection)
+        connection.execute(
+            """
+            UPDATE arbitrage_signals
+            SET status = 'CLOSED', closed_at = 2,
+                close_reason = 'INSUFFICIENT_CAPITAL'
+            WHERE id = 'signal-1'
+            """
+        )
+        assert connection.execute(
+            "SELECT close_reason FROM arbitrage_signals WHERE id = 'signal-1'"
+        ).fetchone() == ("INSUFFICIENT_CAPITAL",)
+
+
 def test_initialize_database_rejects_nonempty_unknown_schema_without_mutation(
     tmp_path: Path,
 ) -> None:

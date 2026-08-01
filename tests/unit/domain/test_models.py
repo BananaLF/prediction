@@ -431,6 +431,18 @@ def test_not_evaluable_requires_stable_reason_and_context_without_economics() ->
         NotEvaluable(reason_code=DecisionReason.PROFIT_BELOW_THRESHOLD, context={"x": 1})
 
 
+def test_insufficient_capital_is_an_absent_reason() -> None:
+    # Catches classifying a proven bankroll shortfall as input invalidity.
+    decision = OpportunityAbsent(
+        reason_code=DecisionReason.INSUFFICIENT_CAPITAL,
+        calculation=_calculation(),
+        legs=(_leg(),),
+        evidence=(_book(),),
+    )
+
+    assert decision.reason_code is DecisionReason.INSUFFICIENT_CAPITAL
+
+
 def test_absent_decision_rejects_bare_string_reason_code() -> None:
     with pytest.raises(ValueError, match="DecisionReason"):
         OpportunityAbsent(

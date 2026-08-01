@@ -11,6 +11,7 @@ from predmarket.strategy.common import (
     calculation,
     classify,
     conversion_leg,
+    feasibility_details,
     long_entry_risk,
     not_evaluable,
     optimize_trades,
@@ -97,6 +98,7 @@ def evaluate_implication(context: StrategyContext) -> StrategyDecision:
             },
             "relation_id": relation.id,
             "strategy_type": context.strategy_type.value,
+            **feasibility_details(context, optimized),
         },
     )
     legs = (
