@@ -455,6 +455,16 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
         created_at=1,
         updated_at=2,
     )
+    second_token = Token(
+        id="token-2",
+        market_id="market-2",
+        outcome="YES",
+        position=0,
+        sync_generation="sync-1",
+        sync_generation_complete=True,
+        created_at=1,
+        updated_at=2,
+    )
     relation = Relation(
         id="relation-1",
         market_a_id="market-1",
@@ -483,7 +493,7 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
         await catalog.save_catalog(
             events=(event,),
             markets=(market, second_market),
-            tokens=(token,),
+            tokens=(token, second_token),
         )
         await relations.save(relation)
         for invalid_initial_status in (
@@ -530,7 +540,10 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
         await writer.close()
 
     assert stored_market == market
-    assert stored_relation == llm_approved
+    assert stored_relation is not None
+    assert replace(stored_relation, llm_analysis=llm_approved.llm_analysis) == llm_approved
+    assert stored_relation.llm_analysis is not None
+    assert "semantic_evidence" in stored_relation.llm_analysis
     assert activation_events == ()
     with sqlite3.connect(database_path) as connection:
         encoded = connection.execute(

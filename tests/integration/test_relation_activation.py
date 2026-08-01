@@ -18,7 +18,7 @@ from predmarket.catalog.relations import (
     RelationChangeMonitor,
 )
 from predmarket.cli import main
-from predmarket.domain.market import Event, Market, MarketStatus
+from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.domain.relation import DiscoverySource, Relation, RelationStatus
 from predmarket.persistence.repositories import CatalogRepository, RelationRepository
 from predmarket.persistence.writer import DatabaseWriter
@@ -54,6 +54,22 @@ def _market(market_id: str) -> Market:
     )
 
 
+def _tokens(market_id: str) -> tuple[Token, ...]:
+    return tuple(
+        Token(
+            id=f"{market_id}-token-{position}",
+            market_id=market_id,
+            outcome=outcome,
+            position=position,
+            sync_generation="sync-1",
+            sync_generation_complete=True,
+            created_at=1,
+            updated_at=1,
+        )
+        for position, outcome in enumerate(("YES", "NO"))
+    )
+
+
 async def _seed_relation(
     database_path: Path,
     relation_id: str,
@@ -70,7 +86,7 @@ async def _seed_relation(
             await catalog.save_catalog(
                 events=(_event(),),
                 markets=(_market("market-a"), _market("market-b")),
-                tokens=(),
+                tokens=(*_tokens("market-a"), *_tokens("market-b")),
             )
         relation = Relation(
             id=relation_id,
@@ -161,6 +177,13 @@ async def test_relations_list_show_and_analyze_use_persistent_database(
         now_ms=lambda: 11,
     ) == 0
     assert json.loads(analyzed_output.getvalue())["status"] == "LLM_APPROVE"
+    evidence = json.loads(analyzed_output.getvalue())["llm_analysis"][
+        "semantic_evidence"
+    ]
+    assert evidence["version"] == 1
+    assert evidence["market_a"]["market"]["question"] == "Question market-a?"
+    assert evidence["market_b"]["event"]["title"] == "Event"
+    assert len(evidence["sha256"]) == 64
     with sqlite3.connect(database_path) as connection:
         row = connection.execute(
             "SELECT status, llm_confidence FROM relations WHERE id = 'relation-1'"
@@ -171,6 +194,110 @@ async def test_relations_list_show_and_analyze_use_persistent_database(
         ).fetchone()
     assert row == ("LLM_APPROVE", "0.91")
     assert activation_count == (0,)
+
+
+@pytest.mark.parametrize(
+    "semantic_change_sql",
+    [
+        "UPDATE events SET title = 'Different event semantics' WHERE id = 'event-1'",
+        "UPDATE markets SET description = 'Different resolution wording' "
+        "WHERE id = 'market-a'",
+        "UPDATE markets SET condition_id = 'different-condition' "
+        "WHERE id = 'market-a'",
+        "UPDATE tokens SET outcome = 'DIFFERENT' "
+        "WHERE id = 'market-a-token-0'",
+    ],
+)
+async def test_cli_approval_rejects_semantics_changed_after_analysis(
+    tmp_path: Path,
+    semantic_change_sql: str,
+) -> None:
+    database_path = tmp_path / "market.db"
+    config_path = _write_config(tmp_path, database_path)
+    raw = yaml.safe_load(config_path.read_text())
+    raw["relations"]["llm_enabled"] = True
+    config_path.write_text(yaml.safe_dump(raw))
+    await _seed_relation(database_path, "relation-1", analyzed=False)
+    analyzer = DeterministicFakeAnalyzer(
+        {
+            "relation-1": RelationAnalysis(
+                approved=True,
+                confidence=Decimal("0.9"),
+                reasoning="fixture analysis",
+                warnings=(),
+            )
+        }
+    )
+    assert await asyncio.to_thread(
+        main,
+        ["--config", str(config_path), "relations", "analyze", "relation-1"],
+        stdout=StringIO(),
+        analyzer=analyzer,
+        now_ms=lambda: 11,
+    ) == 0
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(semantic_change_sql)
+
+    with pytest.raises(ValueError, match="semantics changed"):
+        await asyncio.to_thread(
+            main,
+            ["--config", str(config_path), "relations", "approve", "relation-1"],
+            stdout=StringIO(),
+            now_ms=lambda: 12,
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT status FROM relations WHERE id = 'relation-1'"
+        ).fetchone() == ("LLM_APPROVE",)
+        assert connection.execute(
+            "SELECT count(*) FROM system_events "
+            "WHERE event_type = 'RELATION_ACTIVATED'"
+        ).fetchone() == (0,)
+
+
+async def test_cli_approval_ignores_nonsemantic_market_metadata_changes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    config_path = _write_config(tmp_path, database_path)
+    raw = yaml.safe_load(config_path.read_text())
+    raw["relations"]["llm_enabled"] = True
+    config_path.write_text(yaml.safe_dump(raw))
+    await _seed_relation(database_path, "relation-1", analyzed=False)
+    analyzer = DeterministicFakeAnalyzer(
+        {
+            "relation-1": RelationAnalysis(
+                approved=True,
+                confidence=Decimal("0.9"),
+                reasoning="fixture analysis",
+                warnings=(),
+            )
+        }
+    )
+    assert await asyncio.to_thread(
+        main,
+        ["--config", str(config_path), "relations", "analyze", "relation-1"],
+        stdout=StringIO(),
+        analyzer=analyzer,
+        now_ms=lambda: 11,
+    ) == 0
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE markets
+            SET tick_size = '0.02', minimum_order_size = '5',
+                source_updated_at = 999, updated_at = 999
+            WHERE id = 'market-a'
+            """
+        )
+
+    assert await asyncio.to_thread(
+        main,
+        ["--config", str(config_path), "relations", "approve", "relation-1"],
+        stdout=StringIO(),
+        now_ms=lambda: 12,
+    ) == 0
 
 
 async def test_cli_cannot_approve_an_unanalyzed_relation(tmp_path: Path) -> None:
@@ -213,6 +340,36 @@ async def test_cli_approval_rejects_a_backwards_status_timestamp(tmp_path: Path)
         assert connection.execute(
             "SELECT status, updated_at FROM relations WHERE id = 'relation-1'"
         ).fetchone() == ("LLM_APPROVE", 11)
+
+
+async def test_cli_approval_rejects_legacy_analysis_without_semantic_evidence(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    config_path = _write_config(tmp_path, database_path)
+    await _seed_relation(database_path, "relation-1")
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE relations SET llm_analysis_json = ? WHERE id = 'relation-1'",
+            ('{"approved":true,"reasoning":"legacy","warnings":[]}',),
+        )
+
+    with pytest.raises(ValueError, match="analyze again"):
+        await asyncio.to_thread(
+            main,
+            ["--config", str(config_path), "relations", "approve", "relation-1"],
+            stdout=StringIO(),
+            now_ms=lambda: 12,
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT status FROM relations WHERE id = 'relation-1'"
+        ).fetchone() == ("LLM_APPROVE",)
+        assert connection.execute(
+            "SELECT count(*) FROM system_events "
+            "WHERE event_type = 'RELATION_ACTIVATED'"
+        ).fetchone() == (0,)
 
 
 async def test_cli_approval_is_atomic_and_seen_once_in_event_id_order(
@@ -258,7 +415,11 @@ async def test_cli_approval_is_atomic_and_seen_once_in_event_id_order(
             await monitor_task
 
     assert exit_code == 0
-    assert json.loads(output.getvalue()) == {
+    approved_payload = json.loads(output.getvalue())
+    semantic_evidence = approved_payload["llm_analysis"].pop("semantic_evidence")
+    assert semantic_evidence["version"] == 1
+    assert len(semantic_evidence["sha256"]) == 64
+    assert approved_payload == {
         "id": "relation-1",
         "market_a_id": "market-a",
         "market_b_id": "market-b",

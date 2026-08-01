@@ -95,9 +95,10 @@ class _MemoryRelations:
     async def get(self, relation_id: str) -> Relation | None:
         return self.relation if relation_id == self.relation.id else None
 
-    async def save_analysis(self, relation: Relation) -> None:
+    async def save_analysis(self, relation: Relation) -> Relation:
         self.analysis_writes += 1
         self.relation = relation
+        return relation
 
 
 def _unreviewed_relation() -> Relation:

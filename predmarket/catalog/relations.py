@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal
 import hashlib
+import hmac
 import inspect
 import json
 import math
@@ -151,7 +152,7 @@ class RelationAnalyzer(Protocol):
 class RelationAnalysisRepository(Protocol):
     async def get(self, relation_id: str) -> Relation | None: ...
 
-    async def save_analysis(self, relation: Relation) -> None: ...
+    async def save_analysis(self, relation: Relation) -> Relation: ...
 
 
 class DeterministicFakeAnalyzer:
@@ -234,8 +235,7 @@ class RelationWorkflow:
             },
             updated_at=updated_at,
         )
-        await self._repository.save_analysis(analyzed)
-        return analyzed
+        return await self._repository.save_analysis(analyzed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,10 +404,10 @@ class RelationCliStore:
         _relation_id(relation_id)
         return await asyncio.to_thread(self._get_sync, relation_id)
 
-    async def save_analysis(self, relation: Relation) -> None:
+    async def save_analysis(self, relation: Relation) -> Relation:
         if not isinstance(relation, Relation):
             raise TypeError("relation must be a Relation")
-        await asyncio.to_thread(self._save_analysis_sync, relation)
+        return await asyncio.to_thread(self._save_analysis_sync, relation)
 
     def approve_manual(self, relation_id: str, *, occurred_at: int) -> Relation:
         _relation_id(relation_id)
@@ -450,6 +450,14 @@ class RelationCliStore:
                 raise ValueError(
                     "relation markets no longer have active implication semantics"
                 )
+            stored_semantics = _stored_semantic_snapshot(row["llm_analysis_json"])
+            current_semantics = _capture_relation_semantics_sync(
+                connection,
+                row["market_a_id"],
+                row["market_b_id"],
+            )
+            if not _same_semantics(stored_semantics, current_semantics):
+                raise ValueError("relation semantics changed after analysis")
             updated = connection.execute(
                 """
                 UPDATE relations SET status = 'APPROVED', updated_at = ?
@@ -494,7 +502,7 @@ class RelationCliStore:
             ).fetchone()
         return None if row is None else _relation_from_row(row)
 
-    def _save_analysis_sync(self, relation: Relation) -> None:
+    def _save_analysis_sync(self, relation: Relation) -> Relation:
         if relation.status not in {
             RelationStatus.NO_LLM_APPROVE,
             RelationStatus.LLM_APPROVE,
@@ -511,7 +519,7 @@ class RelationCliStore:
         if type(approved) is not bool or relation.status is not expected_status:
             raise ValueError("analysis decision does not match relation status")
 
-        def transaction(connection: sqlite3.Connection) -> None:
+        def transaction(connection: sqlite3.Connection) -> Relation:
             row = connection.execute(
                 "SELECT * FROM relations WHERE id = ?",
                 (relation.id,),
@@ -530,6 +538,15 @@ class RelationCliStore:
                 raise ValueError("analysis cannot change relation identity")
             if relation.updated_at < current.updated_at:
                 raise ValueError("analysis updated_at must not move backwards")
+            semantics = _capture_relation_semantics_sync(
+                connection,
+                relation.market_a_id,
+                relation.market_b_id,
+            )
+            analysis = _analysis_with_semantic_evidence(
+                relation.llm_analysis,
+                semantics,
+            )
             updated = connection.execute(
                 """
                 UPDATE relations
@@ -541,7 +558,7 @@ class RelationCliStore:
                     relation.status.value,
                     encode_decimal(relation.llm_confidence),
                     json.dumps(
-                        _thaw_json(relation.llm_analysis),
+                        analysis,
                         ensure_ascii=False,
                         sort_keys=True,
                         separators=(",", ":"),
@@ -552,8 +569,11 @@ class RelationCliStore:
             )
             if updated.rowcount != 1:
                 raise ValueError("relation changed concurrently during analysis")
+            return replace(relation, llm_analysis=analysis)
 
-        self._write(transaction)
+        stored = self._write(transaction)
+        assert isinstance(stored, Relation)
+        return stored
 
     def _read_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -642,6 +662,178 @@ def _activation_relation_id(encoded: str | None) -> str:
 def _relation_id(value: object) -> None:
     if not isinstance(value, str) or not value:
         raise ValueError("relation_id must be a non-empty string")
+
+
+_MARKET_SEMANTICS_SQL = """
+SELECT m.id, m.event_id, m.condition_id, m.question, m.description, m.end_at,
+       e.id, e.title, e.description, e.end_at
+FROM markets AS m
+JOIN events AS e ON e.id = m.event_id
+WHERE m.id = ?
+"""
+
+_TOKEN_SEMANTICS_SQL = """
+SELECT id, outcome, position
+FROM tokens
+WHERE market_id = ?
+ORDER BY position, CAST(id AS BLOB)
+"""
+
+
+async def capture_relation_semantics(
+    connection: aiosqlite.Connection,
+    market_a_id: str,
+    market_b_id: str,
+) -> dict[str, object]:
+    snapshots: dict[str, object] = {}
+    for side, market_id in (("market_a", market_a_id), ("market_b", market_b_id)):
+        market_cursor = await connection.execute(_MARKET_SEMANTICS_SQL, (market_id,))
+        market_row = await market_cursor.fetchone()
+        token_cursor = await connection.execute(_TOKEN_SEMANTICS_SQL, (market_id,))
+        token_rows = await token_cursor.fetchall()
+        snapshots[side] = _semantic_market_snapshot(market_row, token_rows)
+    return snapshots
+
+
+def analysis_with_semantic_evidence(
+    analysis: Mapping[str, object],
+    semantics: Mapping[str, object],
+) -> dict[str, object]:
+    return _analysis_with_semantic_evidence(analysis, semantics)
+
+
+def _capture_relation_semantics_sync(
+    connection: sqlite3.Connection,
+    market_a_id: str,
+    market_b_id: str,
+) -> dict[str, object]:
+    snapshots: dict[str, object] = {}
+    for side, market_id in (("market_a", market_a_id), ("market_b", market_b_id)):
+        market_row = connection.execute(_MARKET_SEMANTICS_SQL, (market_id,)).fetchone()
+        token_rows = connection.execute(_TOKEN_SEMANTICS_SQL, (market_id,)).fetchall()
+        snapshots[side] = _semantic_market_snapshot(market_row, token_rows)
+    return snapshots
+
+
+def _semantic_market_snapshot(
+    market_row: object,
+    token_rows: Sequence[object],
+) -> dict[str, object]:
+    if market_row is None:
+        raise ValueError("relation semantic market or event is missing")
+    try:
+        row = tuple(market_row)  # type: ignore[arg-type]
+        tokens = [tuple(item) for item in token_rows]  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError("relation semantic rows are invalid") from error
+    if len(row) != 10 or not tokens:
+        raise ValueError("relation semantic market, event, or tokens are missing")
+    required_strings = (row[0], row[1], row[2], row[3], row[6], row[7])
+    if any(not isinstance(value, str) or not value.strip() for value in required_strings):
+        raise ValueError("relation semantic identity or text is missing")
+    if any(
+        value is not None and not isinstance(value, str)
+        for value in (row[4], row[8])
+    ):
+        raise ValueError("relation semantic description is invalid")
+    if any(
+        value is not None and (type(value) is not int or value < 0)
+        for value in (row[5], row[9])
+    ):
+        raise ValueError("relation semantic end time is invalid")
+    encoded_tokens: list[dict[str, object]] = []
+    for token in tokens:
+        if (
+            len(token) != 3
+            or not isinstance(token[0], str)
+            or not token[0]
+            or not isinstance(token[1], str)
+            or not token[1]
+            or type(token[2]) is not int
+            or token[2] < 0
+        ):
+            raise ValueError("relation token semantics are invalid")
+        encoded_tokens.append(
+            {"id": token[0], "outcome": token[1], "position": token[2]}
+        )
+    return {
+        "event": {
+            "id": row[6],
+            "title": row[7],
+            "description": row[8],
+            "end_at": row[9],
+        },
+        "market": {
+            "id": row[0],
+            "event_id": row[1],
+            "condition_id": row[2],
+            "question": row[3],
+            "description": row[4],
+            "end_at": row[5],
+        },
+        "tokens": encoded_tokens,
+    }
+
+
+def _analysis_with_semantic_evidence(
+    analysis: Mapping[str, object],
+    semantics: Mapping[str, object],
+) -> dict[str, object]:
+    payload = _thaw_json(analysis)
+    if not isinstance(payload, dict):
+        raise ValueError("relation analysis must be a JSON object")
+    canonical_semantics = json.loads(_canonical_json(semantics))
+    payload["semantic_evidence"] = {
+        "version": 1,
+        "market_a": canonical_semantics["market_a"],
+        "market_b": canonical_semantics["market_b"],
+        "sha256": _semantic_digest(canonical_semantics),
+    }
+    return payload
+
+
+def _stored_semantic_snapshot(encoded_analysis: str | None) -> dict[str, object]:
+    try:
+        analysis = json.loads(encoded_analysis) if encoded_analysis is not None else None
+        evidence = analysis["semantic_evidence"]
+        if not isinstance(analysis, dict) or not isinstance(evidence, dict):
+            raise TypeError
+        if set(evidence) != {"version", "market_a", "market_b", "sha256"}:
+            raise ValueError
+        if evidence["version"] != 1 or not isinstance(evidence["sha256"], str):
+            raise ValueError
+        snapshot = {
+            "market_a": evidence["market_a"],
+            "market_b": evidence["market_b"],
+        }
+        if not hmac.compare_digest(evidence["sha256"], _semantic_digest(snapshot)):
+            raise ValueError
+        return snapshot
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "relation semantic evidence is missing or invalid; analyze again"
+        ) from error
+
+
+def _same_semantics(
+    stored: Mapping[str, object],
+    current: Mapping[str, object],
+) -> bool:
+    return hmac.compare_digest(_semantic_digest(stored), _semantic_digest(current))
+
+
+def _semantic_digest(value: Mapping[str, object]) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        _thaw_json(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _thaw_json(value: object) -> object:

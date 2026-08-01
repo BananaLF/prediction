@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -12,6 +12,10 @@ from typing import Any
 import aiosqlite
 
 from predmarket.catalog.changes import MarketChange, MarketChangeType
+from predmarket.catalog.relations import (
+    analysis_with_semantic_evidence,
+    capture_relation_semantics,
+)
 from predmarket.domain.decimal import encode_decimal
 from predmarket.domain.fees import FeeSchedule
 from predmarket.domain.market import Event, Market, MarketStatus, Token
@@ -202,7 +206,7 @@ class RelationRepository:
 
         await self._writer.execute(command)
 
-    async def save_analysis(self, relation: Relation) -> None:
+    async def save_analysis(self, relation: Relation) -> Relation:
         """Persist one analyzer result without crossing the manual gate."""
 
         _require_type(relation, Relation, "relation")
@@ -224,7 +228,7 @@ class RelationRepository:
         if relation.status is not expected_status:
             raise ValueError("analysis decision does not match relation status")
 
-        async def command(connection: aiosqlite.Connection) -> None:
+        async def command(connection: aiosqlite.Connection) -> Relation:
             cursor = await connection.execute(
                 """
                 SELECT market_a_id, market_b_id, status, discovery_source,
@@ -247,6 +251,15 @@ class RelationRepository:
                 raise ValueError("analysis cannot change relation identity")
             if relation.updated_at < row[5]:
                 raise ValueError("analysis updated_at must not move backwards")
+            semantics = await capture_relation_semantics(
+                connection,
+                relation.market_a_id,
+                relation.market_b_id,
+            )
+            analysis = analysis_with_semantic_evidence(
+                relation.llm_analysis,
+                semantics,
+            )
             updated = await connection.execute(
                 """
                 UPDATE relations
@@ -257,15 +270,16 @@ class RelationRepository:
                 (
                     relation.status.value,
                     encode_decimal(relation.llm_confidence),
-                    _encode_json_object(relation.llm_analysis),
+                    _encode_json_object(analysis),
                     relation.updated_at,
                     relation.id,
                 ),
             )
             if updated.rowcount != 1:
                 raise ValueError("relation changed concurrently during analysis")
+            return replace(relation, llm_analysis=analysis)
 
-        await self._writer.execute(command)
+        return await self._writer.execute(command)
 
     async def get(self, relation_id: str) -> Relation | None:
         row = await _fetch_one(
