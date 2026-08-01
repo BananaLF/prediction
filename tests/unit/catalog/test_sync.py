@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
@@ -92,6 +93,7 @@ class _FakeGateway:
     events: Any
     markets: Any
     refreshed: dict[str, Any] | None = None
+    refresh_delay: float = 0
     event_calls: int = 0
     market_calls: int = 0
     refresh_calls: list[str] | None = None
@@ -114,6 +116,8 @@ class _FakeGateway:
     async def refresh_market(self, market_id: str) -> MarketSnapshot:
         assert self.refresh_calls is not None
         self.refresh_calls.append(market_id)
+        if self.refresh_delay:
+            await asyncio.sleep(self.refresh_delay)
         value = None if self.refreshed is None else self.refreshed.get(market_id)
         if isinstance(value, BaseException):
             raise value
@@ -149,6 +153,29 @@ class _FailingCatalog:
 
     async def save_catalog(self, **_: object) -> None:
         raise RuntimeError("forced catalog rollback")
+
+
+class _MarkerFailingSystemEvents:
+    def __init__(self, delegate: SystemEventRepository) -> None:
+        self._delegate = delegate
+        self._failed = False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
+
+    async def record_market_change_published(
+        self,
+        change: MarketChange,
+        *,
+        market_ids: tuple[str, ...] | None = None,
+    ) -> int:
+        if not self._failed:
+            self._failed = True
+            raise RuntimeError("forced marker failure")
+        return await self._delegate.record_market_change_published(
+            change,
+            market_ids=market_ids,
+        )
 
 
 @pytest.fixture
@@ -780,6 +807,175 @@ async def test_publication_marker_is_idempotent_by_change_identity(
     assert second_id == first_id
     rows = await system_events.read_after(0)
     assert [row["event_type"] for row in rows] == ["MARKET_CHANGE_PUBLISHED"]
+
+
+async def test_marker_failure_degrades_but_does_not_skip_later_critical_control(
+    catalog_runtime,
+) -> None:
+    catalog, real_system_events = catalog_runtime
+    await _seed(catalog, ("market-2",))
+    queue = _RecordingQueue()
+    task = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",)),),
+            markets=(_snapshot("market-1"),),
+            refreshed={"market-2": RuntimeError("not resolved")},
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=_MarkerFailingSystemEvents(real_system_events),  # type: ignore[arg-type]
+        clock_ms=lambda: 700,
+        generation_factory=lambda: "sync-marker-failure",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is True
+    assert result.degraded is True
+    assert result.publication_marker_failures == 1
+    assert [item.change_type for item in queue.items] == [
+        MarketChangeType.MARKET_ADDED,
+        MarketChangeType.MARKET_DEACTIVATED,
+    ]
+    events = await real_system_events.read_after(0)
+    degraded = [event for event in events if event["event_type"] == "SYSTEM_DEGRADED"]
+    assert len(degraded) == 1
+    assert degraded[0]["details"]["failed_change_id"].endswith("market-1")
+
+
+async def test_deactivated_publication_baseline_reactivation_replays_added(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    snapshot = _snapshot("market-1")
+    initial = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",)),),
+            markets=(snapshot,),
+        ),
+        catalog=catalog,
+        changes=_RecordingQueue(),
+        system_events=system_events,
+        clock_ms=lambda: 710,
+        generation_factory=lambda: "sync-active",
+    )
+    await initial.run_once()
+    deactivated = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(),
+            markets=(),
+            refreshed={"market-1": RuntimeError("not resolved")},
+        ),
+        catalog=catalog,
+        changes=_RecordingQueue(),
+        system_events=system_events,
+        clock_ms=lambda: 720,
+        generation_factory=lambda: "sync-deactivated",
+    )
+    await deactivated.run_once()
+    incomplete = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",)),),
+            markets=(snapshot, object()),
+        ),
+        catalog=catalog,
+        changes=_RecordingQueue(),
+        system_events=system_events,
+        clock_ms=lambda: 730,
+        generation_factory=lambda: "sync-reactivation-incomplete",
+    )
+    assert (await incomplete.run_once()).complete is False
+
+    queue = _RecordingQueue()
+    recovered = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",)),),
+            markets=(snapshot,),
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 740,
+        generation_factory=lambda: "sync-reactivated",
+    )
+    await recovered.run_once()
+
+    assert queue.items[0].change_type is MarketChangeType.MARKET_ADDED
+
+
+async def test_settlement_refresh_budget_uses_persistent_fair_cursor(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    market_ids = tuple(f"market-{index}" for index in range(1, 6))
+    await _seed(catalog, market_ids)
+    observed: list[tuple[str, ...]] = []
+    generations = iter(("refresh-1", "refresh-2", "refresh-3"))
+    for occurred_at in (750, 760, 770):
+        gateway = _FakeGateway(
+            events=(),
+            markets=(),
+            refreshed={
+                market_id: RuntimeError("not resolved")
+                for market_id in market_ids
+            },
+        )
+        task = SyncMarketTask(
+            gateway=gateway,
+            catalog=catalog,
+            changes=_RecordingQueue(),
+            system_events=system_events,
+            clock_ms=lambda occurred_at=occurred_at: occurred_at,
+            generation_factory=lambda: next(generations),
+            settlement_refresh_budget=2,
+            settlement_refresh_timeout_seconds=0.05,
+        )
+        await task.run_once()
+        assert gateway.refresh_calls is not None
+        observed.append(tuple(gateway.refresh_calls))
+
+    assert observed == [
+        ("market-1", "market-2"),
+        ("market-3", "market-4"),
+        ("market-5", "market-1"),
+    ]
+
+
+async def test_settlement_refresh_timeout_is_fail_closed_and_bounded(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    await _seed(catalog, ("market-1", "market-2"))
+    gateway = _FakeGateway(
+        events=(),
+        markets=(),
+        refreshed={
+            "market-1": _snapshot("market-1"),
+            "market-2": _snapshot("market-2"),
+        },
+        refresh_delay=0.2,
+    )
+    queue = _RecordingQueue()
+    task = SyncMarketTask(
+        gateway=gateway,
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 780,
+        generation_factory=lambda: "refresh-timeout",
+        settlement_refresh_budget=1,
+        settlement_refresh_timeout_seconds=0.005,
+    )
+
+    result = await asyncio.wait_for(task.run_once(), timeout=0.1)
+
+    assert result.complete is True
+    assert gateway.refresh_calls == ["market-1"]
+    assert (await catalog.get_event("event-1")).status is MarketStatus.CLOSED  # type: ignore[union-attr]
+    assert all(
+        item.change_type is MarketChangeType.MARKET_DEACTIVATED
+        for item in queue.items
+    )
 
 
 async def test_catalog_rollback_never_publishes_market_changes(

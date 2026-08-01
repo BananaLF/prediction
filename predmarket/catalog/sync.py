@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
+import logging
 from typing import Any, Protocol, TypeVar
 from uuid import uuid4
 
@@ -23,6 +25,7 @@ from predmarket.polymarket.gateway import MarketSnapshot
 
 
 T = TypeVar("T")
+_LOGGER = logging.getLogger(__name__)
 
 
 class _Gateway(Protocol):
@@ -59,6 +62,8 @@ class SyncResult:
     changes_published: int
     changes_dropped: int
     error: str | None = None
+    degraded: bool = False
+    publication_marker_failures: int = 0
 
 
 class SyncMarketTask:
@@ -71,7 +76,20 @@ class SyncMarketTask:
         system_events: SystemEventRepository,
         clock_ms: Callable[[], int],
         generation_factory: Callable[[], str] | None = None,
+        settlement_refresh_budget: int = 100,
+        settlement_refresh_timeout_seconds: float = 5.0,
     ) -> None:
+        if (
+            type(settlement_refresh_budget) is not int
+            or settlement_refresh_budget < 1
+        ):
+            raise ValueError("settlement_refresh_budget must be a positive integer")
+        if (
+            isinstance(settlement_refresh_timeout_seconds, bool)
+            or not isinstance(settlement_refresh_timeout_seconds, (int, float))
+            or settlement_refresh_timeout_seconds <= 0
+        ):
+            raise ValueError("settlement_refresh_timeout_seconds must be positive")
         self._gateway = gateway
         self._catalog = catalog
         self._changes = changes
@@ -79,6 +97,10 @@ class SyncMarketTask:
         self._clock_ms = clock_ms
         self._generation_factory = generation_factory or (
             lambda: f"sync-{uuid4().hex}"
+        )
+        self._settlement_refresh_budget = settlement_refresh_budget
+        self._settlement_refresh_timeout_seconds = float(
+            settlement_refresh_timeout_seconds
         )
 
     async def run_once(self) -> SyncResult:
@@ -108,11 +130,20 @@ class SyncMarketTask:
 
         previous = await self._catalog.load_catalog()
         published_market_ids = await self._system_events.list_published_market_ids()
+        refresh_cursor = await self._system_events.get_settlement_refresh_cursor()
+        next_refresh_cursor: str | None = None
         if not errors:
-            resolved_snapshots, refresh_error = await _refresh_missing_markets(
+            (
+                resolved_snapshots,
+                refresh_error,
+                next_refresh_cursor,
+            ) = await _refresh_missing_markets(
                 gateway=self._gateway,
                 previous=previous,
                 active_snapshots=snapshots,
+                cursor=refresh_cursor,
+                budget=self._settlement_refresh_budget,
+                timeout_seconds=self._settlement_refresh_timeout_seconds,
             )
             snapshots.extend(resolved_snapshots)
             if refresh_error is not None:
@@ -155,6 +186,11 @@ class SyncMarketTask:
                     "tokens_seen": sum(len(item.tokens) for item in snapshots),
                 },
             )
+            await self._advance_refresh_cursor(
+                generation=generation,
+                cursor=next_refresh_cursor,
+                occurred_at=occurred_at,
+            )
             return SyncResult(
                 sync_generation=generation,
                 complete=False,
@@ -180,17 +216,52 @@ class SyncMarketTask:
             markets=prepared.markets,
             tokens=prepared.tokens,
         )
+        await self._advance_refresh_cursor(
+            generation=generation,
+            cursor=next_refresh_cursor,
+            occurred_at=occurred_at,
+        )
 
         published = 0
         dropped = 0
+        marker_failures = 0
         for change in prepared.changes:
             if await self._changes.put(change):
                 published += 1
-                if change.change_type in {
-                    MarketChangeType.MARKET_ADDED,
-                    MarketChangeType.MARKET_UPDATED,
-                }:
-                    await self._system_events.record_market_change_published(change)
+                affected_market_ids = tuple(
+                    market.id
+                    for market in prepared.markets
+                    if market.event_id == change.event_id
+                )
+                try:
+                    await self._system_events.record_market_change_published(
+                        change,
+                        market_ids=affected_market_ids,
+                    )
+                except Exception as error:
+                    marker_failures += 1
+                    _LOGGER.error(
+                        "Publication marker failed for %s: %s",
+                        change.change_id,
+                        error,
+                    )
+                    try:
+                        await self._system_events.append(
+                            component="SYNC",
+                            severity="ERROR",
+                            event_type="SYSTEM_DEGRADED",
+                            message="Market publication baseline could not be recorded",
+                            occurred_at=occurred_at,
+                            details={
+                                "error": _error_text("marker write failed", error),
+                                "failed_change_id": change.change_id,
+                            },
+                        )
+                    except Exception as report_error:
+                        _LOGGER.error(
+                            "Publication marker degradation report failed: %s",
+                            report_error,
+                        )
             else:
                 dropped += 1
         return SyncResult(
@@ -201,7 +272,27 @@ class SyncMarketTask:
             tokens_seen=sum(len(item.tokens) for item in snapshots),
             changes_published=published,
             changes_dropped=dropped,
+            degraded=marker_failures > 0,
+            publication_marker_failures=marker_failures,
         )
+
+    async def _advance_refresh_cursor(
+        self,
+        *,
+        generation: str,
+        cursor: str | None,
+        occurred_at: int,
+    ) -> None:
+        if cursor is None:
+            return
+        try:
+            await self._system_events.record_settlement_refresh_cursor(
+                sync_generation=generation,
+                cursor=cursor,
+                occurred_at=occurred_at,
+            )
+        except Exception as error:
+            _LOGGER.error("Settlement refresh cursor write failed: %s", error)
 
     def _now(self) -> int:
         value = self._clock_ms()
@@ -281,18 +372,39 @@ async def _refresh_missing_markets(
     gateway: _Gateway,
     previous: CatalogSnapshot,
     active_snapshots: Sequence[MarketSnapshot],
-) -> tuple[list[MarketSnapshot], str | None]:
+    cursor: str | None,
+    budget: int,
+    timeout_seconds: float,
+) -> tuple[list[MarketSnapshot], str | None, str | None]:
     active_ids = {snapshot.market.id for snapshot in active_snapshots}
+    candidates = [
+        market
+        for market in sorted(previous.markets, key=lambda item: _utf8(item.id))
+        if market.id not in active_ids
+        and market.resolved_at is None
+        and market.status in {MarketStatus.ACTIVE, MarketStatus.CLOSED}
+    ]
+    if not candidates:
+        return [], None, None
+    start = next(
+        (
+            index
+            for index, market in enumerate(candidates)
+            if cursor is None or _utf8(market.id) > _utf8(cursor)
+        ),
+        0,
+    )
+    selected = [
+        candidates[(start + offset) % len(candidates)]
+        for offset in range(min(budget, len(candidates)))
+    ]
     resolved: list[MarketSnapshot] = []
-    for old_market in sorted(previous.markets, key=lambda item: _utf8(item.id)):
-        if (
-            old_market.id in active_ids
-            or old_market.resolved_at is not None
-            or old_market.status not in {MarketStatus.ACTIVE, MarketStatus.CLOSED}
-        ):
-            continue
+    for old_market in selected:
         try:
-            refreshed = await gateway.refresh_market(old_market.id)
+            refreshed = await asyncio.wait_for(
+                gateway.refresh_market(old_market.id),
+                timeout=timeout_seconds,
+            )
         except Exception:
             # Missing from the complete active listing is enough to deactivate,
             # but a failed enrichment request is never settlement proof.
@@ -306,10 +418,10 @@ async def _refresh_missing_markets(
             return [], (
                 f"market {market.id} remained active during missing-market "
                 "refresh"
-            )
+            ), selected[-1].id
         if market.status is MarketStatus.RESOLVED and market.resolved_at is not None:
             resolved.append(refreshed)
-    return resolved, None
+    return resolved, None, selected[-1].id
 
 
 def _validate_complete_source(
@@ -744,7 +856,7 @@ def _catalog_changes(
         change_type: MarketChangeType | None = None
         critical = False
         if watchable and prior_generation_incomplete:
-            if market_id in published_market_ids:
+            if old_watchable and market_id in published_market_ids:
                 change_type = MarketChangeType.MARKET_UPDATED
                 critical = True
             else:

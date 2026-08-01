@@ -453,24 +453,35 @@ class SystemEventRepository:
 
         return await self._writer.execute(command)
 
-    async def record_market_change_published(self, change: MarketChange) -> int:
+    async def record_market_change_published(
+        self,
+        change: MarketChange,
+        *,
+        market_ids: Sequence[str] | None = None,
+    ) -> int:
         """Idempotently record an admitted Watch publication baseline."""
 
         if not isinstance(change, MarketChange):
             raise TypeError("change must be a MarketChange")
-        if change.change_type not in {
+        active = change.change_type in {
             MarketChangeType.MARKET_ADDED,
             MarketChangeType.MARKET_UPDATED,
-        }:
-            raise ValueError("only added or updated changes form a watch baseline")
-        if change.market_id is None:
-            raise ValueError("published market change must identify a market")
+        }
+        if change.market_id is not None:
+            affected_market_ids = (change.market_id,)
+        else:
+            if market_ids is None:
+                raise ValueError("event-wide publication requires market_ids")
+            affected_market_ids = tuple(market_ids)
+        encoded_market_ids = json.loads(_encode_ids(affected_market_ids))
         details = _encode_json_object(
             {
+                "active": active,
                 "change_id": change.change_id,
                 "change_type": change.change_type.value,
                 "event_id": change.event_id,
                 "market_id": change.market_id,
+                "market_ids": encoded_market_ids,
                 "sync_generation": change.change_id.rsplit(":", 2)[0],
                 "token_ids": change.token_ids,
             }
@@ -512,14 +523,85 @@ class SystemEventRepository:
         rows = await _fetch_all(
             self._path,
             """
-            SELECT DISTINCT json_extract(details_json, '$.market_id') AS market_id
+            SELECT details_json
             FROM system_events
             WHERE event_type = 'MARKET_CHANGE_PUBLISHED'
-              AND json_type(details_json, '$.market_id') = 'text'
-            ORDER BY CAST(market_id AS BLOB)
+            ORDER BY id
             """,
         )
-        return frozenset(str(row["market_id"]) for row in rows)
+        active_market_ids: set[str] = set()
+        for row in rows:
+            details = json.loads(row["details_json"])
+            affected = details.get("market_ids")
+            if affected is None and details.get("market_id") is not None:
+                affected = [details["market_id"]]
+            if not isinstance(affected, list):
+                continue
+            is_active = details.get("active", True)
+            for market_id in affected:
+                if not isinstance(market_id, str) or not market_id:
+                    continue
+                if is_active is True:
+                    active_market_ids.add(market_id)
+                else:
+                    active_market_ids.discard(market_id)
+        return frozenset(active_market_ids)
+
+    async def get_settlement_refresh_cursor(self) -> str | None:
+        row = await _fetch_one(
+            self._path,
+            """
+            SELECT json_extract(details_json, '$.cursor') AS cursor
+            FROM system_events
+            WHERE event_type = 'SETTLEMENT_REFRESH_CURSOR'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (),
+        )
+        return None if row is None else str(row["cursor"])
+
+    async def record_settlement_refresh_cursor(
+        self,
+        *,
+        sync_generation: str,
+        cursor: str,
+        occurred_at: int,
+    ) -> int:
+        details = _encode_json_object(
+            {"cursor": cursor, "sync_generation": sync_generation}
+        )
+
+        async def command(connection: aiosqlite.Connection) -> int:
+            existing = await connection.execute(
+                """
+                SELECT id FROM system_events
+                WHERE event_type = 'SETTLEMENT_REFRESH_CURSOR'
+                  AND json_extract(details_json, '$.sync_generation') = ?
+                LIMIT 1
+                """,
+                (sync_generation,),
+            )
+            row = await existing.fetchone()
+            if row is not None:
+                return int(row[0])
+            inserted = await connection.execute(
+                """
+                INSERT INTO system_events (
+                    component, severity, event_type, message,
+                    details_json, occurred_at
+                ) VALUES ('SYNC', 'INFO', 'SETTLEMENT_REFRESH_CURSOR', ?, ?, ?)
+                """,
+                (
+                    f"Settlement refresh advanced through {cursor}",
+                    details,
+                    occurred_at,
+                ),
+            )
+            assert inserted.lastrowid is not None
+            return int(inserted.lastrowid)
+
+        return await self._writer.execute(command)
 
     async def read_after(
         self,
