@@ -203,11 +203,11 @@ class SignalManager:
                     f"signal {signal_id} expected revision {expected_revision}, current {latest_revision}"
                 )
             if isinstance(decision, OpportunityPresent):
+                await self._validate_database_state(connection, decision)
                 if await self._matches_latest(connection, signal_id, latest_revision, decision):
                     return SignalNotification(
                         signal_id, opportunity_key, "NOOP", latest_revision, decision
                     )
-                await self._validate_database_state(connection, decision)
                 revision = latest_revision + 1
                 await self._cas_update(
                     connection,

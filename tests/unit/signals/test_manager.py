@@ -283,6 +283,30 @@ async def test_deactivated_market_fails_closed_before_open(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_same_payload_noop_revalidates_deactivated_market(tmp_path: Path) -> None:
+    writer, catalog, signals, manager = await _open_manager(tmp_path)
+    try:
+        signal_id = await manager.apply(_present(), "opportunity-1", None)
+        assert signal_id is not None
+        _event, market, _token = _catalog()
+        await catalog.save_market(
+            replace(
+                market,
+                status=MarketStatus.CLOSED,
+                active=False,
+                accepting_orders=False,
+            )
+        )
+
+        with pytest.raises(ValueError, match="watchable"):
+            await manager.apply(_present(), "opportunity-1", 1)
+
+        assert await signals.get_latest_revision(signal_id) == 1
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
 async def test_absent_without_open_does_not_create_signal(tmp_path: Path) -> None:
     writer, _catalog_repo, _signals, manager = await _open_manager(tmp_path)
     try:
