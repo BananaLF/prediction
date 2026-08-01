@@ -15,12 +15,17 @@ from predmarket.strategy.implication import evaluate_implication
 from predmarket.strategy.neg_risk import evaluate_neg_risk
 from predmarket.strategy.optimizer import (
     DepthRequirement,
+    QuantityCandidate,
     breakpoint_quantities,
-    optimize_candidates,
-    optimize_quantity,
+    candidate_quantities,
+    constraint_root_quantities,
+    select_candidates,
     walk_depth,
 )
-from predmarket.strategy.decimal_context import StrategyNumericLimitError
+from predmarket.strategy.decimal_context import (
+    StrategyNumericLimitError,
+    isolated_decimal_context,
+)
 from predmarket.strategy.risk import (
     FailureScenario,
     OpenExposure,
@@ -173,34 +178,34 @@ def test_optimizer_public_apis_derive_precision_and_exponent_limits_from_inputs(
     book = _large_book()
     requirement = DepthRequirement(book, "BUY")
 
+    @isolated_decimal_context(operation_depth=24)
     def exercise():
         fill = walk_depth(book.asks, Decimal("1E+40"))
         points = breakpoint_quantities(
             (requirement,), minimum_quantity=Decimal("1E+39")
         )
-        optimized = optimize_quantity(
+        quantities = candidate_quantities(
             (requirement,),
             minimum_quantity=Decimal("1E+39"),
-            bankroll=Decimal("3"),
-            evaluate=lambda quantity: (quantity * Decimal("2E-40"), quantity * Decimal("1E-40")),
-            decimal_inputs=(Decimal("2E-40"), Decimal("1E-40")),
         )
-        selected = optimize_candidates(
-            (requirement,),
-            minimum_quantity=Decimal("1E+39"),
-            evaluate=lambda quantity: _Candidate(
+        def closed(quantity: Decimal) -> QuantityCandidate[_Candidate]:
+            item = _Candidate(
                 quantity, quantity * Decimal("2E-40"), quantity * Decimal("1E-40")
-            ),
-            constraint_margins=lambda candidate: {
-                "capital": candidate.total_capital - Decimal("3")
-            },
-            is_feasible=lambda candidate: candidate.total_capital <= Decimal("3"),
-            total_capital=lambda candidate: candidate.total_capital,
-            expected_profit=lambda candidate: candidate.expected_profit,
-            quantity=lambda candidate: candidate.quantity,
-            decimal_inputs=(Decimal("2E-40"), Decimal("1E-40"), Decimal("3")),
-        )
-        return fill, points, optimized, selected
+            )
+            margin = item.total_capital - Decimal("3")
+            return QuantityCandidate(
+                item,
+                item.quantity,
+                item.total_capital,
+                item.expected_profit,
+                (("capital", margin),),
+                margin <= 0,
+            )
+
+        base = tuple(closed(value) for value in quantities)
+        roots = constraint_root_quantities(base)
+        selected = select_candidates(base + tuple(closed(value) for value in roots))
+        return fill, points, quantities, roots, selected
 
     _assert_ambient_invariant(exercise)
 

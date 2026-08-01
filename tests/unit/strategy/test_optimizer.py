@@ -7,9 +7,11 @@ from predmarket.domain.orderbook import OrderBook, OrderBookLevel
 from predmarket.strategy.optimizer import (
     DepthRequirement,
     InsufficientDepth,
+    QuantityCandidate,
     breakpoint_quantities,
-    optimize_quantity,
-    optimize_candidates,
+    candidate_quantities,
+    constraint_root_quantities,
+    select_candidates,
     walk_depth,
 )
 
@@ -81,87 +83,17 @@ def test_breakpoints_include_minimum_default_and_every_relevant_l2_boundary() ->
     assert candidates == (Decimal("3"), Decimal("4"), Decimal("5"))
 
 
-def test_optimizer_adds_exact_bankroll_boundary_inside_a_depth_interval() -> None:
-    # Catches dropping the largest executable quantity when bankroll cuts a level.
-    book = _book("buy", asks=(("0.50", "2"), ("0.60", "8")))
-
-    quantity = optimize_quantity(
-        (DepthRequirement(book, "BUY"),),
-        minimum_quantity=Decimal("1"),
-        default_quantity=Decimal("1"),
-        bankroll=Decimal("2"),
-        evaluate=lambda q: (q * Decimal("0.5"), q * Decimal("0.1")),
-        decimal_inputs=(Decimal("0.5"), Decimal("0.1")),
-    )
-
-    assert quantity == Decimal("4")
-
-
-def test_optimizer_selects_maximum_profit_not_largest_quantity() -> None:
-    # Catches using maximum depth rather than the specified profit objective.
-    book = _book("buy", asks=(("0.40", "2"), ("0.90", "3")))
-
-    def evaluate(quantity: Decimal) -> tuple[Decimal, Decimal]:
-        profit = Decimal("1") if quantity == Decimal("2") else Decimal("0.5")
-        return quantity * Decimal("0.4"), profit
-
-    quantity = optimize_quantity(
-        (DepthRequirement(book, "BUY"),),
-        minimum_quantity=Decimal("1"),
-        default_quantity=Decimal("1"),
-        bankroll=Decimal("10"),
-        evaluate=evaluate,
-        decimal_inputs=(Decimal("1"), Decimal("0.5"), Decimal("0.4")),
-    )
-
-    assert quantity == Decimal("2")
-
-
-def test_optimizer_returns_none_for_minimum_size_or_depth_failure() -> None:
+def test_candidate_quantity_generation_returns_empty_for_minimum_depth_failure() -> None:
     # Catches manufacturing an undersized or partially filled opportunity.
     book = _book("buy", asks=(("0.50", "2"),), minimum="3")
 
-    quantity = optimize_quantity(
+    quantities = candidate_quantities(
         (DepthRequirement(book, "BUY"),),
         minimum_quantity=Decimal("3"),
         default_quantity=Decimal("1"),
-        bankroll=Decimal("10"),
-        evaluate=lambda q: (q, q),
-        decimal_inputs=(Decimal("1"),),
     )
 
-    assert quantity is None
-
-
-def test_optimizer_rejects_missing_or_fake_decimal_dependency_declaration_before_callback() -> None:
-    book = _book("buy")
-
-    class Evaluator:
-        called = False
-
-        def __call__(self, quantity: Decimal) -> tuple[Decimal, Decimal]:
-            self.called = True
-            return quantity, quantity
-
-    evaluator = Evaluator()
-    common = {
-        "requirements": (DepthRequirement(book, "BUY"),),
-        "minimum_quantity": Decimal("1"),
-        "bankroll": Decimal("10"),
-        "evaluate": evaluator,
-    }
-
-    with pytest.raises(ValueError, match="decimal_inputs"):
-        optimize_quantity(**common)
-    assert evaluator.called is False
-
-    with pytest.raises(ValueError, match="decimal_inputs"):
-        optimize_quantity(**common, decimal_inputs=())
-    assert evaluator.called is False
-
-    with pytest.raises(ValueError, match="decimal_inputs"):
-        optimize_quantity(**common, decimal_inputs=(object(),))
-    assert evaluator.called is False
+    assert quantities == ()
 
 
 def test_candidate_optimizer_inserts_constraint_boundary_before_selecting_profit() -> None:
@@ -183,27 +115,22 @@ def test_candidate_optimizer_inserts_constraint_boundary_before_selecting_profit
             quantity * Decimal("0.4"),
         )
 
-    selection = optimize_candidates(
-        (DepthRequirement(book, "BUY"),),
-        minimum_quantity=Decimal("1"),
-        default_quantity=Decimal("1"),
-        evaluate=evaluate,
-        constraint_margins=lambda candidate: {
-            "bankroll": candidate.total_capital - Decimal("1000"),
-            "unhedged": candidate.unhedged - Decimal("20"),
-        },
-        is_feasible=lambda candidate: candidate.unhedged <= Decimal("20"),
-        total_capital=lambda candidate: candidate.total_capital,
-        expected_profit=lambda candidate: candidate.expected_profit,
-        quantity=lambda candidate: candidate.quantity,
-        decimal_inputs=(
-            Decimal("0.8"),
-            Decimal("0.2"),
-            Decimal("0.4"),
-            Decimal("1000"),
-            Decimal("20"),
-        ),
-    )
+    def closed(candidate: Candidate) -> QuantityCandidate[Candidate]:
+        return QuantityCandidate(
+            evaluation=candidate,
+            quantity=candidate.quantity,
+            total_capital=candidate.total_capital,
+            expected_profit=candidate.expected_profit,
+            constraint_margins=(
+                ("bankroll", candidate.total_capital - Decimal("1000")),
+                ("unhedged", candidate.unhedged - Decimal("20")),
+            ),
+            feasible=candidate.unhedged <= Decimal("20"),
+        )
+
+    base = tuple(closed(evaluate(value)) for value in (Decimal("1"), Decimal("100")))
+    roots = constraint_root_quantities(base)
+    selection = select_candidates(base + tuple(closed(evaluate(value)) for value in roots))
 
     assert selection.feasible is True
     assert selection.candidate.quantity == Decimal("50")
@@ -234,17 +161,19 @@ def test_candidate_optimizer_evaluates_both_adjacent_decimals_at_rounded_roots(
         raw = candidate.quantity * Decimal("0.124") - Decimal("7")
         return raw if safe_below else -raw
 
-    selection = optimize_candidates(
-        (DepthRequirement(book, "BUY"),),
-        minimum_quantity=Decimal("1"),
-        evaluate=evaluate,
-        constraint_margins=lambda candidate: {constraint_name: margin(candidate)},
-        is_feasible=lambda candidate: margin(candidate) <= 0,
-        total_capital=lambda candidate: candidate.total_capital,
-        expected_profit=lambda candidate: candidate.expected_profit,
-        quantity=lambda candidate: candidate.quantity,
-        decimal_inputs=(Decimal("0.124"), Decimal("7")),
-    )
+    def closed(candidate: Candidate) -> QuantityCandidate[Candidate]:
+        return QuantityCandidate(
+            evaluation=candidate,
+            quantity=candidate.quantity,
+            total_capital=candidate.total_capital,
+            expected_profit=candidate.expected_profit,
+            constraint_margins=((constraint_name, margin(candidate)),),
+            feasible=margin(candidate) <= 0,
+        )
+
+    base = tuple(closed(evaluate(value)) for value in (Decimal("1"), Decimal("100")))
+    roots = constraint_root_quantities(base)
+    selection = select_candidates(base + tuple(closed(evaluate(value)) for value in roots))
 
     assert selection is not None
     assert selection.candidate.quantity > Decimal("56")

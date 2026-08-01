@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from fractions import Fraction
 from typing import Generic, Literal, TypeVar
 
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
 from predmarket.strategy.decimal_context import (
-    MAX_DECIMAL_INPUTS,
     MAX_LEVELS_PER_BOOK,
     MAX_OPTIMIZER_CANDIDATES,
     MAX_STRATEGY_LEGS,
@@ -55,8 +55,49 @@ class DepthRequirement:
         return self.book.asks if self.side == "BUY" else self.book.bids
 
 
-Evaluation = Callable[[Decimal], tuple[Decimal, Decimal]]
 T = TypeVar("T")
+
+
+@dataclass(frozen=True, slots=True)
+class QuantityCandidate(Generic[T]):
+    """A complete, immutable strategy evaluation at one exact quantity."""
+
+    evaluation: T
+    quantity: Decimal
+    total_capital: Decimal
+    expected_profit: Decimal
+    constraint_margins: tuple[tuple[str, Decimal], ...]
+    feasible: bool
+
+    def __post_init__(self) -> None:
+        _positive_decimal(self.quantity, "quantity")
+        _positive_decimal(self.total_capital, "total_capital")
+        _finite_decimal(self.expected_profit, "expected_profit")
+        if type(self.feasible) is not bool:
+            raise ValueError("feasible must be a bool")
+        margins = bounded_sequence(
+            self.constraint_margins,
+            field_name="constraint_margins",
+            max_items=MAX_STRATEGY_LEGS * 2 + 3,
+        )
+        if not margins:
+            raise ValueError("constraint_margins must not be empty")
+        normalized: list[tuple[str, Decimal]] = []
+        for item in margins:
+            if (
+                not isinstance(item, tuple)
+                or len(item) != 2
+                or not isinstance(item[0], str)
+                or not item[0]
+            ):
+                raise ValueError("constraint margins must be name/Decimal pairs")
+            _finite_decimal(item[1], "constraint margin")
+            normalized.append(item)
+        normalized.sort(key=lambda item: item[0].encode("utf-8"))
+        names = [item[0] for item in normalized]
+        if len(names) != len(set(names)):
+            raise ValueError("constraint margin names must be unique")
+        object.__setattr__(self, "constraint_margins", tuple(normalized))
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +105,94 @@ class CandidateSelection(Generic[T]):
     candidate: T
     feasible: bool
     candidates: tuple[T, ...]
+
+
+def constraint_root_quantities(
+    candidates: Sequence[QuantityCandidate[object]],
+) -> tuple[Decimal, ...]:
+    """Derive hard-constraint roots from already-computed candidate data."""
+
+    materialized = _quantity_candidates(candidates)
+    return _constraint_root_quantities(materialized)
+
+
+@isolated_decimal_context(operation_depth=12)
+def _constraint_root_quantities(
+    candidates: tuple[QuantityCandidate[object], ...],
+) -> tuple[Decimal, ...]:
+    ordered = tuple(sorted(candidates, key=lambda item: item.quantity))
+    names = tuple(name for name, _ in ordered[0].constraint_margins)
+    if any(tuple(name for name, _ in item.constraint_margins) != names for item in ordered):
+        raise ValueError("constraint margin names must be stable")
+    roots: set[Decimal] = set()
+    for lower, upper in zip(ordered, ordered[1:]):
+        lower_margins = dict(lower.constraint_margins)
+        upper_margins = dict(upper.constraint_margins)
+        for name in names:
+            lower_margin = lower_margins[name]
+            upper_margin = upper_margins[name]
+            if lower_margin == upper_margin or lower_margin * upper_margin > 0:
+                continue
+            exact_fraction = Fraction(lower.quantity) + (
+                -Fraction(lower_margin)
+                * (Fraction(upper.quantity) - Fraction(lower.quantity))
+                / (Fraction(upper_margin) - Fraction(lower_margin))
+            )
+            exact_root = _terminating_decimal(exact_fraction)
+            root = exact_root or (
+                lower.quantity
+                + (-lower_margin)
+                * (upper.quantity - lower.quantity)
+                / (upper_margin - lower_margin)
+            )
+            if not lower.quantity < root < upper.quantity:
+                continue
+            roots.add(root)
+            if exact_root is not None:
+                _candidate_count(len(ordered) + len(roots))
+                continue
+            if lower_margin <= 0 < upper_margin:
+                roots.add(root.next_minus())
+            elif upper_margin <= 0 < lower_margin:
+                roots.add(root.next_plus())
+            _candidate_count(len(ordered) + len(roots))
+    return tuple(sorted(roots))
+
+
+def select_candidates(
+    candidates: Sequence[QuantityCandidate[T]],
+) -> CandidateSelection[T] | None:
+    """Select maximum profit from complete candidate data without callbacks."""
+
+    materialized = _quantity_candidates(candidates)
+    return _select_candidates(materialized)
+
+
+@isolated_decimal_context(operation_depth=4)
+def _select_candidates(
+    candidates: tuple[QuantityCandidate[T], ...],
+) -> CandidateSelection[T] | None:
+    if not candidates:
+        return None
+    quantities = [item.quantity for item in candidates]
+    if len(quantities) != len(set(quantities)):
+        raise ValueError("candidate quantities must be unique")
+    feasible = tuple(item for item in candidates if item.feasible)
+    pool = feasible or candidates
+    selected = max(
+        pool,
+        key=lambda item: (
+            item.expected_profit,
+            -item.total_capital,
+            -item.quantity,
+        ),
+    )
+    ordered = tuple(sorted(candidates, key=lambda item: item.quantity))
+    return CandidateSelection(
+        selected.evaluation,
+        bool(feasible),
+        tuple(item.evaluation for item in ordered),
+    )
 
 
 def walk_depth(
@@ -129,6 +258,57 @@ def breakpoint_quantities(
     )
 
 
+def candidate_quantities(
+    requirements: Sequence[DepthRequirement],
+    *,
+    minimum_quantity: Decimal,
+    default_quantity: Decimal = Decimal("1"),
+    extra_breakpoints: Sequence[Decimal] = (),
+) -> tuple[Decimal, ...]:
+    """Return bounded base quantities without evaluating strategy callbacks."""
+
+    materialized = _requirements(requirements)
+    extras = bounded_sequence(
+        extra_breakpoints,
+        field_name="extra_breakpoints",
+        max_items=MAX_OPTIMIZER_CANDIDATES,
+    )
+    return _candidate_quantities(
+        materialized,
+        minimum_quantity=minimum_quantity,
+        default_quantity=default_quantity,
+        extra_breakpoints=extras,
+    )
+
+
+@isolated_decimal_context(operation_depth=8)
+def _candidate_quantities(
+    requirements: tuple[DepthRequirement, ...],
+    *,
+    minimum_quantity: Decimal,
+    default_quantity: Decimal,
+    extra_breakpoints: tuple[Decimal, ...],
+) -> tuple[Decimal, ...]:
+    base = set(
+        _breakpoint_quantities(
+            requirements,
+            minimum_quantity=minimum_quantity,
+            default_quantity=default_quantity,
+        )
+    )
+    _candidate_count(len(base))
+    if not base:
+        return ()
+    lower_bound = min(base)
+    upper_bound = max(base)
+    for value in extra_breakpoints:
+        _positive_decimal(value, "extra breakpoint")
+        if lower_bound <= value <= upper_bound:
+            base.add(value)
+            _candidate_count(len(base))
+    return tuple(sorted(base))
+
+
 @isolated_decimal_context(operation_depth=8)
 def _breakpoint_quantities(
     requirements: tuple[DepthRequirement, ...],
@@ -162,218 +342,6 @@ def _breakpoint_quantities(
     return tuple(sorted(candidates))
 
 
-def optimize_quantity(
-    requirements: Sequence[DepthRequirement],
-    *,
-    minimum_quantity: Decimal,
-    bankroll: Decimal,
-    evaluate: Evaluation,
-    default_quantity: Decimal = Decimal("1"),
-    decimal_inputs: Sequence[Decimal] | None = None,
-) -> Decimal | None:
-    """Choose the executable candidate with maximum expected profit.
-
-    Besides L2 breakpoints, this inserts the exact quantity where a monotonic,
-    piecewise-linear capital curve crosses the bankroll inside a depth level.
-    """
-
-    materialized = _requirements(requirements)
-    declared = _decimal_inputs(decimal_inputs)
-    return _optimize_quantity(
-        materialized,
-        minimum_quantity=minimum_quantity,
-        bankroll=bankroll,
-        evaluate=evaluate,
-        default_quantity=default_quantity,
-        decimal_inputs=declared,
-    )
-
-
-@isolated_decimal_context(operation_depth=20)
-def _optimize_quantity(
-    requirements: tuple[DepthRequirement, ...],
-    *,
-    minimum_quantity: Decimal,
-    bankroll: Decimal,
-    evaluate: Evaluation,
-    default_quantity: Decimal,
-    decimal_inputs: tuple[Decimal, ...],
-) -> Decimal | None:
-    materialized = requirements
-    _positive_decimal(bankroll, "bankroll")
-    if not callable(evaluate):
-        raise ValueError("evaluate must be callable")
-    breakpoints = breakpoint_quantities(
-        materialized,
-        minimum_quantity=minimum_quantity,
-        default_quantity=default_quantity,
-    )
-    evaluated: dict[Decimal, tuple[Decimal, Decimal]] = {}
-    for quantity in breakpoints:
-        evaluated[quantity] = _evaluation(evaluate(quantity))
-
-    for lower, upper in zip(breakpoints, breakpoints[1:]):
-        lower_capital = evaluated[lower][0]
-        upper_capital = evaluated[upper][0]
-        if lower_capital <= bankroll < upper_capital:
-            if upper_capital <= lower_capital:
-                continue
-            boundary = lower + (
-                (bankroll - lower_capital)
-                * (upper - lower)
-                / (upper_capital - lower_capital)
-            )
-            if lower < boundary < upper:
-                evaluated[boundary] = _evaluation(evaluate(boundary))
-
-    feasible = [
-        (quantity, capital, profit)
-        for quantity, (capital, profit) in evaluated.items()
-        if capital <= bankroll
-    ]
-    if not feasible:
-        return None
-    # Lower capital then lower quantity wins an exact-profit tie.
-    return max(feasible, key=lambda item: (item[2], -item[1], -item[0]))[0]
-
-
-def optimize_candidates(
-    requirements: Sequence[DepthRequirement],
-    *,
-    minimum_quantity: Decimal,
-    evaluate: Callable[[Decimal], T],
-    constraint_margins: Callable[[T], Mapping[str, Decimal]],
-    is_feasible: Callable[[T], bool],
-    total_capital: Callable[[T], Decimal],
-    expected_profit: Callable[[T], Decimal],
-    quantity: Callable[[T], Decimal],
-    default_quantity: Decimal = Decimal("1"),
-    extra_breakpoints: Sequence[Decimal] = (),
-    decimal_inputs: Sequence[Decimal] | None = None,
-) -> CandidateSelection[T] | None:
-    """Evaluate complete candidates, insert exact hard-constraint roots, then optimize."""
-
-    materialized = _requirements(requirements)
-    extras = bounded_sequence(
-        extra_breakpoints,
-        field_name="extra_breakpoints",
-        max_items=MAX_OPTIMIZER_CANDIDATES,
-    )
-    declared = _decimal_inputs(decimal_inputs)
-    return _optimize_candidates(
-        materialized,
-        minimum_quantity=minimum_quantity,
-        evaluate=evaluate,
-        constraint_margins=constraint_margins,
-        is_feasible=is_feasible,
-        total_capital=total_capital,
-        expected_profit=expected_profit,
-        quantity=quantity,
-        default_quantity=default_quantity,
-        extra_breakpoints=extras,
-        decimal_inputs=declared,
-    )
-
-
-@isolated_decimal_context(operation_depth=24)
-def _optimize_candidates(
-    requirements: tuple[DepthRequirement, ...],
-    *,
-    minimum_quantity: Decimal,
-    evaluate: Callable[[Decimal], T],
-    constraint_margins: Callable[[T], Mapping[str, Decimal]],
-    is_feasible: Callable[[T], bool],
-    total_capital: Callable[[T], Decimal],
-    expected_profit: Callable[[T], Decimal],
-    quantity: Callable[[T], Decimal],
-    default_quantity: Decimal,
-    extra_breakpoints: tuple[Decimal, ...],
-    decimal_inputs: tuple[Decimal, ...],
-) -> CandidateSelection[T] | None:
-    base = set(
-        breakpoint_quantities(
-            requirements,
-            minimum_quantity=minimum_quantity,
-            default_quantity=default_quantity,
-        )
-    )
-    _candidate_count(len(base))
-    if not base:
-        return None
-    lower_bound = min(base)
-    upper_bound = max(base)
-    for value in extra_breakpoints:
-        _positive_decimal(value, "extra breakpoint")
-        if lower_bound <= value <= upper_bound:
-            base.add(value)
-            _candidate_count(len(base))
-
-    evaluated: dict[Decimal, T] = {
-        value: evaluate(value) for value in sorted(base)
-    }
-    ordered_base = tuple(sorted(evaluated))
-    margin_names: tuple[str, ...] | None = None
-    margins_by_quantity: dict[Decimal, Mapping[str, Decimal]] = {}
-    for value in ordered_base:
-        margins = constraint_margins(evaluated[value])
-        if not isinstance(margins, Mapping) or not margins:
-            raise ValueError("constraint_margins must return a non-empty mapping")
-        names = tuple(sorted(margins, key=lambda item: item.encode("utf-8")))
-        if margin_names is None:
-            margin_names = names
-        elif names != margin_names:
-            raise ValueError("constraint margin names must be stable")
-        for margin in margins.values():
-            _finite_decimal(margin, "constraint margin")
-        margins_by_quantity[value] = margins
-
-    assert margin_names is not None
-    root_candidates: set[Decimal] = set()
-    for lower, upper in zip(ordered_base, ordered_base[1:]):
-        for name in margin_names:
-            lower_margin = margins_by_quantity[lower][name]
-            upper_margin = margins_by_quantity[upper][name]
-            if lower_margin == upper_margin or lower_margin * upper_margin > 0:
-                continue
-            root = lower + (
-                (-lower_margin) * (upper - lower) / (upper_margin - lower_margin)
-            )
-            if lower < root < upper:
-                root_candidates.add(root)
-                _candidate_count(len(evaluated) + len(root_candidates))
-                # Margins use <= 0 as the safe side. Evaluate the adjacent
-                # representable Decimal only in that direction, so a rounded
-                # multiplication cannot admit the mathematically unsafe side.
-                if lower_margin <= 0 < upper_margin:
-                    adjacent = root.next_minus()
-                elif upper_margin <= 0 < lower_margin:
-                    adjacent = root.next_plus()
-                else:
-                    continue
-                if lower_bound <= adjacent <= upper_bound:
-                    root_candidates.add(adjacent)
-                    _candidate_count(len(evaluated) + len(root_candidates))
-    for root_candidate in root_candidates:
-        evaluated[root_candidate] = evaluate(root_candidate)
-
-    candidates = tuple(evaluated.values())
-    feasible_candidates = tuple(item for item in candidates if is_feasible(item))
-    pool = feasible_candidates or candidates
-    selected = max(
-        pool,
-        key=lambda item: (
-            expected_profit(item),
-            -total_capital(item),
-            -quantity(item),
-        ),
-    )
-    return CandidateSelection(
-        selected,
-        bool(feasible_candidates),
-        tuple(sorted(candidates, key=quantity)),
-    )
-
-
 def _requirements(
     values: Sequence[DepthRequirement],
 ) -> tuple[DepthRequirement, ...]:
@@ -392,19 +360,16 @@ def _requirements(
     return materialized
 
 
-def _decimal_inputs(values: Sequence[Decimal] | None) -> tuple[Decimal, ...]:
-    if values is None:
-        raise ValueError("decimal_inputs must be explicitly declared")
+def _quantity_candidates(
+    values: Sequence[QuantityCandidate[T]],
+) -> tuple[QuantityCandidate[T], ...]:
     materialized = bounded_sequence(
         values,
-        field_name="decimal_inputs",
-        max_items=MAX_DECIMAL_INPUTS,
+        field_name="candidates",
+        max_items=MAX_OPTIMIZER_CANDIDATES,
     )
-    if not materialized or any(
-        not isinstance(value, Decimal) or not value.is_finite()
-        for value in materialized
-    ):
-        raise ValueError("decimal_inputs must contain finite Decimal values")
+    if any(not isinstance(value, QuantityCandidate) for value in materialized):
+        raise ValueError("candidates must contain QuantityCandidate values")
     return materialized
 
 
@@ -415,13 +380,24 @@ def _candidate_count(count: int) -> None:
         )
 
 
-def _evaluation(value: object) -> tuple[Decimal, Decimal]:
-    if not isinstance(value, tuple) or len(value) != 2:
-        raise ValueError("evaluate must return (total_capital, expected_profit)")
-    capital, profit = value
-    _positive_decimal(capital, "total_capital")
-    _finite_decimal(profit, "expected_profit")
-    return capital, profit
+def _terminating_decimal(value: Fraction) -> Decimal | None:
+    denominator = value.denominator
+    twos = 0
+    fives = 0
+    while denominator % 2 == 0:
+        denominator //= 2
+        twos += 1
+    while denominator % 5 == 0:
+        denominator //= 5
+        fives += 1
+    if denominator != 1:
+        return None
+    scale = max(twos, fives)
+    coefficient = abs(value.numerator)
+    coefficient *= 2 ** (scale - twos)
+    coefficient *= 5 ** (scale - fives)
+    digits = tuple(int(character) for character in str(coefficient))
+    return Decimal((1 if value.numerator < 0 else 0, digits, -scale))
 
 
 def _positive_decimal(value: object, field_name: str) -> None:

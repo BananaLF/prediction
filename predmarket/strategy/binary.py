@@ -13,16 +13,19 @@ from predmarket.domain.signal import (
     StrategyType,
 )
 from predmarket.strategy.common import (
+    EvaluatedTrades,
     calculation,
     classify,
     conversion_leg,
     feasibility_details,
     long_entry_risk,
     not_evaluable,
-    optimize_trades,
+    plan_trade_quantities,
+    select_trade_optimization,
     split_inventory_risk,
     token_by_outcome,
     trade,
+    trade_root_quantities,
     validate_inputs,
 )
 from predmarket.strategy.decimal_context import (
@@ -91,7 +94,16 @@ def _evaluate_binary(context: StrategyContext) -> StrategyDecision:
 def _underpriced(context, market, yes, no) -> StrategyDecision:
     specs = ((market, yes, Action.BUY), (market, no, Action.BUY))
 
-    def economics(quantity, trades):
+    plan = plan_trade_quantities(context, trade_specs=specs)
+    if plan is None:
+        return not_evaluable(
+            context,
+            DecisionReason.ORDERBOOK_INVALID,
+            "no_executable_quantity",
+        )
+
+    def evaluate_candidate(quantity):
+        trades = tuple(trade(context, *spec, quantity) for spec in specs)
         trading_cost = sum(
             (item.fill.gross_amount + item.fee for item in trades), Decimal("0")
         )
@@ -100,15 +112,26 @@ def _underpriced(context, market, yes, no) -> StrategyDecision:
             * context.configuration.safety_buffer_rate
         )
         capital = trading_cost + context.configuration.conversion_cost + safety
-        return capital, quantity - capital
+        return EvaluatedTrades(
+            quantity,
+            trades,
+            capital,
+            quantity - capital,
+            long_entry_risk(context, trades, total_capital=capital),
+        )
 
-    optimized = optimize_trades(
+    candidates = tuple(evaluate_candidate(value) for value in plan.quantities)
+    if plan.forced_absent_reason is None:
+        known = {item.quantity for item in candidates}
+        candidates += tuple(
+            evaluate_candidate(value)
+            for value in trade_root_quantities(context, candidates)
+            if value not in known
+        )
+    optimized = select_trade_optimization(
         context,
-        trade_specs=specs,
-        economics=economics,
-        risk_evaluator=lambda trades, capital: long_entry_risk(
-            context, trades, total_capital=capital
-        ),
+        candidates,
+        forced_absent_reason=plan.forced_absent_reason,
     )
     if optimized is None:
         return not_evaluable(
@@ -151,22 +174,42 @@ def _underpriced(context, market, yes, no) -> StrategyDecision:
 def _overpriced(context, market, yes, no) -> StrategyDecision:
     specs = ((market, yes, Action.SELL), (market, no, Action.SELL))
 
-    def economics(quantity, trades):
+    plan = plan_trade_quantities(context, trade_specs=specs)
+    if plan is None:
+        return not_evaluable(
+            context,
+            DecisionReason.ORDERBOOK_INVALID,
+            "no_executable_quantity",
+        )
+
+    def evaluate_candidate(quantity):
+        trades = tuple(trade(context, *spec, quantity) for spec in specs)
         safety = (
             sum((item.fill.gross_amount for item in trades), Decimal("0"))
             * context.configuration.safety_buffer_rate
         )
         capital = quantity + context.configuration.conversion_cost + safety
         proceeds = sum((item.net_proceeds for item in trades), Decimal("0"))
-        return capital, proceeds - capital
+        return EvaluatedTrades(
+            quantity,
+            trades,
+            capital,
+            proceeds - capital,
+            split_inventory_risk(context, trades, total_capital=capital),
+        )
 
-    optimized = optimize_trades(
+    candidates = tuple(evaluate_candidate(value) for value in plan.quantities)
+    if plan.forced_absent_reason is None:
+        known = {item.quantity for item in candidates}
+        candidates += tuple(
+            evaluate_candidate(value)
+            for value in trade_root_quantities(context, candidates)
+            if value not in known
+        )
+    optimized = select_trade_optimization(
         context,
-        trade_specs=specs,
-        economics=economics,
-        risk_evaluator=lambda trades, capital: split_inventory_risk(
-            context, trades, total_capital=capital
-        ),
+        candidates,
+        forced_absent_reason=plan.forced_absent_reason,
     )
     if optimized is None:
         return not_evaluable(

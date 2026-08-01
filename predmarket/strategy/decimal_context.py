@@ -17,6 +17,8 @@ from decimal import (
 from functools import wraps
 from typing import Any, Callable, ParamSpec, TypeVar, cast
 
+from predmarket.domain.orderbook import OrderBook
+
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -80,6 +82,8 @@ class _Envelope:
         self.min_adjusted = 0
         self.max_adjusted = 0
         self.collection_width = 1
+        self.book_count = 0
+        self.total_book_levels = 0
         self._seen: set[int] = set()
 
     def add(self, value: object) -> None:
@@ -129,6 +133,23 @@ class _Envelope:
         if identity in self._seen:
             return
         self._seen.add(identity)
+        if isinstance(value, OrderBook):
+            self.book_count += 1
+            if self.book_count > MAX_STRATEGY_LEGS:
+                raise StrategyNumericLimitError(
+                    "strategy books exceed the numeric leg limit"
+                )
+            bid_count = len(value.bids)
+            ask_count = len(value.asks)
+            if bid_count > MAX_LEVELS_PER_BOOK or ask_count > MAX_LEVELS_PER_BOOK:
+                raise StrategyNumericLimitError(
+                    "order-book levels exceed the strategy numeric limit"
+                )
+            self.total_book_levels += bid_count + ask_count
+            if self.total_book_levels > MAX_TOTAL_BOOK_LEVELS:
+                raise StrategyNumericLimitError(
+                    "total order-book levels exceed the strategy numeric limit"
+                )
         if isinstance(value, Mapping):
             width = len(value)
             self._add_collection_width(width)

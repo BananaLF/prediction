@@ -10,6 +10,7 @@ from predmarket.domain.orderbook import OrderBook
 from predmarket.strategy.decimal_context import (
     MAX_FAILURE_SCENARIOS,
     MAX_STRATEGY_LEGS,
+    StrategyNumericLimitError,
     bounded_sequence,
     isolated_decimal_context,
 )
@@ -139,6 +140,15 @@ def assess_failure_scenarios(
         field_name="scenarios",
         max_items=MAX_FAILURE_SCENARIOS,
     )
+    total_exposures = sum(
+        len(scenario.exposures)
+        for scenario in materialized
+        if isinstance(scenario, FailureScenario)
+    )
+    if total_exposures > MAX_STRATEGY_LEGS:
+        raise StrategyNumericLimitError(
+            "scenario exposures exceed the numeric leg limit"
+        )
     return _assess_failure_scenarios(
         materialized,
         evaluated_at_ms=evaluated_at_ms,

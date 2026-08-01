@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from collections.abc import Callable
 from typing import Iterable
 
 from predmarket.domain.fees import FeeCalculator, FeeSchedule
@@ -25,16 +24,11 @@ from predmarket.domain.signal import (
 from predmarket.strategy.optimizer import (
     DepthFill,
     DepthRequirement,
-    CandidateSelection,
-    optimize_candidates,
-    optimize_quantity,
+    QuantityCandidate,
+    candidate_quantities,
+    constraint_root_quantities,
+    select_candidates,
     walk_depth,
-)
-from predmarket.strategy.decimal_context import (
-    MAX_LEVELS_PER_BOOK,
-    MAX_STRATEGY_LEGS,
-    MAX_TOTAL_BOOK_LEVELS,
-    StrategyNumericLimitError,
 )
 from predmarket.strategy.risk import (
     FailureScenario,
@@ -92,6 +86,12 @@ class EvaluatedTrades:
 @dataclass(frozen=True, slots=True)
 class TradeOptimization:
     candidate: EvaluatedTrades
+    forced_absent_reason: DecisionReason | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TradeQuantityPlan:
+    quantities: tuple[Decimal, ...]
     forced_absent_reason: DecisionReason | None = None
 
 
@@ -305,14 +305,11 @@ def trade(
     return Trade(market, token, book, action, fill, fee, schedule)
 
 
-def optimize_trades(
+def plan_trade_quantities(
     context: StrategyContext,
     *,
     trade_specs: tuple[tuple[Market, Token, Action], ...],
-    economics: Callable[[Decimal, tuple[Trade, ...]], tuple[Decimal, Decimal]],
-    risk_evaluator: Callable[[tuple[Trade, ...], Decimal], RiskResult],
-    decimal_inputs: tuple[Decimal, ...] = (),
-) -> TradeOptimization | None:
+) -> TradeQuantityPlan | None:
     requirements = tuple(
         DepthRequirement(
             next(book for book in context.orderbooks if book.token_id == token.id),
@@ -325,21 +322,6 @@ def optimize_trades(
         *(market.minimum_order_size or Decimal("0") for market, _, _ in trade_specs),
     )
 
-    def evaluate_candidate(quantity: Decimal) -> EvaluatedTrades:
-        trades = tuple(
-            trade(context, market, token, action, quantity)
-            for market, token, action in trade_specs
-        )
-        total_capital, expected_profit = economics(quantity, trades)
-        risk = risk_evaluator(trades, total_capital)
-        return EvaluatedTrades(
-            quantity,
-            trades,
-            total_capital,
-            expected_profit,
-            risk,
-        )
-
     maximum_depth = min(
         sum((level.size for level in requirement.levels), Decimal("0"))
         for requirement in requirements
@@ -347,8 +329,8 @@ def optimize_trades(
     if maximum_depth < minimum:
         if maximum_depth <= 0:
             return None
-        return TradeOptimization(
-            evaluate_candidate(maximum_depth),
+        return TradeQuantityPlan(
+            (maximum_depth,),
             DecisionReason.QUANTITY_BELOW_MINIMUM,
         )
 
@@ -361,53 +343,35 @@ def optimize_trades(
                 if minimum <= cumulative <= maximum_depth:
                     extra_breakpoints.add(cumulative)
 
-    def margins(candidate: EvaluatedTrades) -> dict[str, Decimal]:
-        values = {
-            "bankroll": candidate.total_capital - context.configuration.bankroll,
-            "profit": -candidate.expected_profit,
-            "return": (
-                context.configuration.minimum_return_rate * candidate.total_capital
-                - candidate.expected_profit
-            ),
-        }
-        for scenario in candidate.risk.scenarios:
-            values[f"risk:{scenario.name}"] = (
-                scenario.loss
-                - context.configuration.maximum_risk_rate * candidate.total_capital
-            )
-            values[f"unhedged:{scenario.name}"] = (
-                scenario.unhedged_notional
-                - context.configuration.maximum_unhedged_notional
-            )
-        return values
-
-    def feasible(candidate: EvaluatedTrades) -> bool:
-        return (
-            candidate.total_capital <= context.configuration.bankroll
-            and candidate.expected_profit > 0
-            and candidate.expected_profit
-            >= context.configuration.minimum_return_rate * candidate.total_capital
-            and all(
-                scenario.loss
-                <= context.configuration.maximum_risk_rate * candidate.total_capital
-                and scenario.unhedged_notional
-                <= context.configuration.maximum_unhedged_notional
-                for scenario in candidate.risk.scenarios
-            )
-        )
-
-    selection = optimize_candidates(
+    quantities = candidate_quantities(
         requirements,
         minimum_quantity=minimum,
         default_quantity=max(Decimal("1"), minimum),
-        evaluate=evaluate_candidate,
-        constraint_margins=margins,
-        is_feasible=feasible,
-        total_capital=lambda item: item.total_capital,
-        expected_profit=lambda item: item.expected_profit,
-        quantity=lambda item: item.quantity,
         extra_breakpoints=tuple(extra_breakpoints),
-        decimal_inputs=_strategy_decimal_inputs(context, decimal_inputs),
+    )
+    return TradeQuantityPlan(quantities)
+
+
+def trade_root_quantities(
+    context: StrategyContext,
+    candidates: tuple[EvaluatedTrades, ...],
+) -> tuple[Decimal, ...]:
+    closed = tuple(_quantity_candidate(context, item) for item in candidates)
+    return constraint_root_quantities(closed)
+
+
+def select_trade_optimization(
+    context: StrategyContext,
+    candidates: tuple[EvaluatedTrades, ...],
+    *,
+    forced_absent_reason: DecisionReason | None = None,
+) -> TradeOptimization | None:
+    if not candidates:
+        return None
+    if forced_absent_reason is not None:
+        return TradeOptimization(candidates[0], forced_absent_reason)
+    selection = select_candidates(
+        tuple(_quantity_candidate(context, item) for item in candidates)
     )
     if selection is None:
         return None
@@ -433,6 +397,50 @@ def optimize_trades(
         key=lambda item: (item.total_capital, item.quantity),
     )
     return TradeOptimization(selected, DecisionReason.INSUFFICIENT_CAPITAL)
+
+
+def _quantity_candidate(
+    context: StrategyContext,
+    candidate: EvaluatedTrades,
+) -> QuantityCandidate[EvaluatedTrades]:
+    margins = {
+        "bankroll": candidate.total_capital - context.configuration.bankroll,
+        "profit": -candidate.expected_profit,
+        "return": (
+            context.configuration.minimum_return_rate * candidate.total_capital
+            - candidate.expected_profit
+        ),
+    }
+    for scenario in candidate.risk.scenarios:
+        margins[f"risk:{scenario.name}"] = (
+            scenario.loss
+            - context.configuration.maximum_risk_rate * candidate.total_capital
+        )
+        margins[f"unhedged:{scenario.name}"] = (
+            scenario.unhedged_notional
+            - context.configuration.maximum_unhedged_notional
+        )
+    feasible = (
+        candidate.total_capital <= context.configuration.bankroll
+        and candidate.expected_profit > 0
+        and candidate.expected_profit
+        >= context.configuration.minimum_return_rate * candidate.total_capital
+        and all(
+            scenario.loss
+            <= context.configuration.maximum_risk_rate * candidate.total_capital
+            and scenario.unhedged_notional
+            <= context.configuration.maximum_unhedged_notional
+            for scenario in candidate.risk.scenarios
+        )
+    )
+    return QuantityCandidate(
+        evaluation=candidate,
+        quantity=candidate.quantity,
+        total_capital=candidate.total_capital,
+        expected_profit=candidate.expected_profit,
+        constraint_margins=tuple(margins.items()),
+        feasible=feasible,
+    )
 
 
 def feasibility_details(
@@ -587,52 +595,3 @@ def _exposure(item: Trade) -> OpenExposure:
         item.book,
         item.fee_schedule,
     )
-
-
-def _strategy_decimal_inputs(
-    context: StrategyContext,
-    extras: tuple[Decimal, ...],
-) -> tuple[Decimal, ...]:
-    if len(context.orderbooks) > MAX_STRATEGY_LEGS:
-        raise StrategyNumericLimitError(
-            "strategy books exceed the numeric leg limit"
-        )
-    total_levels = 0
-    for book in context.orderbooks:
-        if (
-            len(book.bids) > MAX_LEVELS_PER_BOOK
-            or len(book.asks) > MAX_LEVELS_PER_BOOK
-        ):
-            raise StrategyNumericLimitError(
-                "order-book levels exceed the strategy numeric limit"
-            )
-        total_levels += len(book.bids) + len(book.asks)
-    if total_levels > MAX_TOTAL_BOOK_LEVELS:
-        raise StrategyNumericLimitError(
-            "total order-book levels exceed the strategy numeric limit"
-        )
-    config = context.configuration
-    values: list[Decimal] = [
-        config.bankroll,
-        config.minimum_return_rate,
-        config.maximum_risk_rate,
-        config.maximum_unhedged_notional,
-        config.safety_buffer_rate,
-        config.conversion_cost,
-        Decimal("0"),
-        Decimal("1"),
-        Decimal("2"),
-        *extras,
-    ]
-    for market in context.markets:
-        if market.tick_size is not None:
-            values.append(market.tick_size)
-        if market.minimum_order_size is not None:
-            values.append(market.minimum_order_size)
-    for book in context.orderbooks:
-        values.extend((book.tick_size, book.minimum_order_size))
-        for level in (*book.bids, *book.asks):
-            values.extend((level.price, level.size))
-    for schedule in context.fee_schedules.values():
-        values.extend(schedule.parameters.values())
-    return tuple(values)
