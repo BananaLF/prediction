@@ -5,11 +5,13 @@ from __future__ import annotations
 from predmarket.domain.signal import DecisionReason, StrategyContext, StrategyDecision, StrategyType
 from predmarket.strategy.binary import evaluate_binary
 from predmarket.strategy.common import not_evaluable
+from predmarket.strategy.decimal_context import isolated_decimal_context
 from predmarket.strategy.implication import evaluate_implication
 from predmarket.strategy.neg_risk import evaluate_neg_risk
 
 
 class StrategyEngine:
+    @isolated_decimal_context(operation_depth=56)
     def evaluate(self, context: StrategyContext) -> StrategyDecision:
         if not isinstance(context, StrategyContext):
             raise TypeError("context must be a StrategyContext")

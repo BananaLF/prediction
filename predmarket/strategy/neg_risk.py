@@ -20,6 +20,7 @@ from predmarket.strategy.common import (
     trade,
     validate_inputs,
 )
+from predmarket.strategy.decimal_context import isolated_decimal_context
 
 
 _MAPPING_VERSION = "polymarket-client-0.3.0b1:v1"
@@ -39,6 +40,7 @@ _NEG_RISK_SCHEMAS = {
 }
 
 
+@isolated_decimal_context(operation_depth=48)
 def evaluate_neg_risk(context: StrategyContext) -> StrategyDecision:
     if context.strategy_type is not StrategyType.NEG_RISK_COMPLETE_SET:
         return not_evaluable(

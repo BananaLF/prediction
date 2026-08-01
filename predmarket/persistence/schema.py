@@ -159,13 +159,19 @@ CREATE TABLE arbitrage_signals (
                 'PROFIT_BELOW_THRESHOLD',
                 'RISK_ABOVE_THRESHOLD',
                 'INSUFFICIENT_DEPTH',
+                'QUANTITY_BELOW_MINIMUM',
                 'INSUFFICIENT_CAPITAL',
                 'MARKET_CLOSED',
                 'EVENT_SETTLED',
                 'ORDERBOOK_INVALID',
+                'ORDERBOOK_STALE',
+                'LEG_SKEW_EXCEEDED',
                 'SDK_DISCONNECTED',
                 'INPUT_METADATA_MISSING',
-                'FEE_SCHEDULE_UNKNOWN'
+                'FEE_SCHEDULE_UNKNOWN',
+                'FEE_SCHEDULE_STALE',
+                'SYNC_GENERATION_INCOMPLETE',
+                'RELATION_NOT_APPROVED'
             )
         ),
     latest_revision INTEGER NOT NULL CHECK (latest_revision >= 1),

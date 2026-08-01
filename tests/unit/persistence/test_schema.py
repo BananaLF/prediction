@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import predmarket.persistence.schema as schema_module
+from predmarket.domain.signal import DecisionReason
 from predmarket.persistence.schema import initialize_database
 
 
@@ -143,25 +144,35 @@ def test_initialize_database_creates_exact_schema_v1_and_wal(tmp_path: Path) -> 
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
 
-def test_schema_accepts_insufficient_capital_as_stable_close_reason(tmp_path: Path) -> None:
-    # Catches domain/schema reason drift before SignalManager persists a closure.
+def test_schema_accepts_every_decision_reason_as_a_close_reason(tmp_path: Path) -> None:
+    # Catches domain/schema enum drift before SignalManager persists a closure.
     database_path = tmp_path / "market.db"
     initialize_database(database_path)
 
     with _connect(database_path) as connection:
         _insert_catalog(connection)
-        _insert_signal(connection)
-        connection.execute(
-            """
-            UPDATE arbitrage_signals
-            SET status = 'CLOSED', closed_at = 2,
-                close_reason = 'INSUFFICIENT_CAPITAL'
-            WHERE id = 'signal-1'
-            """
-        )
-        assert connection.execute(
-            "SELECT close_reason FROM arbitrage_signals WHERE id = 'signal-1'"
-        ).fetchone() == ("INSUFFICIENT_CAPITAL",)
+        for index, reason in enumerate(DecisionReason):
+            signal_id = f"signal-{index}"
+            _insert_signal(
+                connection,
+                signal_id=signal_id,
+                opportunity_key=f"opportunity-{index}",
+            )
+            connection.execute(
+                """
+                UPDATE arbitrage_signals
+                SET status = 'CLOSED', closed_at = 2, close_reason = ?
+                WHERE id = ?
+                """,
+                (reason.value, signal_id),
+            )
+        persisted = {
+            row[0]
+            for row in connection.execute(
+                "SELECT close_reason FROM arbitrage_signals ORDER BY id"
+            )
+        }
+        assert persisted == {reason.value for reason in DecisionReason}
 
 
 def test_initialize_database_rejects_nonempty_unknown_schema_without_mutation(

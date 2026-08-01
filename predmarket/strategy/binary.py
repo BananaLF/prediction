@@ -25,8 +25,10 @@ from predmarket.strategy.common import (
     trade,
     validate_inputs,
 )
+from predmarket.strategy.decimal_context import isolated_decimal_context
 
 
+@isolated_decimal_context(operation_depth=48)
 def evaluate_binary(context: StrategyContext) -> StrategyDecision:
     if context.strategy_type not in {
         StrategyType.BINARY_UNDERPRICED,

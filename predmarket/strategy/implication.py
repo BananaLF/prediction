@@ -19,8 +19,10 @@ from predmarket.strategy.common import (
     trade,
     validate_inputs,
 )
+from predmarket.strategy.decimal_context import isolated_decimal_context
 
 
+@isolated_decimal_context(operation_depth=48)
 def evaluate_implication(context: StrategyContext) -> StrategyDecision:
     if context.strategy_type is not StrategyType.LOGICAL_IMPLICATION:
         return not_evaluable(

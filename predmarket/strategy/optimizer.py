@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Generic, Literal, TypeVar
 
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
+from predmarket.strategy.decimal_context import isolated_decimal_context
 
 
 Side = Literal["BUY", "SELL"]
@@ -57,6 +58,7 @@ class CandidateSelection(Generic[T]):
     candidates: tuple[T, ...]
 
 
+@isolated_decimal_context(operation_depth=8)
 def walk_depth(
     levels: Sequence[OrderBookLevel],
     quantity: Decimal,
@@ -90,6 +92,7 @@ def walk_depth(
     )
 
 
+@isolated_decimal_context(operation_depth=8)
 def breakpoint_quantities(
     requirements: Sequence[DepthRequirement],
     *,
@@ -124,6 +127,7 @@ def breakpoint_quantities(
     return tuple(sorted(candidates))
 
 
+@isolated_decimal_context(operation_depth=20)
 def optimize_quantity(
     requirements: Sequence[DepthRequirement],
     *,
@@ -176,6 +180,7 @@ def optimize_quantity(
     return max(feasible, key=lambda item: (item[2], -item[1], -item[0]))[0]
 
 
+@isolated_decimal_context(operation_depth=24)
 def optimize_candidates(
     requirements: Sequence[DepthRequirement],
     *,

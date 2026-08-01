@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from predmarket.domain.fees import FeeCalculator, FeeSchedule
 from predmarket.domain.orderbook import OrderBook
+from predmarket.strategy.decimal_context import isolated_decimal_context
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +80,7 @@ class RiskResult:
     scenarios: tuple[ScenarioResult, ...]
 
 
+@isolated_decimal_context(operation_depth=12)
 def immediate_close_value(
     exposure: OpenExposure,
     *,
@@ -115,6 +117,7 @@ def immediate_close_value(
     )
 
 
+@isolated_decimal_context(operation_depth=20)
 def assess_failure_scenarios(
     scenarios: tuple[FailureScenario, ...],
     *,
