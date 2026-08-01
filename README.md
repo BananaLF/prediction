@@ -22,8 +22,10 @@ python -m predmarket relations list --config config/default.yaml
 or `relations show` read the local SQLite database.  `relations analyze` is a
 controlled local relationship update.  `relations approve` updates the
 relationship and records a `RELATION_ACTIVATED` event.  Neither command mutates
-Polymarket.  See [the project guide](docs/PROJECT-GUIDE.md) for the schema and
-[operations](docs/OPERATIONS.md) for safe lifecycle and reset procedures.
+Polymarket.  The separate reset helper is an operator action; after its dry-run
+review it can delete only the configured main SQLite file and exact `-wal` and
+`-shm` siblings.  See [the project guide](docs/PROJECT-GUIDE.md) for the schema
+and [operations](docs/OPERATIONS.md) for lifecycle and reset safeguards.
 
 ## Safety boundary
 

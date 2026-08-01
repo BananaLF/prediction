@@ -31,6 +31,16 @@
   regression replaces the planned SQLite target and confirms it survives.
   Process parsing now accepts only `predmarket` as argv[0], or a Python
   interpreter whose immediate argv is `-m predmarket`.
+- **RED (review remediation round 3):** permanently refusing `--execute`
+  contradicted the documented operator procedure.  The Python argv parser also
+  missed `python -u -m predmarket` and `python3.14 -X dev -m predmarket`.
+- **GREEN (review remediation round 3):** `--execute` now deletes validated
+  temporary main/WAL/SHM files end-to-end.  It binds operations to an opened,
+  identity-checked parent directory, opens and verifies regular targets with
+  `O_NOFOLLOW`, and uses non-blocking advisory locks for cooperating reset
+  operators.  A target replaced after planning is refused before deletion.
+  Python option parsing recognizes the supported pre-`-m` options while still
+  rejecting pytest, another Python module, and non-Python commands.
 
 ## Changes
 
@@ -48,12 +58,14 @@
 - Hardened reset execution against parent-directory TOCTOU. The reset plan
   binds the verified parent directory device/inode; execution opens it with
   `O_DIRECTORY | O_NOFOLLOW` and compares the opened descriptor.
-- Removed the unsafe `stat`-then-`os.unlink(..., dir_fd=...)` deletion path.
-  Until a platform-specific primitive can atomically unlink an exact verified
-  device/inode identity, `--execute` fails closed and removes no file.
+- Made `--execute` usable again under an explicit Darwin/POSIX threat model.
+  It requires an owner-only parent directory, records target identities during
+  planning, reopens and locks each exact regular target before deletion, and
+  unlinks exact names only through the verified parent descriptor.  The narrow
+  hostile-same-UID replacement race remains a documented platform boundary.
 - Extended active-process detection to parse argv and recognize both the
   `predmarket` console script (including `/venv/bin/predmarket`) and a Python
-  interpreter immediately followed by `-m predmarket`.
+  interpreter with supported Python options before `-m predmarket`.
 - Clarified `README.md`: `relations list` and `relations show` are local
   read-only operations; `relations analyze` updates only a relationship, while
   `relations approve` updates it and records `RELATION_ACTIVATED`. Polymarket
@@ -65,12 +77,13 @@
 
 | Command | Result |
 | --- | --- |
-| `pytest -q tests/integration/test_documented_commands.py` | Passed after remediation: `9 passed, 1 warning in 0.16s`. |
-| `pytest -q tests/integration/test_documented_commands.py -k reset` | Passed: `7 passed, 2 deselected, 1 warning in 0.09s`. |
-| `pytest -q` | Collection failed with 5 errors in `0.25s` because the optional `polymarket` package is absent: `ModuleNotFoundError: No module named 'polymarket'` in SDK, watch, catalog-sync, and gateway tests. No dependency boundary was changed. |
+| `pytest -q tests/integration/test_documented_commands.py` | Passed after round-3 remediation: `10 passed, 1 warning in 0.69s`. |
+| `pytest -q tests/integration/test_documented_commands.py -k reset` | Passed: `8 passed, 2 deselected, 1 warning in 0.60s`. |
+| `pytest -q` | Collection failed with 5 errors in `0.26s` because the optional `polymarket` package is absent: `ModuleNotFoundError: No module named 'polymarket'` in SDK, watch, catalog-sync, and gateway tests. No dependency boundary was changed. |
 | `python -m predmarket --help` | Passed (exit 0); showed `run`, `status`, `signals`, and `relations`. |
 | `python -m predmarket status --config config/default.yaml` | Failed: `sqlite3.OperationalError: unable to open database file`; `config/default.yaml` points to the absent `data/predmarket-v1.sqlite3`. No default user database was created for verification. |
 | `python scripts/reset_database.py --config config/default.yaml` | Passed dry run; printed `/Users/lifei/workspace/earn_money_from_prediction/data/predmarket-v1.sqlite3` and only its exact `-wal` and `-shm` siblings. No file was removed. |
+| `python scripts/reset_database.py --help` | Passed (exit 0); documents the executable `--execute` action and exact SQLite sibling scope. |
 | `git diff --check` | Passed. |
 | `python -m compileall -q predmarket` | Passed. |
 | temporary SQLite schema check | Passed: exactly 10 project tables, `user_version=1`, `integrity_check=ok`, and no `foreign_key_check` rows. |
@@ -82,6 +95,9 @@
 - The configured default database has not been initialized.  `status` is
   deliberately read-only and therefore does not create it.
 - The sandbox denies process enumeration with `ps`; the reset helper fails
-  closed when process inspection is unavailable. Python/POSIX also lacks the
-  required atomic identity-checked unlink primitive, so `--execute` is
-  intentionally unavailable and removes no file.
+  closed when process inspection is unavailable. The end-to-end reset test uses
+  a temporary test-only `ps` executable that reports no running process.
+- Python/POSIX lacks an inode-bound unlink. The reset procedure is safe against
+  path drift, symlinks, parent replacement, and cooperative concurrency, but
+  not a hostile same-UID process that races an exact basename after final
+  verification while disregarding advisory locks.

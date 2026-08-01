@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shlex
 from pathlib import Path
@@ -82,7 +83,7 @@ def _reset_config(tmp_path: Path, database_path: Path) -> Path:
     return config
 
 
-def test_documented_reset_helper_refuses_delete_without_atomic_identity_unlink(
+def test_documented_reset_helper_deletes_exact_temporary_sqlite_files(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "reset.sqlite3"
@@ -93,9 +94,38 @@ def test_documented_reset_helper_refuses_delete_without_atomic_identity_unlink(
     plan = prepare_reset(_reset_config(tmp_path, database))
 
     assert plan.main_path == database
-    with pytest.raises(ResetRefused, match="atomic unlink by verified file identity"):
-        execute_reset(plan, running_processes=())
-    assert [path.read_text() for path in siblings] == ["test database content"] * 3
+    assert execute_reset(plan, running_processes=()) == siblings
+    assert all(not path.exists() for path in siblings)
+
+
+def test_documented_reset_script_executes_only_in_a_temporary_directory(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "reset.sqlite3"
+    siblings = (database, Path(f"{database}-wal"), Path(f"{database}-shm"))
+    for path in siblings:
+        path.write_text("test database content")
+    ps_command = tmp_path / "ps"
+    ps_command.write_text("#!/bin/sh\nexit 0\n")
+    ps_command.chmod(0o700)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/reset_database.py",
+            "--config",
+            str(_reset_config(tmp_path, database)),
+            "--execute",
+        ],
+        capture_output=True,
+        env={**os.environ, "PATH": str(tmp_path)},
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert [f"deleted: {path}" for path in siblings] == result.stdout.splitlines()[-3:]
+    assert all(not path.exists() for path in siblings)
 
 
 def test_reset_helper_refuses_a_configured_directory(tmp_path: Path) -> None:
@@ -149,7 +179,7 @@ def test_reset_helper_preserves_target_replaced_after_reset_plan(tmp_path: Path)
     database.unlink()
     database.write_text("replacement must survive")
 
-    with pytest.raises(ResetRefused, match="atomic unlink by verified file identity"):
+    with pytest.raises(ResetRefused, match="target changed after validation"):
         execute_reset(plan, running_processes=())
 
     assert database.read_text() == "replacement must survive"
@@ -182,13 +212,16 @@ def test_reset_helper_detects_console_script_but_not_ordinary_predmarket_names(
                 stdout=(
                     "4242 /venv/bin/predmarket run --config config/default.yaml\n"
                     "4243 /venv/bin/python3 -m predmarket run\n"
-                    "4244 pytest -m predmarket tests/test_reset.py\n"
-                    "4245 tool --mode -m predmarket\n"
-                    "4246 python --mode -m predmarket\n"
-                    "4247 /tmp/predmarket-notes.txt\n"
+                    "4244 python -u -m predmarket run\n"
+                    "4245 /venv/bin/python3.14 -X dev -m predmarket run\n"
+                    "4246 pytest -m predmarket tests/test_reset.py\n"
+                    "4247 python -m pytest -m predmarket\n"
+                    "4248 tool --mode -m predmarket\n"
+                    "4249 python --mode -m predmarket\n"
+                    "4250 /tmp/predmarket-notes.txt\n"
                 ),
             )
         ),
     )
 
-    assert running_predmarket_processes() == (4242, 4243)
+    assert running_predmarket_processes() == (4242, 4243, 4244, 4245)

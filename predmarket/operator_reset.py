@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fcntl
 import os
 from pathlib import Path
 import re
 import shlex
 import stat
 import subprocess
-from typing import Callable
 
 from predmarket.config import AppConfig
 
 
 class ResetRefused(ValueError):
     """Raised when a requested database reset is not demonstrably safe."""
+
+
+TargetIdentity = tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -26,9 +29,7 @@ class ResetPlan:
     target_names: tuple[str, str, str]
     parent_device: int
     parent_inode: int
-
-
-IdentitySafeUnlinker = Callable[[int, str, int, int], None]
+    target_identities: tuple[TargetIdentity | None, ...]
 
 
 def prepare_reset(config_path: Path, *, working_directory: Path | None = None) -> ResetPlan:
@@ -53,11 +54,6 @@ def prepare_reset(config_path: Path, *, working_directory: Path | None = None) -
         raise ResetRefused("configured database path is a protected root")
 
     targets = (resolved, Path(f"{resolved}-wal"), Path(f"{resolved}-shm"))
-    for target in targets:
-        if target.is_symlink():
-            raise ResetRefused(f"reset target must not be a symlink: {target}")
-        if target.exists() and not target.is_file():
-            raise ResetRefused(f"reset target must be a file: {target}")
     parent_path = resolved.parent
     try:
         parent_stat = parent_path.stat(follow_symlinks=False)
@@ -65,13 +61,33 @@ def prepare_reset(config_path: Path, *, working_directory: Path | None = None) -
         raise ResetRefused("could not verify reset parent directory") from error
     if not stat.S_ISDIR(parent_stat.st_mode):
         raise ResetRefused("reset parent directory must be a directory")
-    return ResetPlan(
+    if parent_stat.st_uid != os.geteuid():
+        raise ResetRefused("reset parent directory must be owned by this user")
+    if parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ResetRefused("reset parent directory must not be group or world writable")
+    plan = ResetPlan(
         main_path=resolved,
         targets=targets,
         parent_path=parent_path,
         target_names=tuple(target.name for target in targets),
         parent_device=parent_stat.st_dev,
         parent_inode=parent_stat.st_ino,
+        target_identities=(None, None, None),
+    )
+    parent_fd = _open_verified_parent(plan)
+    try:
+        _lock_parent_directory(parent_fd)
+        target_identities = _snapshot_target_identities(plan, parent_fd)
+    finally:
+        os.close(parent_fd)
+    return ResetPlan(
+        main_path=plan.main_path,
+        targets=plan.targets,
+        parent_path=plan.parent_path,
+        target_names=plan.target_names,
+        parent_device=plan.parent_device,
+        parent_inode=plan.parent_inode,
+        target_identities=target_identities,
     )
 
 
@@ -113,24 +129,25 @@ def execute_reset(plan: ResetPlan, *, running_processes: tuple[int, ...] | None 
         )
 
     parent_fd = _open_verified_parent(plan)
+    target_descriptors: tuple[tuple[str, int] | None, ...] = ()
     try:
-        identity_unlinker = _identity_safe_unlinker()
-        if identity_unlinker is None:
-            raise ResetRefused(
-                "platform does not provide atomic unlink by verified file identity"
-            )
-        existing_targets = _verified_target_identities(plan, parent_fd)
-        for identity in existing_targets:
-            if identity is not None:
-                identity_unlinker(parent_fd, identity[0], identity[1], identity[2])
+        _lock_parent_directory(parent_fd)
+        target_descriptors = _verified_target_descriptors(plan, parent_fd)
+        for descriptor in target_descriptors:
+            if descriptor is not None:
+                name, _ = descriptor
+                os.unlink(name, dir_fd=parent_fd)
         return tuple(
             target
-            for target, identity in zip(plan.targets, existing_targets, strict=True)
-            if identity is not None
+            for target, descriptor in zip(plan.targets, target_descriptors, strict=True)
+            if descriptor is not None
         )
     except OSError as error:
         raise ResetRefused("could not safely remove validated reset target") from error
     finally:
+        for descriptor in target_descriptors:
+            if descriptor is not None:
+                os.close(descriptor[1])
         os.close(parent_fd)
 
 
@@ -156,35 +173,97 @@ def _open_verified_parent(plan: ResetPlan) -> int:
     return parent_fd
 
 
-def _verified_target_identities(
+def _lock_parent_directory(parent_fd: int) -> None:
+    """Serialize cooperating reset operators on the verified directory inode."""
+    try:
+        fcntl.flock(parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        raise ResetRefused("could not acquire exclusive reset directory lock") from error
+
+
+def _snapshot_target_identities(
     plan: ResetPlan,
     parent_fd: int,
-) -> tuple[tuple[str, int, int] | None, ...]:
-    identities: list[tuple[str, int, int] | None] = []
+) -> tuple[TargetIdentity | None, ...]:
+    identities: list[TargetIdentity | None] = []
     for target, name in zip(plan.targets, plan.target_names, strict=True):
-        try:
-            target_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
+        opened_target = _open_target(target, name, parent_fd)
+        if opened_target is None:
             identities.append(None)
             continue
-        if stat.S_ISLNK(target_stat.st_mode):
-            raise ResetRefused(f"reset target must not be a symlink: {target}")
-        if not stat.S_ISREG(target_stat.st_mode):
-            raise ResetRefused(f"reset target must be a file: {target}")
-        identities.append((name, target_stat.st_dev, target_stat.st_ino))
+        target_fd, identity = opened_target
+        os.close(target_fd)
+        identities.append(identity)
     return tuple(identities)
 
 
-def _identity_safe_unlinker() -> IdentitySafeUnlinker | None:
-    """Return an unlink primitive that atomically checks the verified identity.
+def _verified_target_descriptors(
+    plan: ResetPlan,
+    parent_fd: int,
+) -> tuple[tuple[str, int] | None, ...]:
+    descriptors: list[tuple[str, int] | None] = []
+    try:
+        for target, name, expected_identity in zip(
+            plan.targets,
+            plan.target_names,
+            plan.target_identities,
+            strict=True,
+        ):
+            opened_target = _open_target(target, name, parent_fd)
+            if opened_target is None:
+                if expected_identity is not None:
+                    raise ResetRefused("reset target changed after validation")
+                descriptors.append(None)
+                continue
+            target_fd, actual_identity = opened_target
+            if actual_identity != expected_identity:
+                os.close(target_fd)
+                raise ResetRefused("reset target changed after validation")
+            _lock_target_file(target_fd)
+            descriptors.append((name, target_fd))
+    except BaseException:
+        for descriptor in descriptors:
+            if descriptor is not None:
+                os.close(descriptor[1])
+        raise
+    return tuple(descriptors)
 
-    POSIX ``unlinkat`` (and Python's ``os.unlink(..., dir_fd=...)``) identifies
-    the entry by name only.  It cannot attach a checked ``st_dev``/``st_ino`` to
-    deletion, so using it after ``stat`` reintroduces the target-entry race.
-    Python exposes no supported primitive with that atomic contract on this
-    platform.  Keep reset fail-closed until such a primitive is available.
-    """
-    return None
+
+def _open_target(
+    target: Path,
+    name: str,
+    parent_fd: int,
+) -> tuple[int, TargetIdentity] | None:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ResetRefused("platform cannot safely open reset target")
+    try:
+        target_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | nofollow,
+            dir_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ResetRefused(f"could not safely open reset target: {target}") from error
+    try:
+        target_stat = os.fstat(target_fd)
+    except OSError as error:
+        os.close(target_fd)
+        raise ResetRefused(f"could not verify reset target: {target}") from error
+    if not stat.S_ISREG(target_stat.st_mode):
+        os.close(target_fd)
+        raise ResetRefused(f"reset target must be a file: {target}")
+    return target_fd, (target_stat.st_dev, target_stat.st_ino)
+
+
+def _lock_target_file(target_fd: int) -> None:
+    try:
+        fcntl.flock(target_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(target_fd)
+        raise ResetRefused("could not acquire exclusive reset target lock") from error
 
 
 def _contains_symlink(path: Path) -> bool:
@@ -206,13 +285,51 @@ def _is_predmarket_command(command: str) -> bool:
     executable = Path(argv[0]).name
     if executable == "predmarket":
         return True
-    return (
-        _is_python_interpreter(executable)
-        and len(argv) >= 3
-        and argv[1] == "-m"
-        and argv[2] == "predmarket"
-    )
+    return _is_python_interpreter(executable) and _has_predmarket_module_entry(argv[1:])
 
 
 def _is_python_interpreter(executable: str) -> bool:
     return re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable) is not None
+
+
+def _has_predmarket_module_entry(arguments: list[str]) -> bool:
+    """Find Python's first module entry while respecting option arguments."""
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "-m":
+            return index + 1 < len(arguments) and arguments[index + 1] == "predmarket"
+        if argument == "-" or not argument.startswith("-"):
+            return False
+        if argument == "-c" or argument.startswith("-c"):
+            return False
+        if argument in {"-W", "-X"}:
+            index += 2
+            continue
+        if argument.startswith("-W") or argument.startswith("-X"):
+            index += 1
+            continue
+        if argument in {
+            "-b",
+            "-B",
+            "-d",
+            "-E",
+            "-h",
+            "-i",
+            "-I",
+            "-O",
+            "-OO",
+            "-P",
+            "-q",
+            "-R",
+            "-s",
+            "-S",
+            "-u",
+            "-v",
+            "-V",
+            "-x",
+        }:
+            index += 1
+            continue
+        return False
+    return False

@@ -32,15 +32,23 @@ The dry run prints the resolved absolute main database path and its three exact
 potential targets: the main file, `main-file-wal`, and `main-file-shm`.  Confirm
 the printed path before executing.  The helper refuses if it finds a running
 Predmarket process, or if the configured main path is a directory, symlink,
-filesystem root, user home directory, or repository root.  It deletes no other
-file and cannot accept a wildcard or directory target.
+filesystem root, user home directory, repository root, or a parent directory
+not owned by the invoking user or writable by group or world.  It deletes no
+other file and cannot accept a wildcard or directory target.
 
-The current Python/POSIX implementation has no supported atomic unlink operation
-that binds deletion to a previously verified file identity.  Consequently,
-`--execute` fails closed with a refusal and removes nothing; do not replace it
-with shell deletion.  The dry run remains available to identify the configured
-path safely.  A deletion-capable reset requires a future platform-specific
-identity-checked unlink primitive and matching regression tests.
+`--execute` is executable.  It fixes and rechecks the parent directory by
+device/inode and `O_DIRECTORY | O_NOFOLLOW`, takes non-blocking exclusive
+advisory locks on that directory and every opened regular target, compares each
+target's planned device/inode, then deletes only verified exact basenames using
+the parent descriptor.  A target that changed since planning, or is symlinked
+or non-regular, causes refusal before deletion.
+
+Darwin/POSIX does not expose an unlink primitive bound atomically to an opened
+inode.  The locks serialize cooperating operators, and the owner-only directory
+requirement excludes other users, but an adversarial same-UID process that
+ignores advisory locks can still replace a basename after final verification.
+Do not use this operator procedure in that threat model; see `SECURITY.md` for
+the full boundary.  Never substitute shell deletion.
 
 ## Signal semantics
 
