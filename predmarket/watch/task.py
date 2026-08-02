@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import inspect
+import logging
 from typing import Any, Protocol
 
 from predmarket.catalog.changes import MarketChange, MarketChangeType
@@ -33,6 +34,8 @@ from predmarket.watch.cache import (
 
 
 _NO_CHANGE = object()
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class WatchCleanupError(RuntimeError):
@@ -196,6 +199,13 @@ class WatchTask:
             if token_ids:
                 await self._recover(token_ids)
             self._started = True
+            events, markets, tokens = _watch_scope_counts(snapshot, token_ids)
+            _LOGGER.info(
+                "watch started events=%d markets=%d tokens=%d",
+                events,
+                markets,
+                tokens,
+            )
 
     async def run(self) -> None:
         try:
@@ -294,6 +304,14 @@ class WatchTask:
                 explicitly_closed=explicitly_closed,
                 close_reason=reason,
             )
+            events, markets, tokens = _watch_scope_counts(snapshot, new_token_ids)
+            _LOGGER.info(
+                "watch updated events=%d markets=%d tokens=%d reason=%s",
+                events,
+                markets,
+                tokens,
+                change.change_type.value,
+            )
 
     async def handle_stream_message(
         self,
@@ -329,10 +347,19 @@ class WatchTask:
                     for token_id in self._active_token_ids
                     if token_id not in frozenset(token_ids)
                 )
+                snapshot = await self._catalog.load_catalog()
                 await self._rotate_to(
                     retained,
                     explicitly_closed=token_ids,
                     close_reason=DecisionReason.EVENT_SETTLED,
+                )
+                events, markets, tokens = _watch_scope_counts(snapshot, retained)
+                _LOGGER.info(
+                    "watch updated events=%d markets=%d tokens=%d reason=%s",
+                    events,
+                    markets,
+                    tokens,
+                    DecisionReason.EVENT_SETTLED.value,
                 )
                 return
             if message.event_type == "book":
@@ -662,6 +689,29 @@ def _watchable_token_ids(snapshot: CatalogSnapshot) -> tuple[str, ...]:
             key=_utf8,
         )
     )
+
+
+def _watch_scope_counts(
+    snapshot: CatalogSnapshot,
+    token_ids: Sequence[str],
+) -> tuple[int, int, int]:
+    """Return distinct event/market/token counts for the active watch scope."""
+
+    if not isinstance(snapshot, CatalogSnapshot):
+        raise TypeError("catalog must return CatalogSnapshot")
+    token_set = frozenset(token_ids)
+    market_by_id = {market.id: market for market in snapshot.markets}
+    market_ids = {
+        token.market_id
+        for token in snapshot.tokens
+        if token.id in token_set
+    }
+    market_ids.intersection_update(market_by_id)
+    event_ids = {
+        market_by_id[market_id].event_id
+        for market_id in market_ids
+    }
+    return len(event_ids), len(market_ids), len(token_set)
 
 
 def _payload_token_ids(payload: Mapping[str, Any]) -> tuple[str, ...]:

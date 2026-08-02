@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 import inspect
+import logging
 import time
 from typing import Any, TextIO
 
@@ -35,6 +36,8 @@ from predmarket.watch.cache import CacheState, OrderBookCache
 
 Clock = Callable[[], int]
 Factory = Callable[..., Any]
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class Supervisor:
@@ -232,6 +235,10 @@ class Supervisor:
         cache = getattr(watch, "cache", None)
         if isinstance(cache, OrderBookCache):
             subscription_generation.bind(cache)
+        _LOGGER.info(
+            "runtime initialized components=%s",
+            "database,writer,repositories,notifier,gateway,sync,strategy_engine,watch",
+        )
         return writer, gateway, notifier, sync, watch
 
     async def _sync_forever(self, sync: Any, notifier: Notifier) -> None:

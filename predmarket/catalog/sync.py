@@ -102,6 +102,9 @@ class SyncResult:
     degraded: bool = False
     publication_marker_failures: int = 0
     cursor_persistence_failed: bool = False
+    events_persisted: int = 0
+    markets_persisted: int = 0
+    tokens_persisted: int = 0
 
 
 class SyncMarketTask:
@@ -226,7 +229,19 @@ class SyncMarketTask:
                     markets=partial.markets,
                     tokens=partial.tokens,
                 )
+            persisted_events = len(partial.events)
+            persisted_markets = len(partial.markets)
+            persisted_tokens = len(partial.tokens)
             error_message = "; ".join(errors)
+            _LOGGER.error(
+                "sync incomplete generation=%s events_seen=%d markets_seen=%d "
+                "tokens_seen=%d error=%s",
+                generation,
+                len(events),
+                len(snapshots),
+                sum(len(item.tokens) for item in snapshots),
+                error_message,
+            )
             await self._system_events.append(
                 component="SYNC",
                 severity="ERROR",
@@ -265,6 +280,9 @@ class SyncMarketTask:
                 error=error_message,
                 degraded=self._degraded,
                 cursor_persistence_failed=cursor_error is not None,
+                events_persisted=persisted_events,
+                markets_persisted=persisted_markets,
+                tokens_persisted=persisted_tokens,
             )
 
         prepared = _prepare_complete(
@@ -323,6 +341,25 @@ class SyncMarketTask:
                 failed_change_ids=tuple(failed_change_ids),
                 cursor_persistence_failed=cursor_error is not None,
             )
+        events_persisted = len(prepared.events)
+        markets_persisted = len(prepared.markets)
+        tokens_persisted = len(prepared.tokens)
+        degraded_suffix = " degraded=true" if self._degraded else ""
+        _LOGGER.info(
+            "sync completed generation=%s events_seen=%d markets_seen=%d "
+            "tokens_seen=%d events_persisted=%d markets_persisted=%d "
+            "tokens_persisted=%d changes_published=%d changes_dropped=%d%s",
+            generation,
+            len(events),
+            len(snapshots),
+            sum(len(item.tokens) for item in snapshots),
+            events_persisted,
+            markets_persisted,
+            tokens_persisted,
+            published,
+            dropped,
+            degraded_suffix,
+        )
         return SyncResult(
             sync_generation=generation,
             complete=True,
@@ -334,6 +371,9 @@ class SyncMarketTask:
             degraded=self._degraded,
             publication_marker_failures=len(marker_errors),
             cursor_persistence_failed=cursor_error is not None,
+            events_persisted=events_persisted,
+            markets_persisted=markets_persisted,
+            tokens_persisted=tokens_persisted,
         )
 
     async def _record_publication_marker(

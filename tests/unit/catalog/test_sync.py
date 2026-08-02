@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from decimal import Decimal
+import logging
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -308,7 +309,9 @@ async def _seed(
 
 async def test_complete_generation_drains_gateway_and_commits_before_publish(
     catalog_runtime,
+    caplog,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="predmarket.catalog.sync")
     catalog, system_events = catalog_runtime
     gateway = _FakeGateway(
         events=(_event(("market-1", "market-2")),),
@@ -329,6 +332,15 @@ async def test_complete_generation_drains_gateway_and_commits_before_publish(
     assert result.complete is True
     assert result.sync_generation == "sync-1"
     assert (result.events_seen, result.markets_seen, result.tokens_seen) == (1, 2, 4)
+    assert (
+        result.events_persisted,
+        result.markets_persisted,
+        result.tokens_persisted,
+    ) == (1, 2, 4)
+    assert "sync completed" in caplog.text
+    assert "events_seen=1" in caplog.text
+    assert "markets_persisted=2" in caplog.text
+    assert "tokens_persisted=4" in caplog.text
     assert gateway.event_calls == gateway.market_calls == 1
     assert [change.change_type for change in queue.items] == [
         MarketChangeType.MARKET_ADDED,
@@ -721,7 +733,9 @@ async def test_incomplete_generation_preserves_existing_active_state_and_emits_n
 
 async def test_market_mapping_error_is_preserved_in_result_and_system_event(
     catalog_runtime,
+    caplog,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="predmarket.catalog.sync")
     catalog, system_events = catalog_runtime
     marker = 'api_response={"id":"market-1"}'
     task = SyncMarketTask(
@@ -743,6 +757,9 @@ async def test_market_mapping_error_is_preserved_in_result_and_system_event(
     assert result.complete is False
     assert result.error is not None
     assert marker in result.error
+    assert "sync incomplete" in caplog.text
+    assert marker in caplog.text
+    assert "sync completed" not in caplog.text
     events_after = await system_events.read_after(0)
     assert marker in events_after[-1]["details"]["error"]
 

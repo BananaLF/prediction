@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 import inspect
 import json
+import logging
 from pathlib import Path
 import time
 from typing import Any
@@ -33,6 +34,8 @@ from predmarket.persistence.repositories import SignalRepository
 
 Clock = Callable[[], int]
 StateSource = Mapping[str, Any] | Callable[[str], Any] | None
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class SignalRevisionConflict(RuntimeError):
@@ -626,7 +629,17 @@ class SignalManager:
         return context
 
     async def _notify_after_commit(self, notification: SignalNotification) -> None:
-        if self._notifier is None or notification.event_type == "NOOP":
+        if notification.event_type == "NOOP":
+            return
+        _LOGGER.info(
+            "signal %s id=%s opportunity=%s strategy=%s revision=%d",
+            notification.event_type,
+            notification.signal_id,
+            notification.opportunity_key,
+            self._strategy_type.value,
+            notification.revision,
+        )
+        if self._notifier is None:
             return
         callback = getattr(self._notifier, "notify", self._notifier)
         try:

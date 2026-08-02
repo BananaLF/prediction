@@ -5,6 +5,7 @@ from dataclasses import replace
 from decimal import Decimal
 from io import StringIO
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -114,8 +115,9 @@ class _FailingNotifier:
 
 @pytest.mark.asyncio
 async def test_supervisor_syncs_before_watch_and_terminates_after_watch_crash(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="predmarket.app")
     calls: list[str] = []
     events = _Events()
     output = StringIO()
@@ -133,6 +135,7 @@ async def test_supervisor_syncs_before_watch_and_terminates_after_watch_crash(
 
     assert calls == ["sync", "watch-start", "watch-run", "watch-close"]
     assert "RUNTIME_TASK_EXITED" in output.getvalue()
+    assert "runtime initialized components=" in caplog.text
     assert events.entries == []
 
 

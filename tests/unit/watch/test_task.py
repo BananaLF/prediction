@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from decimal import Decimal
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -407,8 +408,11 @@ async def _cancel(task: asyncio.Task[Any]) -> None:
         await task
 
 
-async def test_run_subscribes_all_initial_watchable_tokens_and_evaluates_after_rest() -> None:
+async def test_run_subscribes_all_initial_watchable_tokens_and_evaluates_after_rest(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     # Catches startup analyzing before the complete REST recovery baseline exists.
+    caplog.set_level(logging.INFO, logger="predmarket.watch.task")
     gateway = FakeGateway()
     gateway.recovery_gate = asyncio.Event()
     watch, _, _, _, strategy, _ = _watch(gateway=gateway)
@@ -430,6 +434,7 @@ async def test_run_subscribes_all_initial_watchable_tokens_and_evaluates_after_r
 
     assert watch.cache.state is CacheState.VALID
     assert {call.changed_token_id for call in strategy.calls} == {"token-1", "token-2"}
+    assert "watch started events=1 markets=1 tokens=2" in caplog.text
     await _cancel(task)
     assert gateway.subscriptions[0].closed is True
 
@@ -563,8 +568,11 @@ async def test_double_cancel_during_stop_drain_still_claims_change_once() -> Non
     await asyncio.wait_for(changes.join(), timeout=0.1)
 
 
-async def test_market_add_rebuilds_subscription_and_closes_old_generation() -> None:
+async def test_market_add_rebuilds_subscription_and_closes_old_generation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     # Catches dynamic catalog additions being absent until process restart.
+    caplog.set_level(logging.INFO, logger="predmarket.watch.task")
     watch, gateway, catalog, _, _, signals = _watch()
     await watch.start()
     first = gateway.subscriptions[0]
@@ -585,6 +593,7 @@ async def test_market_add_rebuilds_subscription_and_closes_old_generation() -> N
     assert gateway.requests[-1] == ("token-1", "token-2", "token-3", "token-4")
     assert signals.closed[-1][0] == ("token-1", "token-2")
     assert signals.closed[-1][1].reason_code is DecisionReason.ORDERBOOK_INVALID
+    assert "watch updated events=1 markets=2 tokens=4 reason=MARKET_ADDED" in caplog.text
     await watch.close()
 
 

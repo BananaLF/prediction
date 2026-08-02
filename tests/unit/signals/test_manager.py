@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from dataclasses import replace
+import logging
 from pathlib import Path
 import sqlite3
 
@@ -130,7 +131,10 @@ async def _open_manager(
 
 
 @pytest.mark.asyncio
-async def test_signal_manager_persists_open_update_noop_and_close_lifecycle(tmp_path: Path) -> None:
+async def test_signal_manager_persists_open_update_noop_and_close_lifecycle(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="predmarket.signals.manager")
     writer, _catalog_repo, _signals, manager = await _open_manager(tmp_path)
     try:
         signal_id = await manager.apply(_present(), "opportunity-1", None)
@@ -170,6 +174,15 @@ async def test_signal_manager_persists_open_update_noop_and_close_lifecycle(tmp_
         ["OPENED"],
         ["OPENED", "UPDATED", "CLOSED"],
     ]
+    signal_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "predmarket.signals.manager"
+    ]
+    assert sum(message.startswith("signal OPENED ") for message in signal_messages) == 2
+    assert sum(message.startswith("signal UPDATED ") for message in signal_messages) == 1
+    assert sum(message.startswith("signal CLOSED ") for message in signal_messages) == 1
+    assert not any(message.startswith("signal NOOP ") for message in signal_messages)
 
 
 @pytest.mark.asyncio

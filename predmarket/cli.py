@@ -37,7 +37,9 @@ def main(
 
     if arguments.command == "run":
         from predmarket.app import Supervisor
+        from predmarket.runtime_logging import configure_runtime_logging
 
+        configure_runtime_logging(output)
         return asyncio.run(Supervisor(config, terminal=output).run())
 
     if arguments.command == "status":
