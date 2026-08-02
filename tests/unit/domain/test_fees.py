@@ -48,6 +48,85 @@ def test_flat_fee_schedule_charges_rate_on_notional() -> None:
     ) == Decimal("0.08")
 
 
+def test_curve_fee_schedule_calculates_polymarket_taker_fee() -> None:
+    schedule = FeeSchedule.from_json(
+        {
+            "model": "CURVE",
+            "enabled": True,
+            "source": "clob",
+            "parameters": {
+                "rate": "0.04",
+                "exponent": "1",
+                "rebate_rate": "0.25",
+            },
+            "taker_only": True,
+            "updated_at": 100,
+        }
+    )
+
+    assert schedule.model is FeeModel.CURVE
+    assert schedule.taker_only is True
+    assert schedule.parameters["exponent"] == Decimal("1")
+    assert schedule.parameters["rebate_rate"] == Decimal("0.25")
+    assert FeeCalculator.calculate(
+        schedule,
+        Decimal("0.4"),
+        Decimal("10"),
+        evaluated_at_ms=100,
+        max_age_seconds=300,
+    ) == Decimal("0.096")
+
+
+def test_curve_taker_only_schedule_does_not_charge_maker_path() -> None:
+    schedule = FeeSchedule.from_json(
+        {
+            "model": "CURVE",
+            "enabled": True,
+            "source": "clob",
+            "parameters": {
+                "rate": "0.04",
+                "exponent": "1",
+                "rebate_rate": "0.25",
+            },
+            "taker_only": True,
+            "updated_at": 100,
+        }
+    )
+
+    assert FeeCalculator.calculate(
+        schedule,
+        Decimal("0.4"),
+        Decimal("10"),
+        evaluated_at_ms=100,
+        max_age_seconds=300,
+        is_taker=False,
+    ) == Decimal("0")
+
+
+def test_curve_fee_has_protocol_minimum_after_rounding() -> None:
+    schedule = FeeSchedule.from_json(
+        {
+            "model": "CURVE",
+            "enabled": True,
+            "source": "clob",
+            "parameters": {
+                "rate": "0.000001",
+                "exponent": "1",
+                "rebate_rate": "0",
+            },
+            "updated_at": 100,
+        }
+    )
+
+    assert FeeCalculator.calculate(
+        schedule,
+        Decimal("0.5"),
+        Decimal("1"),
+        evaluated_at_ms=100,
+        max_age_seconds=300,
+    ) == Decimal("0.00001")
+
+
 def test_disabled_known_schedule_returns_zero() -> None:
     schedule = FeeSchedule.from_json(
         {
@@ -72,7 +151,7 @@ def test_unknown_fee_model_is_rejected_instead_of_assumed_zero() -> None:
     with pytest.raises(ValueError, match="unknown fee model"):
         FeeSchedule.from_json(
             {
-                "model": "CURVE",
+                "model": "UNKNOWN",
                 "enabled": True,
                 "source": "clob",
                 "parameters": {},

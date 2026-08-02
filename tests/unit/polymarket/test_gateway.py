@@ -460,14 +460,42 @@ async def test_list_active_markets_maps_tokens_and_authoritative_fee_schedules(
     assert all(isinstance(token, Token) for token in first.tokens)
     fee = first.tokens[0].fee_schedule
     assert fee is not None
-    assert fee.model is FeeModel.FLAT
+    assert fee.model is FeeModel.CURVE
     assert fee.enabled is True
-    assert fee.parameters == {"rate": Decimal("0.02")}
+    assert fee.parameters == {
+        "rate": Decimal("0.04"),
+        "exponent": Decimal("1"),
+        "rebate_rate": Decimal("0.25"),
+    }
+    assert fee.taker_only is True
     assert fee.updated_at == 1_785_405_970_000
     zero_fee = snapshots[1].tokens[0].fee_schedule
     assert zero_fee is not None
     assert zero_fee.model is FeeModel.ZERO
     assert zero_fee.enabled is False
+
+
+async def test_market_mapping_error_includes_bounded_api_response(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    payload = deepcopy(sdk_fixture)
+    payload["markets"][0].trading.fee_schedule = None
+    client = FakePublicClient(**payload)
+    gateway = PolymarketGateway(
+        client=client,
+        clock_ms=lambda: 1_785_405_970_000,
+        page_size=1,
+    )
+
+    with pytest.raises(
+        GatewayMappingError,
+        match=r"market 200.*enabled fees require a fee schedule.*api_response=",
+    ) as raised:
+        await gateway.list_active_markets()
+
+    message = str(raised.value)
+    assert '"id":"200"' in message
+    assert len(message.rsplit("api_response=", 1)[1]) <= 8_192
 
 
 @pytest.mark.parametrize("contradictory_flag", ["closed", "archived"])

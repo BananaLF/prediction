@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 import inspect
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -12,6 +13,15 @@ import time
 from typing import Any, TextIO
 
 from predmarket.signals.manager import SignalNotification
+
+
+_OPERATIONAL_ERROR_EVENTS = frozenset(
+    {
+        "SYNC_GENERATION_INCOMPLETE",
+        "RUNTIME_STARTUP_FAILED",
+        "RUNTIME_TASK_EXITED",
+    }
+)
 
 
 class Notifier:
@@ -66,6 +76,19 @@ class Notifier:
             raise TypeError("details must be a mapping or None")
 
         print(f"{event_type}: {message}", file=self._terminal, flush=True)
+        if details is not None and event_type in _OPERATIONAL_ERROR_EVENTS:
+            rendered_details = json.dumps(
+                details,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            print(
+                f"{event_type} details: {rendered_details}",
+                file=self._terminal,
+                flush=True,
+            )
         if self._desktop is None:
             return
         try:

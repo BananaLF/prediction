@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 import importlib.metadata
+import json
 import time
 from typing import Any
 
@@ -30,6 +31,7 @@ from predmarket.domain.orderbook import OrderBook, OrderBookLevel
 
 MAPPING_VERSION = "polymarket-client-0.3.0b1:v1"
 PINNED_SDK_VERSION = "0.3.0b1"
+_MAX_MAPPING_RESPONSE_CHARS = 8_192
 
 
 class GatewayMappingError(ValueError):
@@ -1151,7 +1153,10 @@ def _map_market(
     except GatewayMappingError:
         raise
     except (AttributeError, TypeError, ValueError) as error:
-        raise GatewayMappingError(f"market {market_id}: {error}") from error
+        raise GatewayMappingError(
+            f"market {market_id}: {error}; "
+            f"api_response={_api_response_summary(sdk_market)}"
+        ) from error
 
 
 def _map_fee_schedule(trading: Any, *, received_at: int) -> FeeSchedule | None:
@@ -1173,17 +1178,56 @@ def _map_fee_schedule(trading: Any, *, received_at: int) -> FeeSchedule | None:
     sdk_schedule = getattr(trading, "fee_schedule")
     if sdk_schedule is None:
         raise ValueError("enabled fees require a fee schedule")
-    exponent = getattr(sdk_schedule, "exponent")
+    exponent = _decimal(getattr(sdk_schedule, "exponent"), "fee exponent")
+    rate = _decimal(getattr(sdk_schedule, "rate"), "fee rate")
     rebate_rate = _decimal(getattr(sdk_schedule, "rebate_rate"), "fee rebate rate")
-    if fee_type != "flat" or exponent != 0 or rebate_rate != Decimal("0"):
-        raise ValueError("SDK fee schedule cannot be represented by the FLAT domain model")
+    taker_only = getattr(sdk_schedule, "taker_only")
+    if type(taker_only) is not bool:
+        raise ValueError("fee taker_only must be a boolean")
+    if fee_type == "flat" and exponent == 0 and rebate_rate == Decimal("0"):
+        return FeeSchedule(
+            model=FeeModel.FLAT,
+            enabled=True,
+            source=source,
+            parameters={"rate": rate},
+            updated_at=received_at,
+            taker_only=taker_only,
+        )
     return FeeSchedule(
-        model=FeeModel.FLAT,
+        model=FeeModel.CURVE,
         enabled=True,
         source=source,
-        parameters={"rate": _decimal(getattr(sdk_schedule, "rate"), "fee rate")},
+        parameters={
+            "rate": rate,
+            "exponent": exponent,
+            "rebate_rate": rebate_rate,
+        },
         updated_at=received_at,
+        taker_only=taker_only,
     )
+
+
+def _api_response_summary(value: Any) -> str:
+    try:
+        model_dump = getattr(value, "model_dump", None)
+        payload = (
+            model_dump(mode="json")
+            if callable(model_dump)
+            else vars(value)
+        )
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except Exception:
+        serialized = repr(value)
+    if len(serialized) <= _MAX_MAPPING_RESPONSE_CHARS:
+        return serialized
+    suffix = "...<truncated>"
+    return serialized[: _MAX_MAPPING_RESPONSE_CHARS - len(suffix)] + suffix
 
 
 def _map_order_book_level(sdk_level: Any, side: str) -> OrderBookLevel:

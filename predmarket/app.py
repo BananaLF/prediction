@@ -91,7 +91,7 @@ class Supervisor:
 
             await watch.start()
             sync_task = asyncio.create_task(
-                self._sync_forever(sync), name="SyncMarketTask"
+                self._sync_forever(sync, notifier), name="SyncMarketTask"
             )
             watch_task = asyncio.create_task(watch.run(), name="WatchTask")
             tasks = (sync_task, watch_task)
@@ -231,10 +231,19 @@ class Supervisor:
             subscription_generation.bind(cache)
         return writer, gateway, notifier, sync, watch
 
-    async def _sync_forever(self, sync: Any) -> None:
+    async def _sync_forever(self, sync: Any, notifier: Notifier) -> None:
         while True:
             await self._sleep(self._config.polymarket.sync_interval_seconds)
-            await sync.run_once()
+            result = await sync.run_once()
+            if getattr(result, "complete", True) is False:
+                await notifier.notify(
+                    event_type="SYNC_GENERATION_INCOMPLETE",
+                    message="Market sync generation was incomplete",
+                    details={
+                        "error": getattr(result, "error", None),
+                        "sync_generation": getattr(result, "sync_generation", None),
+                    },
+                )
 
     async def _record_overflow(
         self, system_events: SystemEventRepository, overflow: MarketChangeOverflow

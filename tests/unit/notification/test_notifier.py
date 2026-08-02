@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import StringIO
+import json
 
 import pytest
 
@@ -52,6 +53,26 @@ async def test_terminal_notification_survives_desktop_failure() -> None:
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_operational_error_notification_prints_json_details() -> None:
+    output = StringIO()
+    notifier = Notifier(terminal=output)
+
+    await notifier.notify(
+        event_type="SYNC_GENERATION_INCOMPLETE",
+        message="Market sync generation was incomplete",
+        details={"error": 'market request failed; api_response={"id":"200"}'},
+    )
+
+    rendered = output.getvalue()
+    assert "SYNC_GENERATION_INCOMPLETE: Market sync generation was incomplete" in rendered
+    details_line = rendered.splitlines()[1]
+    details = json.loads(details_line.split(" details: ", 1)[1])
+    assert details == {
+        "error": 'market request failed; api_response={"id":"200"}',
+    }
 
 
 def test_macos_desktop_notification_escapes_double_quoted_applescript_literals(

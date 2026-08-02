@@ -17,7 +17,11 @@ from predmarket.persistence.repositories import (
     SystemEventRepository,
 )
 from predmarket.persistence.writer import DatabaseWriter
-from predmarket.polymarket.gateway import MAPPING_VERSION, MarketSnapshot
+from predmarket.polymarket.gateway import (
+    MAPPING_VERSION,
+    GatewayMappingError,
+    MarketSnapshot,
+)
 
 
 def _event(
@@ -713,6 +717,34 @@ async def test_incomplete_generation_preserves_existing_active_state_and_emits_n
     events_after = await system_events.read_after(0)
     assert events_after[-1]["event_type"] == "SYNC_GENERATION_INCOMPLETE"
     assert events_after[-1]["details"]["sync_generation"] == "sync-incomplete"
+
+
+async def test_market_mapping_error_is_preserved_in_result_and_system_event(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    marker = 'api_response={"id":"market-1"}'
+    task = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1",)),),
+            markets=GatewayMappingError(
+                f"market market-1: malformed fee schedule; {marker}"
+            ),
+        ),
+        catalog=catalog,
+        changes=_RecordingQueue(),
+        system_events=system_events,
+        clock_ms=lambda: 301,
+        generation_factory=lambda: "sync-mapping-error",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is False
+    assert result.error is not None
+    assert marker in result.error
+    events_after = await system_events.read_after(0)
+    assert marker in events_after[-1]["details"]["error"]
 
 
 async def test_repeated_complete_generation_is_an_idempotent_upsert(

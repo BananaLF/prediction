@@ -1076,6 +1076,7 @@ def _encode_fee_schedule(schedule: FeeSchedule) -> str:
             for key, value in sorted(schedule.parameters.items())
         },
         "source": schedule.source,
+        "taker_only": schedule.taker_only,
     }
     if schedule.updated_at is not None:
         payload["updated_at"] = schedule.updated_at

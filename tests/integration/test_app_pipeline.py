@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import replace
 from decimal import Decimal
 from io import StringIO
+import json
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,23 @@ class _Sync:
 class _FailingSync:
     async def run_once(self):
         raise RuntimeError("initial sync failed")
+
+
+class _IncompletePeriodicSync:
+    def __init__(self) -> None:
+        self.called = asyncio.Event()
+
+    async def run_once(self):
+        self.called.set()
+        return type(
+            "Result",
+            (),
+            {
+                "complete": False,
+                "error": 'market request failed; api_response={"id":"200"}',
+                "sync_generation": "sync-periodic",
+            },
+        )()
 
 
 class _Watch:
@@ -149,6 +167,34 @@ async def test_supervisor_returns_failure_when_startup_failure_notification_fail
     )
 
     assert await supervisor.run() == 1
+
+
+@pytest.mark.asyncio
+async def test_periodic_sync_notifies_when_generation_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    notifier = Notifier(terminal=output)
+    sync = _IncompletePeriodicSync()
+    supervisor = Supervisor(
+        _config(tmp_path),
+        notifier=notifier,
+        sleep=lambda _: asyncio.sleep(0),
+    )
+    task = asyncio.create_task(supervisor._sync_forever(sync, notifier))
+
+    try:
+        await asyncio.wait_for(sync.called.wait(), timeout=1)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    rendered = output.getvalue()
+    assert "SYNC_GENERATION_INCOMPLETE" in rendered
+    details = json.loads(rendered.splitlines()[1].split(" details: ", 1)[1])
+    assert details["error"] == 'market request failed; api_response={"id":"200"}'
+    assert details["sync_generation"] == "sync-periodic"
 
 
 @pytest.mark.asyncio
