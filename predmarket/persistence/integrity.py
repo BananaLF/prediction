@@ -286,7 +286,7 @@ def database_diagnostics(path: Path) -> dict[str, object]:
 
 
 def check_database_integrity(path: Path) -> None:
-    """Raise with stable violation codes when a schema-v2 database is unsafe."""
+    """Raise with stable violation codes when a schema-v3 database is unsafe."""
     collector = _collect_database_findings(path, include_semantic=True)
     if collector.violations:
         raise DatabaseIntegrityError(collector.violations)

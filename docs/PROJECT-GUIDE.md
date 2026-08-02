@@ -21,7 +21,7 @@ The runtime is assembled in `predmarket/app.py`:
   (`predmarket/signals/manager.py`) persists their open, update, or close evidence.
 - `Relation` (`predmarket/catalog/relations.py`) discovers, analyzes when an
   injected analyzer is supplied, and manually approves implication relations.
-- `Persistence` (`predmarket/persistence/`) supplies the Schema v2 repositories
+- `Persistence` (`predmarket/persistence/`) supplies the Schema v3 repositories
   and serializes writes through `DatabaseWriter`; `Notifier`
   (`predmarket/notification/notifier.py`) sends signal and operational events
   to the optional macOS desktop channel. Runtime status is emitted through
@@ -53,15 +53,15 @@ the degraded condition. The affected evidence must be refreshed before it can be
 used again. Startup, sync, metadata, order-book, strategy, and persistence
 invariant failures are all handled fail closed.
 
-## Schema v2
+## Schema v3
 
-The local SQLite database is **Schema v2**. Its initializer creates the schema
-and sets `PRAGMA user_version = 2`; an existing database with another version is
-rejected. Schema v1 databases require the explicit `predmarket migrate --to 2`
-command, which creates a backup before replacing the `markets` table with the
-nullable `event_id` form.
+The local SQLite database is **Schema v3**. Its initializer creates the schema
+and sets `PRAGMA user_version = 3`. An existing Schema v2 database is migrated
+to v3 transactionally; other versions are rejected. Schema v3 retains the v2
+contract that `markets.event_id` may be `NULL`, so an orphan market can remain
+valid until a later catalog sync connects it to an event.
 
-Apart from SQLite internal tables, Schema v1 has exactly these ten tables:
+Apart from SQLite internal tables, Schema v3 has exactly these ten tables:
 
 | Table | Responsibility |
 | --- | --- |
@@ -79,6 +79,18 @@ Apart from SQLite internal tables, Schema v1 has exactly these ten tables:
 `CLOSED` is an opportunity lifecycle result, not an order fill, settlement, or
 realized profit. A later independently valid opportunity receives a distinct
 signal record.
+
+### Decimal storage contract
+
+Decimal-valued SQLite columns use `TEXT`, not IEEE-754 `REAL`. New writes use a
+canonical plain-decimal string: no exponent notation, plus sign, leading or
+trailing redundant zeroes, or negative zero. There is no fixed scale, so prices,
+quantities, fees, and risk values retain arbitrarily long fractional parts in
+Python's `Decimal` type. The v2-to-v3 migration normalizes legacy spellings before
+the rows enter v3; reads accept legacy Decimal spellings at the compatibility
+boundary and return `Decimal`. Fee-schedule parameters use the same canonical
+strings inside JSON. Decimal columns are not used as numeric SQLite indexes,
+because their `TEXT` ordering is lexical rather than numeric.
 
 `markets.event_id` is nullable because an upstream market may be valid even
 when its event response is absent. `events.market_ids` is a derived reverse

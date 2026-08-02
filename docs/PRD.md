@@ -9,7 +9,7 @@
 | 适用代码基线 | `82d72e8` |
 | Python | `>=3.11` |
 | SDK | `polymarket-client==0.3.0b1` |
-| 本地数据库 | SQLite Schema v1 |
+| 本地数据库 | SQLite Schema v3 |
 
 ## 产品背景与问题定义
 
@@ -29,7 +29,7 @@ Predmarket 解决的问题是：从 Polymarket 公开市场和订单簿中发现
 
 ### 开发维护者
 
-维护同步、监控、策略、持久化与通知组件；在离线测试中验证 fail-closed 行为、Schema v1 一致性和 CLI 合同，不把未接入的 provider 或交易能力描述为现有功能。
+维护同步、监控、策略、持久化与通知组件；在离线测试中验证 fail-closed 行为、Schema v3 一致性和 CLI 合同，不把未接入的 provider 或交易能力描述为现有功能。
 
 ## 用户场景
 
@@ -57,7 +57,7 @@ Predmarket 解决的问题是：从 Polymarket 公开市场和订单簿中发现
 - 对真实成交概率的预测；
 - 链上操作；
 - 新增 LLM provider、API key 或默认 LLM 分析服务；
-- SQLite Schema 迁移或旧 Schema 兼容层；
+- v2 之前的 SQLite Schema 兼容层；
 - 全量 WebSocket 消息的永久保存。
 
 ## 功能需求
@@ -96,14 +96,14 @@ Predmarket 解决的问题是：从 Polymarket 公开市场和订单簿中发现
 
 ### 本地查询、存储与通知
 
-- Schema v1 SQLite 保存市场证据、关系、信号 revision 与 `system_events`，数据库写入由 `DatabaseWriter` 串行化。
+- Schema v3 SQLite 保存市场证据、关系、信号 revision 与 `system_events`，数据库写入由 `DatabaseWriter` 串行化。Decimal 字段以可保留任意小数位的规范化 `TEXT` 保存，由 Python `Decimal` 读写；v2 数据库在初始化时事务性迁移到 v3。
 - `status`、`signals list/show` 与 `relations list/show` 通过只读 SQLite 连接查询本地数据；数据库须先由 `run` 初始化。
 - 支持 terminal 与 desktop notifier 配置，并为启动、同步、监控与恢复中的重要故障提供通知。
 
 ### CLI 入口
 
 - 以下命令均应从仓库根目录执行。
-- 安装后以 `predmarket` 作为主入口，默认配置为 `config/default.yaml`，默认数据库为 `data/predmarket-v1.sqlite3`；配置相对路径按当前工作目录解析。
+- 安装后以 `predmarket` 作为主入口，默认配置为 `config/default.yaml`，默认数据库文件名仍为 `data/predmarket-v1.sqlite3`（文件名为历史兼容名称，SQLite Schema 为 v3）；配置相对路径按当前工作目录解析。
 - `python -m predmarket` 保留为兼容入口，功能与主入口一致。
 
 ## 数据生命周期
@@ -119,7 +119,7 @@ Predmarket 解决的问题是：从 Polymarket 公开市场和订单簿中发现
 
 - 只读外部边界：运行时不认证、不持有钱包、不签名、不下单、不撤单、不执行链上操作。
 - 安全 reset：reset 为独立脚本，要求服务停止、dry-run 审核和显式 `--execute`；只处理配置的 SQLite 主文件及精确的 `-wal`、`-shm` 同级文件。
-- 可审计与一致性：Schema v1 约束持久化结构；写入串行化，查询有专用只读边界。
+- 可审计与一致性：Schema v3 约束持久化结构；写入串行化，查询有专用只读边界。
 - Fail-closed 与 Decimal 精度：金融数值使用 `Decimal`，不以二进制浮点代替；不可靠数据不输出可用信号。
 - Bounded queue：市场变更队列容量受配置限制，溢出会记录事件并要求快照恢复。
 - 恢复能力：WebSocket 中断后按 generation 失效与 REST 快照恢复，不继续使用旧订单簿。
@@ -130,7 +130,7 @@ Predmarket 解决的问题是：从 Polymarket 公开市场和订单簿中发现
 - 产品不交易，也不预测真实成交概率。
 - 产品不保存全量 WebSocket 消息，只保留本地审计所需的证据和事件。
 - 标准 CLI 没有 analyzer provider，`relations analyze` 不能被视为默认可用的 LLM 分析功能。
-- 旧 SQLite Schema 不迁移；仅支持 Schema v1。
+- Schema v2 会在初始化时迁移到 v3；其他旧版本或未知版本拒绝启动。
 - live SDK smoke 依赖外部网络和可用的 Polymarket 公开接口，不能作为离线验证的前提。
 - `CLOSED` 不表示成交完成、结算或实现收益。
 

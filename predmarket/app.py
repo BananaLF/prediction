@@ -160,7 +160,7 @@ class Supervisor:
         self,
     ) -> tuple[DatabaseWriter, Any, Notifier, CatalogRepository, Any, Any]:
         # Initialize before the integrity read and before constructing the SDK
-        # boundary, so the v2 ten-table schema is an invariant of every run.
+        # boundary, so the v3 ten-table schema is an invariant of every run.
         initialize_database(self._config.database.path)
         check_database_startup(self._config.database.path)
         _LOGGER.info("component_initialized component=database")
