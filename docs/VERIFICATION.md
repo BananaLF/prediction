@@ -31,13 +31,13 @@ documentation test; they are not runtime smoke commands.
 
 The `predmarket` console entry point is available only after the editable
 install.  In the current `tests/integration/test_documented_commands.py`,
-`_documented_predmarket_commands()` collects only documented lines beginning
-with `python -m predmarket`, so the parser loop covers the module-form
-examples, including `python -m predmarket --help`.  Its subprocess check also
-executes only `python -m predmarket --help`; it does not parse or execute
-`predmarket --help`.  The console-form help command is therefore a manual
-check after the editable install.  Both help commands are static checks and do
-not need a database or network.
+`_documented_predmarket_commands()` collects documented commands in both
+`python -m predmarket` module form and `predmarket` console form, and the
+parser loop validates both forms without running them.  Its parameterized
+subprocess check validates help for both `python -m predmarket --help` and
+`predmarket --help`; if `shutil.which("predmarket")` cannot find the console
+entry point, only the console-form help case is skipped.  Both help commands
+are static checks and do not need a database or network.
 
 `status` opens SQLite read-only and therefore needs a configuration whose
 `database.path` names an initialized temporary Schema v1 database:
