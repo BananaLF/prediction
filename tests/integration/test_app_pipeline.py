@@ -25,6 +25,7 @@ from predmarket.domain.signal import (
 )
 from predmarket.notification.notifier import Notifier
 from predmarket.persistence.repositories import CatalogRepository, SignalRepository
+from predmarket.persistence.schema import initialize_database
 from predmarket.persistence.writer import DatabaseWriter
 from predmarket.watch.cache import OrderBookCache
 
@@ -79,6 +80,19 @@ class _IncompletePeriodicSync:
                 "complete": False,
                 "error": 'market request failed; api_response={"id":"200"}',
                 "sync_generation": "sync-periodic",
+            },
+        )()
+
+
+class _IncompleteWatchableSync:
+    async def run_once(self):
+        return type(
+            "Result",
+            (),
+            {
+                "complete": False,
+                "error": "event request failed",
+                "sync_generation": "sync-initial-incomplete",
             },
         )()
 
@@ -197,6 +211,59 @@ async def test_supervisor_notifies_when_initial_generation_skips_malformed_marke
         ],
         "sync_generation": "sync-initial-skipped",
     }
+
+
+@pytest.mark.asyncio
+async def test_supervisor_starts_watch_from_existing_catalog_during_incomplete_initial_sync(
+    tmp_path: Path,
+) -> None:
+    database_path = _config(tmp_path).database.path
+    initialize_database(database_path)
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    try:
+        catalog = CatalogRepository(database_path, writer)
+        market = Market(
+            id="market-orphan",
+            event_id=None,
+            condition_id="condition-orphan",
+            question="Orphan?",
+            status=MarketStatus.ACTIVE,
+            active=True,
+            accepting_orders=True,
+            enable_orderbook=True,
+            sync_generation="sync-existing",
+            sync_generation_complete=True,
+        )
+        await catalog.save_catalog(
+            events=(),
+            markets=(market,),
+            tokens=(
+                Token(
+                    id="token-orphan",
+                    market_id=market.id,
+                    outcome="YES",
+                    position=0,
+                    sync_generation="sync-existing",
+                    sync_generation_complete=True,
+                ),
+            ),
+        )
+    finally:
+        await writer.close()
+
+    calls: list[str] = []
+    supervisor = Supervisor(
+        _config(tmp_path),
+        gateway=object(),
+        terminal=StringIO(),
+        sync_task_factory=lambda **_: _IncompleteWatchableSync(),
+        watch_task_factory=lambda **_: _Watch(calls, crash=True),
+        sleep=lambda _: pytest.fail("watchable catalog should bypass sync retry"),
+    )
+
+    assert await supervisor.run() == 1
+    assert calls == ["watch-start", "watch-run", "watch-close"]
 
 
 @pytest.mark.asyncio

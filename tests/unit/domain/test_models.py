@@ -178,16 +178,30 @@ def test_event_canonicalizes_market_ids_by_utf8_bytes() -> None:
         event.title = "changed"  # type: ignore[misc]
 
 
-def test_event_requires_at_least_one_market_id() -> None:
-    with pytest.raises(ValueError, match="market_ids"):
-        Event(
-            id="event-1",
-            title="Event",
-            status=MarketStatus.ACTIVE,
-            market_ids=(),
-            sync_generation="sync-1",
-            sync_generation_complete=True,
-        )
+def test_event_allows_zero_market_ids() -> None:
+    event = Event(
+        id="event-1",
+        title="Event",
+        status=MarketStatus.ACTIVE,
+        market_ids=(),
+        sync_generation="sync-1",
+        sync_generation_complete=True,
+    )
+
+    assert event.market_ids == ()
+
+
+def test_market_allows_missing_event_relation() -> None:
+    market = _market()
+
+    orphan = Market(
+        **{
+            **market.__dict__,
+            "event_id": None,
+        }
+    )
+
+    assert orphan.event_id is None
 
 
 def test_event_rejects_string_instead_of_market_id_collection() -> None:

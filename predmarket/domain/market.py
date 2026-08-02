@@ -51,7 +51,7 @@ class Event:
         _boolean(self.neg_risk, "neg_risk")
         _boolean(self.neg_risk_complete, "neg_risk_complete")
         _boolean(self.neg_risk_conversion_supported, "neg_risk_conversion_supported")
-        market_ids = _canonical_ids(self.market_ids, "market_ids")
+        market_ids = _canonical_ids(self.market_ids, "market_ids", allow_empty=True)
         object.__setattr__(self, "market_ids", market_ids)
         if self.neg_risk_metadata is not None:
             if not isinstance(self.neg_risk_metadata, Mapping):
@@ -78,7 +78,7 @@ class Event:
 @dataclass(frozen=True)
 class Market:
     id: str
-    event_id: str
+    event_id: str | None
     condition_id: str
     question: str
     status: MarketStatus
@@ -102,7 +102,8 @@ class Market:
 
     def __post_init__(self) -> None:
         _identifier(self.id, "market id")
-        _identifier(self.event_id, "event id")
+        if self.event_id is not None:
+            _identifier(self.event_id, "event id")
         _identifier(self.condition_id, "condition id")
         _nonempty(self.question, "market question")
         _enum(self.status, MarketStatus, "market status")
@@ -161,14 +162,19 @@ class Token:
         _timestamps(self.fee_updated_at, self.created_at, self.updated_at)
 
 
-def _canonical_ids(values: tuple[str, ...], field_name: str) -> tuple[str, ...]:
+def _canonical_ids(
+    values: tuple[str, ...],
+    field_name: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
     if isinstance(values, (str, bytes)):
         raise ValueError(f"{field_name} must be an iterable of strings")
     try:
         normalized = tuple(values)
     except TypeError as error:
         raise ValueError(f"{field_name} must be an iterable of strings") from error
-    if not normalized:
+    if not normalized and not allow_empty:
         raise ValueError(f"{field_name} must not be empty")
     for value in normalized:
         _identifier(value, field_name)

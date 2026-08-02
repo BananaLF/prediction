@@ -24,7 +24,7 @@ class MarketChangeType(str, Enum):
 class MarketChange:
     change_id: str
     change_type: MarketChangeType
-    event_id: str
+    event_id: str | None
     market_id: str | None
     token_ids: tuple[str, ...]
     occurred_at: int
@@ -34,8 +34,11 @@ class MarketChange:
         _identifier(self.change_id, "change_id")
         if not isinstance(self.change_type, MarketChangeType):
             raise ValueError("change_type must be a MarketChangeType")
-        _identifier(self.event_id, "event_id")
+        if self.event_id is not None:
+            _identifier(self.event_id, "event_id")
         if self.change_type is MarketChangeType.EVENT_SETTLED:
+            if self.event_id is None:
+                raise ValueError("event_id is required for EVENT_SETTLED")
             if self.market_id is not None:
                 _identifier(self.market_id, "market_id")
         else:

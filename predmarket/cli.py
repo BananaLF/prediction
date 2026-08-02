@@ -20,6 +20,8 @@ from predmarket.catalog.relations import (
 from predmarket.config import AppConfig
 from predmarket.domain.decimal import encode_decimal
 from predmarket.domain.relation import Relation
+from predmarket.persistence.integrity import database_diagnostics
+from predmarket.persistence.migration import migrate_database
 
 
 def main(
@@ -31,9 +33,31 @@ def main(
 ) -> int:
     parser = _build_parser()
     arguments = parser.parse_args(_normalize_config_position(argv))
-    config = AppConfig.load(arguments.config)
     output = sys.stdout if stdout is None else stdout
     clock = now_ms or (lambda: time.time_ns() // 1_000_000)
+
+    if arguments.command == "migrate":
+        migrate_database(
+            arguments.database,
+            arguments.backup,
+            target_version=arguments.target_version,
+        )
+        _write_json(
+            output,
+            {
+                "backup": str(arguments.backup),
+                "database": str(arguments.database),
+                "schema_version": arguments.target_version,
+            },
+        )
+        return 0
+
+    if arguments.command == "doctor":
+        diagnostics = database_diagnostics(arguments.database)
+        _write_json(output, diagnostics)
+        return 0 if not diagnostics["violations"] else 1
+
+    config = AppConfig.load(arguments.config)
 
     if arguments.command == "run":
         from predmarket.app import Supervisor
@@ -119,6 +143,15 @@ def _build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("run", help="run the read-only market signal service")
     commands.add_parser("status", help="show local service database status")
+    migrate = commands.add_parser(
+        "migrate",
+        help="explicitly migrate a legacy database schema",
+    )
+    migrate.add_argument("--to", dest="target_version", type=int, required=True)
+    migrate.add_argument("--database", type=Path, required=True)
+    migrate.add_argument("--backup", type=Path, required=True)
+    doctor = commands.add_parser("doctor", help="check local database integrity")
+    doctor.add_argument("--database", type=Path, required=True)
     signals = commands.add_parser("signals", help="inspect persisted signals")
     signal_commands = signals.add_subparsers(dest="signals_command", required=True)
     signal_commands.add_parser("list", help="list persisted signals")

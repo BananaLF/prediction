@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_V1 = """
 CREATE TABLE events (
@@ -425,9 +425,16 @@ CREATE INDEX system_events_severity_occurred_at_idx
     ON system_events(severity, occurred_at);
 """
 
+# v1 is retained as the source schema for the explicit on-disk migration.
+# The only v2 structural change is that a market may temporarily have no event.
+SCHEMA_V2 = SCHEMA_V1.replace(
+    "event_id TEXT NOT NULL REFERENCES events(id)",
+    "event_id TEXT REFERENCES events(id)",
+)
+
 
 def initialize_database(path: Path) -> None:
-    """Create schema v1 or validate that an existing database is schema v1."""
+    """Create schema v2 or validate that an existing database is schema v2."""
     database_path = Path(path)
     if database_path.exists() and database_path.stat().st_size > 0:
         version = _read_existing_version(database_path)
@@ -445,7 +452,7 @@ def initialize_database(path: Path) -> None:
         try:
             connection.executescript(
                 "BEGIN IMMEDIATE;\n"
-                + SCHEMA_V1
+                + SCHEMA_V2
                 + f"\nPRAGMA user_version = {SCHEMA_VERSION};\n"
                 + "COMMIT;\n"
             )

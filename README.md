@@ -80,6 +80,8 @@ predmarket run
 | --- | --- | --- |
 | `predmarket --help` | 查看全局帮助和子命令 | 只读，不需要数据库或网络 |
 | `predmarket run --config config/default.yaml` | 启动公开市场数据采集和信号服务 | 读取配置并写入/初始化本地 SQLite；需要公开数据网络可用 |
+| `predmarket doctor --database PATH` | 检查本地数据库 schema、SQLite 完整性和 catalog 诊断 | 只读本地 SQLite；数据库必须已初始化 |
+| `predmarket migrate --to 2 --database PATH --backup PATH` | 将 Schema v1 数据库显式迁移到 v2 | 写入迁移后的数据库，并创建指定备份；执行前应停止服务 |
 | `predmarket status --config config/default.yaml` | 查看本地信号和系统事件计数 | 只读本地 SQLite；数据库必须已初始化 |
 | `predmarket signals list --config config/default.yaml` | 列出已记录信号 | 只读本地 SQLite；数据库必须已初始化 |
 | `predmarket signals show SIGNAL_ID --config config/default.yaml` | 查看一个信号及其证据字段 | 只读本地 SQLite；数据库必须已初始化且 ID 存在 |
@@ -114,7 +116,18 @@ python -m predmarket status --config config/default.yaml
 
 ## 数据库与 reset
 
-默认数据库路径是 `data/predmarket-v1.sqlite3`。`status`、`signals` 和 `relations list/show` 要求数据库已经由 `run` 初始化；数据库不存在或尚未完成初始化时，先启动 `run` 并等待首轮数据处理。
+默认数据库路径是 `data/predmarket-v1.sqlite3`，当前 SQLite Schema 是 v2。`markets.event_id` 可以为空，表示上游没有对应 event；`events.market_ids` 是由本地 market 关系重建的反向索引。只要数据库中有合法的 active market 和 token，`run` 即使遇到不完整的首轮 sync 也会启动 watch，并继续后台同步。
+
+旧的 Schema v1 数据库不会由服务自动修改。停止服务后，先创建备份并显式迁移，再启动 `run`：
+
+```console
+predmarket migrate --to 2 --database data/predmarket-v1.sqlite3 --backup data/predmarket-v1.sqlite3.before-v2
+predmarket doctor --database data/predmarket-v1.sqlite3
+```
+
+`doctor` 会报告 schema、SQLite 完整性、孤立 market、没有 market 的 event 和可 watch catalog；孤立 market 在关系合法且具备 token 时不是完整性错误。
+
+`status`、`signals` 和 `relations list/show` 要求数据库已经由 `run` 初始化；数据库不存在或尚未完成初始化时，先初始化或迁移数据库。
 
 reset 使用独立脚本，不提供 `predmarket reset` 子命令。执行前必须先停止运行中的服务，先检查 dry-run 输出的绝对路径，确认目标后再使用 `--execute`：
 

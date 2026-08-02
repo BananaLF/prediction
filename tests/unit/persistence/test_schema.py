@@ -123,7 +123,7 @@ def _insert_revision(
     )
 
 
-def test_initialize_database_creates_exact_schema_v1_and_wal(tmp_path: Path) -> None:
+def test_initialize_database_creates_exact_schema_v2_and_wal(tmp_path: Path) -> None:
     database_path = tmp_path / "market.db"
 
     initialize_database(database_path)
@@ -139,7 +139,7 @@ def test_initialize_database_creates_exact_schema_v1_and_wal(tmp_path: Path) -> 
             )
         }
         assert tables == PROJECT_TABLES
-        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
         assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
@@ -191,14 +191,14 @@ def test_initialize_database_rejects_nonempty_unknown_schema_without_mutation(
     assert database_path.read_bytes() == original_bytes
 
 
-def test_initialize_database_accepts_an_existing_schema_v1(tmp_path: Path) -> None:
+def test_initialize_database_accepts_an_existing_schema_v2(tmp_path: Path) -> None:
     database_path = tmp_path / "market.db"
     initialize_database(database_path)
 
     initialize_database(database_path)
 
     with _connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
 
 
 def test_initialize_database_rolls_back_a_partially_failing_schema_script(
@@ -208,7 +208,7 @@ def test_initialize_database_rolls_back_a_partially_failing_schema_script(
     database_path = tmp_path / "market.db"
     monkeypatch.setattr(
         schema_module,
-        "SCHEMA_V1",
+        "SCHEMA_V2",
         """
         CREATE TABLE partial_table (id INTEGER PRIMARY KEY);
         CREATE TABLE broken_table (;

@@ -476,7 +476,7 @@ async def test_list_active_markets_maps_tokens_and_authoritative_fee_schedules(
     assert zero_fee.enabled is False
 
 
-async def test_list_active_markets_skips_one_malformed_market_with_warning(
+async def test_list_active_markets_accepts_market_without_event_reference(
     sdk_fixture: dict[str, tuple[Any, ...]],
 ) -> None:
     payload = deepcopy(sdk_fixture)
@@ -490,13 +490,33 @@ async def test_list_active_markets_skips_one_malformed_market_with_warning(
 
     snapshots = await gateway.list_active_markets()
 
-    assert tuple(snapshot.market.id for snapshot in snapshots) == ("201",)
-    assert tuple(warning.market_id for warning in gateway.market_mapping_warnings) == (
-        "200",
+    assert tuple(snapshot.market.id for snapshot in snapshots) == ("200", "201")
+    assert gateway.market_mapping_warnings == ()
+    assert snapshots[0].market.event_id is None
+
+
+async def test_list_active_markets_skips_market_with_multiple_event_references(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    payload = deepcopy(sdk_fixture)
+    payload["markets"][0].events = (
+        payload["markets"][0].events[0],
+        payload["markets"][1].events[0],
     )
+    client = FakePublicClient(**payload)
+    gateway = PolymarketGateway(
+        client=client,
+        clock_ms=lambda: 1_785_405_970_000,
+        page_size=1,
+    )
+
+    snapshots = await gateway.list_active_markets()
+
+    assert tuple(snapshot.market.id for snapshot in snapshots) == ("201",)
     warning = gateway.market_mapping_warnings[0]
-    assert "events must contain exactly one event reference" in warning.error
-    assert '"events":[]' in warning.error
+    assert warning.market_id == "200"
+    assert "events must contain at most one event reference" in warning.error
+    assert '"events":[' in warning.error
     assert len(warning.error.rsplit("api_response=", 1)[1]) <= 8_192
 
 

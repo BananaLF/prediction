@@ -18,17 +18,37 @@ def _change(
     change_id: str,
     change_type: MarketChangeType,
     *,
+    event_id: str | None = "event-1",
     critical: bool = False,
 ) -> MarketChange:
     return MarketChange(
         change_id=change_id,
         change_type=change_type,
-        event_id="event-1",
+        event_id=event_id,
         market_id=None if change_type is MarketChangeType.EVENT_SETTLED else "market-1",
         token_ids=("token-1", "token-2"),
         occurred_at=123,
         critical=critical,
     )
+
+
+def test_market_change_allows_orphan_market_without_event() -> None:
+    change = _change(
+        "orphan-added",
+        MarketChangeType.MARKET_ADDED,
+        event_id=None,
+    )
+
+    assert change.event_id is None
+
+
+def test_event_settled_change_requires_event() -> None:
+    with pytest.raises(ValueError, match="event_id"):
+        _change(
+            "settled-without-event",
+            MarketChangeType.EVENT_SETTLED,
+            event_id=None,
+        )
 
 
 @dataclass
