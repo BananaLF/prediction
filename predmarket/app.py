@@ -111,7 +111,10 @@ class Supervisor:
                 )
             return 1
         except asyncio.CancelledError:
-            raise
+            # asyncio.run() cancels the main task on the first Ctrl+C. Treat
+            # that cancellation as an intentional shutdown so the runner can
+            # return normally after this method's cleanup completes.
+            return 0
         except Exception as error:
             notifier = self._runtime_notifier
             if notifier is not None:
