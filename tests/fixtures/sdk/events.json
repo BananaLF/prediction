@@ -304,12 +304,12 @@
         "minimum_tick_size": "0.01",
         "seconds_delay": 0,
         "fees_enabled": true,
-        "fee_type": "flat",
+        "fee_type": "politics_fees",
         "fee_schedule": {
-          "exponent": 0,
-          "rate": "0.02",
+          "exponent": 1,
+          "rate": "0.04",
           "taker_only": true,
-          "rebate_rate": "0"
+          "rebate_rate": "0.25"
         }
       },
       "resolution": {

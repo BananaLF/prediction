@@ -10,6 +10,7 @@ import pytest
 
 import predmarket.persistence.writer as writer_module
 from predmarket.catalog.relations import semantic_evidence_digest
+from predmarket.domain.fees import FeeModel, FeeSchedule
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
 from predmarket.domain.relation import DiscoverySource, Relation, RelationStatus
@@ -453,6 +454,19 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
         position=0,
         sync_generation="sync-1",
         sync_generation_complete=True,
+        fee_schedule=FeeSchedule(
+            model=FeeModel.CURVE,
+            enabled=True,
+            source="fixture",
+            parameters={
+                "rate": Decimal("0.04"),
+                "exponent": Decimal("1"),
+                "rebate_rate": Decimal("0.25"),
+            },
+            updated_at=3,
+            taker_only=True,
+        ),
+        fee_updated_at=3,
         created_at=1,
         updated_at=2,
     )
@@ -552,12 +566,14 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
         with pytest.raises(ValueError, match="NO_LLM_APPROVE"):
             await relations.save(approved)
         stored_market = await catalog.get_market("market-1")
+        stored_token = await catalog.get_token("token-1")
         stored_relation = await relations.get("relation-1")
         activation_events = await system_events.read_after(0)
     finally:
         await writer.close()
 
     assert stored_market == market
+    assert stored_token == token
     assert stored_relation is not None
     assert replace(stored_relation, llm_analysis=llm_approved.llm_analysis) == llm_approved
     assert stored_relation.llm_analysis is not None
