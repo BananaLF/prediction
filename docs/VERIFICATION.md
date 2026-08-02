@@ -1,12 +1,23 @@
 # Verification
 
-Run these commands from the repository root with Python 3.11 or newer:
+Run this command from the repository root to create/reuse a Python 3.11+ virtual
+environment, install the editable project with test dependencies, and run the
+complete offline verification:
 
 ```console
-python -m pip install -e ".[test]"
-pytest -q
-python -m predmarket --help
-predmarket --help
+./scripts/build_env.sh
+```
+
+The script prefers `uv` and falls back to a local Python 3.11+ interpreter with
+venv `pip`. To keep the environment activated in the current shell, use
+`source scripts/build_env.sh`. Direct execution cannot activate its parent
+shell. For troubleshooting, the equivalent checks inside an already prepared
+environment are:
+
+```console
+.venv/bin/python -m pytest -q
+.venv/bin/python -m predmarket --help
+.venv/bin/predmarket --help
 python -m compileall -q predmarket
 git diff --check
 ```
