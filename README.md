@@ -39,26 +39,32 @@ Predmarket 是一个本地、对 Polymarket 只读、证据驱动的市场信号
 - `polymarket-client==0.3.0b1`
 - 建议从仓库根目录执行以下命令。
 
-推荐使用 uv 安装测试依赖：
+推荐使用一键脚本准备构建环境、安装 `predmarket[test]` 并运行完整验证：
 
 ```console
-uv sync --extra test
-source .venv/bin/activate
+./scripts/build_env.sh
 ```
 
-不使用 uv 时，也可以用 pip 以可编辑模式安装：
+脚本优先使用 `uv` 和 Python `>=3.11`；没有 `uv` 时，会选择本机可用的 Python
+`>=3.11`，创建 `.venv` 并使用 venv 内的 `pip` 安装。脚本会运行完整的
+`pytest -q`，以及 `python -m predmarket --help` 和 `predmarket --help` 两种 CLI
+检查，不会初始化或修改默认数据库。
+
+直接执行脚本不会改变父 shell 的激活状态；如果希望脚本完成后保留 `.venv` 激活，使用：
 
 ```console
-python -m pip install -e ".[test]"
+source scripts/build_env.sh
 ```
+
+脚本也可以重复执行：已有 `.venv` 必须使用 Python `>=3.11`，否则脚本会报错并要求手动重建，
+不会自动删除或替换已有环境。
 
 ## 快速开始
 
 以下命令均从仓库根目录执行，首选使用已安装的 `predmarket` console entry：
 
 ```console
-uv sync --extra test
-source .venv/bin/activate
+source scripts/build_env.sh
 predmarket --help
 predmarket run --config config/default.yaml
 ```
@@ -67,10 +73,10 @@ predmarket run --config config/default.yaml
 
 运行状态通过 Python `logging` 输出到 `stderr`，默认级别为 `INFO`。可在启动命令中使用 `--log-level DEBUG|INFO|WARNING|ERROR|CRITICAL` 调整级别，例如 `predmarket run --config config/default.yaml --log-level DEBUG`。
 
-不使用 uv 的等价入口是：
+如果已经通过直接执行完成环境准备，也可以手动激活后运行：
 
 ```console
-python -m pip install -e ".[test]"
+source .venv/bin/activate
 predmarket run
 ```
 
