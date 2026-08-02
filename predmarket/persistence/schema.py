@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import re
 import sqlite3
 
+from predmarket.domain.decimal import decode_decimal, encode_decimal
+from predmarket.domain.fees import FeeSchedule
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_V1 = """
 CREATE TABLE events (
@@ -432,17 +436,288 @@ SCHEMA_V2 = SCHEMA_V1.replace(
     "event_id TEXT REFERENCES events(id)",
 )
 
+_SCHEMA_TABLES = (
+    "events",
+    "markets",
+    "tokens",
+    "relations",
+    "arbitrage_signals",
+    "signal_revisions",
+    "signal_legs",
+    "orderbook_snapshots",
+    "orderbook_levels",
+    "system_events",
+)
+
+_DECIMAL_COLUMNS = {
+    "markets": {
+        "tick_size": "unit_interval_positive_or_one",
+        "minimum_order_size": "positive",
+    },
+    "relations": {"llm_confidence": "unit_interval"},
+    "signal_revisions": {
+        "quantity": "positive",
+        "total_capital": "positive",
+        "expected_profit": "any",
+        "return_rate": "any",
+        "worst_case_loss": "nonnegative",
+        "risk_rate": "any",
+        "unhedged_notional": "nonnegative",
+    },
+    "signal_legs": {
+        "quantity": "positive",
+        "average_price": "unit_interval_positive",
+        "worst_price": "unit_interval_positive",
+        "gross_amount": "nonnegative",
+        "fee_amount": "nonnegative",
+    },
+    "orderbook_snapshots": {
+        "tick_size": "unit_interval_positive_or_one",
+        "minimum_order_size": "positive",
+    },
+    "orderbook_levels": {
+        "price": "unit_interval_positive",
+        "size": "positive",
+    },
+}
+
+
+def _canonical_decimal_check(column: str) -> str:
+    magnitude = (
+        f"CASE WHEN substr({column}, 1, 1) = '-' "
+        f"THEN substr({column}, 2) ELSE {column} END"
+    )
+    return (
+        f"typeof({column}) = 'text'"
+        f" AND length({column}) > 0"
+        f" AND substr({magnitude}, 1, 1) GLOB '[0-9]'"
+        f" AND {magnitude} NOT GLOB '*[^0-9.]*'"
+        f" AND {magnitude} NOT GLOB '*.*.*'"
+        f" AND {magnitude} NOT GLOB '0[0-9]*'"
+        f" AND NOT ({column} GLOB '-*' AND {magnitude} = '0')"
+        f" AND substr({magnitude}, -1, 1) <> '.'"
+        f" AND NOT ({magnitude} LIKE '%.%' AND substr({column}, -1, 1) = '0')"
+    )
+
+
+def _decimal_range_check(column: str, range_name: str) -> str:
+    nonnegative = f"substr({column}, 1, 1) <> '-'"
+    positive = f"{nonnegative} AND {column} <> '0'"
+    if range_name == "any":
+        return "1"
+    if range_name == "positive":
+        return positive
+    if range_name == "nonnegative":
+        return nonnegative
+    if range_name == "unit_interval":
+        return f"{nonnegative} AND ({column} IN ('0', '1') OR {column} LIKE '0.%')"
+    if range_name == "unit_interval_positive":
+        return f"{nonnegative} AND {column} LIKE '0.%'"
+    if range_name == "unit_interval_positive_or_one":
+        return f"{nonnegative} AND ({column} = '1' OR {column} LIKE '0.%')"
+    raise ValueError(f"unknown Decimal range {range_name!r}")
+
+
+def _decimal_definition(column: str, range_name: str, *, nullable: bool) -> str:
+    checks = f"{_canonical_decimal_check(column)} AND {_decimal_range_check(column, range_name)}"
+    if nullable:
+        checks = f"{column} IS NULL OR ({checks})"
+        nullability = ""
+    else:
+        nullability = " NOT NULL"
+    return f"    {column} TEXT{nullability}\n        CHECK ({checks}),\n"
+
+
+def _build_schema_v3() -> str:
+    """Build the v3 schema by replacing every Decimal declaration in v2."""
+
+    schema = SCHEMA_V2
+    for table, columns in _DECIMAL_COLUMNS.items():
+        table_match = re.search(
+            rf"(?ms)^CREATE TABLE {re.escape(table)} \(.*?^\);",
+            schema,
+        )
+        if table_match is None:
+            raise RuntimeError(f"schema table {table!r} is missing")
+
+        table_sql = table_match.group(0)
+        for column, range_name in columns.items():
+            column_match = re.search(
+                rf"(?ms)^    {re.escape(column)} TEXT(?P<not_null> NOT NULL)?\s.*?"
+                r"(?=^    [A-Za-z_][A-Za-z0-9_]*|^\);)",
+                table_sql,
+            )
+            if column_match is None:
+                raise RuntimeError(f"schema Decimal column {table}.{column} is missing")
+            replacement = _decimal_definition(
+                column,
+                range_name,
+                nullable=column_match.group("not_null") is None,
+            )
+            table_sql = (
+                table_sql[: column_match.start()]
+                + replacement
+                + table_sql[column_match.end() :]
+            )
+
+        schema = schema[: table_match.start()] + table_sql + schema[table_match.end() :]
+    return schema
+
+
+SCHEMA_V3 = _build_schema_v3()
+
+
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _execute_sql_script(connection: sqlite3.Connection, script: str) -> None:
+    """Execute a schema script without the implicit commit of executescript()."""
+
+    statement_lines: list[str] = []
+    for line in script.splitlines():
+        statement_lines.append(line)
+        statement = "\n".join(statement_lines)
+        if sqlite3.complete_statement(statement):
+            connection.execute(statement)
+            statement_lines = []
+    if any(line.strip() for line in statement_lines):
+        raise sqlite3.OperationalError("incomplete schema SQL")
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> list[str]:
+    return [
+        str(row[1])
+        for row in connection.execute(f"PRAGMA table_info({_quote_identifier(table)})")
+    ]
+
+
+def _normalize_fee_schedule_json(value: str) -> str:
+    payload = json.loads(value)
+    if not isinstance(payload, dict):
+        raise ValueError("fee schedule must be a JSON object")
+    parameters = payload.get("parameters")
+    if not isinstance(parameters, dict):
+        raise ValueError("fee parameters must be a JSON object")
+    normalized = dict(payload)
+    normalized_parameters = dict(parameters)
+    for key, parameter in normalized_parameters.items():
+        if isinstance(parameter, str):
+            normalized_parameters[key] = encode_decimal(decode_decimal(parameter))
+    normalized["parameters"] = normalized_parameters
+    FeeSchedule.from_json(normalized)
+    return json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _migrate_v2_to_v3(database_path: Path) -> None:
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("BEGIN IMMEDIATE")
+        saved_indexes = connection.execute(
+            "SELECT name, sql FROM sqlite_schema "
+            "WHERE type = 'index' AND sql IS NOT NULL "
+            "AND tbl_name IN (" + ",".join("?" for _ in _SCHEMA_TABLES) + ")",
+            _SCHEMA_TABLES,
+        ).fetchall()
+        for index_name, _ in saved_indexes:
+            connection.execute(f"DROP INDEX {_quote_identifier(str(index_name))}")
+
+        temporary_tables = {
+            table: f"__predmarket_v2_{table}" for table in _SCHEMA_TABLES
+        }
+        for table in _SCHEMA_TABLES:
+            connection.execute(
+                f"ALTER TABLE {_quote_identifier(table)} "
+                f"RENAME TO {_quote_identifier(temporary_tables[table])}"
+            )
+
+        _execute_sql_script(connection, SCHEMA_V3)
+
+        for table in _SCHEMA_TABLES:
+            source_table = temporary_tables[table]
+            source_columns = _table_columns(connection, source_table)
+            target_columns = _table_columns(connection, table)
+            source_column_set = set(source_columns)
+            columns = [column for column in target_columns if column in source_column_set]
+            quoted_columns = ", ".join(_quote_identifier(column) for column in columns)
+            rows = connection.execute(
+                f"SELECT {quoted_columns} FROM {_quote_identifier(source_table)}"
+            ).fetchall()
+            decimal_columns = _DECIMAL_COLUMNS.get(table, {})
+            placeholders = ", ".join("?" for _ in columns)
+            insert_sql = (
+                f"INSERT INTO {_quote_identifier(table)} ({quoted_columns}) "
+                f"VALUES ({placeholders})"
+            )
+            column_positions = {column: index for index, column in enumerate(columns)}
+            for row in rows:
+                values = list(row)
+                for column in decimal_columns:
+                    position = column_positions.get(column)
+                    if position is None or values[position] is None:
+                        continue
+                    try:
+                        values[position] = encode_decimal(decode_decimal(values[position]))
+                    except ValueError as error:
+                        raise ValueError(
+                            f"invalid Decimal value in {table}.{column}"
+                        ) from error
+                fee_position = column_positions.get("fee_schedule_json")
+                if fee_position is not None and values[fee_position] is not None:
+                    try:
+                        values[fee_position] = _normalize_fee_schedule_json(
+                            values[fee_position]
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError) as error:
+                        raise ValueError(
+                            f"invalid fee schedule JSON in {table}.fee_schedule_json"
+                        ) from error
+                connection.execute(insert_sql, values)
+
+        for table in reversed(_SCHEMA_TABLES):
+            connection.execute(f"DROP TABLE {_quote_identifier(temporary_tables[table])}")
+
+        existing_indexes = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'index'"
+            )
+        }
+        for index_name, index_sql in saved_indexes:
+            if str(index_name) in existing_indexes:
+                continue
+            assert isinstance(index_sql, str)
+            connection.execute(index_sql)
+
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.close()
+
 
 def initialize_database(path: Path) -> None:
-    """Create schema v2 or validate that an existing database is schema v2."""
+    """Create schema v3 or migrate an existing schema v2 database to v3."""
     database_path = Path(path)
     if database_path.exists() and database_path.stat().st_size > 0:
         version = _read_existing_version(database_path)
-        if version != SCHEMA_VERSION:
-            raise ValueError(
-                f"unsupported database schema version {version}; expected {SCHEMA_VERSION}"
-            )
-        return
+        if version == SCHEMA_VERSION:
+            return
+        if version == 2:
+            _migrate_v2_to_v3(database_path)
+            return
+        raise ValueError(
+            f"unsupported database schema version {version}; expected {SCHEMA_VERSION}"
+        )
 
     database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path)
@@ -450,12 +725,10 @@ def initialize_database(path: Path) -> None:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         try:
-            connection.executescript(
-                "BEGIN IMMEDIATE;\n"
-                + SCHEMA_V2
-                + f"\nPRAGMA user_version = {SCHEMA_VERSION};\n"
-                + "COMMIT;\n"
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            _execute_sql_script(connection, SCHEMA_V3)
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            connection.commit()
         except BaseException:
             connection.rollback()
             raise

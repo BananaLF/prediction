@@ -20,7 +20,7 @@ from typing import Protocol
 import aiosqlite
 
 from predmarket.domain.market import Event, Market, MarketStatus
-from predmarket.domain.decimal import encode_decimal
+from predmarket.domain.decimal import decode_decimal, encode_decimal
 from predmarket.domain.relation import DiscoverySource, Relation, RelationStatus
 
 
@@ -980,7 +980,7 @@ def _relation_from_row(row: aiosqlite.Row) -> Relation:
         llm_confidence=(
             None
             if row["llm_confidence"] is None
-            else Decimal(row["llm_confidence"])
+            else decode_decimal(row["llm_confidence"])
         ),
         llm_analysis=(
             None

@@ -12,10 +12,14 @@ predmarket signals list --config config/default.yaml
 The default configuration is `config/default.yaml`; it stores local evidence in
 `data/predmarket-v1.sqlite3`. `run` is the long-running observer: it reads only
 public Polymarket data, writes local evidence, relations, signals, and
-operational state, initializes Schema v2, watches order books, evaluates
+operational state, initializes Schema v3, watches order books, evaluates
 strategies, and sends notifications. `status` and `signals list` are local
 SQLite reads, so use them after `run` has initialized the database. They do not
 make Polymarket requests.
+
+The filename is retained for historical compatibility; the SQLite
+`PRAGMA user_version` for a current database is `3`. A v2 database is migrated
+transactionally during initialization.
 
 If the first sync is incomplete because an event request fails, `run` starts
 `watch` as soon as the committed database contains a valid active market with a
@@ -45,7 +49,7 @@ application log file in the default configuration. Check a running process in
 its terminal, and use `status` for the configured database, signal count, and
 system-event count.
 
-`run` performs only the required startup checks: Schema v2, SQLite structural
+`run` performs only the required startup checks: Schema v3, SQLite structural
 integrity, foreign-key basics, and the expected project tables. It does not scan
 all persisted application payloads during startup. Use the read-only doctor for
 the full semantic scan:
@@ -76,7 +80,10 @@ transition. `stdout` remains available for query-command JSON output. With the
 default configuration, macOS desktop notifications remain enabled and
 important conditions are also stored in `system_events`. The
 `notification.terminal_enabled` setting controls the runtime `stderr` handler;
-the notifier itself does not print terminal messages.
+the notifier itself does not print terminal messages. There is no separate
+configured application log file in the default configuration. Check a running
+process in its terminal, and use `status` for the configured database, signal
+count, and system-event count.
 
 ## Long-running recovery and shutdown
 

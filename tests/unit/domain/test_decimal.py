@@ -5,7 +5,7 @@ from decimal import Decimal
 import pytest
 from hypothesis import given, strategies as st
 
-from predmarket.domain.decimal import encode_decimal, parse_decimal
+from predmarket.domain.decimal import decode_decimal, encode_decimal, parse_decimal
 
 
 @pytest.mark.parametrize(
@@ -50,6 +50,51 @@ def test_parse_decimal_rejects_noncanonical_input(value: object) -> None:
 
 def test_encode_decimal_removes_trailing_zeroes_without_rounding() -> None:
     assert encode_decimal(Decimal("1.2300")) == "1.23"
+
+
+def test_decode_decimal_preserves_a_long_fraction_without_float_rounding() -> None:
+    encoded = "0." + ("1234567890" * 49) + "1"
+
+    decoded = decode_decimal(encoded)
+
+    assert isinstance(decoded, Decimal)
+    assert encode_decimal(decoded) == encoded
+
+
+@pytest.mark.parametrize(
+    ("legacy", "canonical"),
+    [
+        ("1E-5", "0.00001"),
+        ("001.2300", "1.23"),
+        ("-0.5000", "-0.5"),
+        (2, "2"),
+        (0.125, "0.125"),
+    ],
+)
+def test_decode_decimal_normalizes_legacy_representations(
+    legacy: object,
+    canonical: str,
+) -> None:
+    assert encode_decimal(decode_decimal(legacy)) == canonical
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        False,
+        "NaN",
+        "Infinity",
+        "not-a-decimal",
+        float("inf"),
+        float("nan"),
+    ],
+)
+def test_decode_decimal_rejects_non_finite_and_unsupported_values(
+    value: object,
+) -> None:
+    with pytest.raises(ValueError):
+        decode_decimal(value)
 
 
 @pytest.mark.parametrize("value", [Decimal("0"), Decimal("0.0"), Decimal("-0.000")])

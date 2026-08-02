@@ -41,7 +41,9 @@ class MarketChange:
                 raise ValueError("event_id is required for EVENT_SETTLED")
             if self.market_id is not None:
                 _identifier(self.market_id, "market_id")
-        else:
+        elif self.event_id is not None:
+            _identifier(self.event_id, "event_id")
+        if self.change_type is not MarketChangeType.EVENT_SETTLED:
             _identifier(self.market_id, "market_id")
         if isinstance(self.token_ids, (str, bytes)):
             raise ValueError("token_ids must be an iterable of identifiers")

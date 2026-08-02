@@ -18,7 +18,7 @@ from predmarket.catalog.relations import (
     semantic_evidence_digest,
     validate_semantic_digest,
 )
-from predmarket.domain.decimal import encode_decimal
+from predmarket.domain.decimal import decode_decimal, encode_decimal
 from predmarket.domain.fees import FeeSchedule
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.domain.relation import DiscoverySource, Relation, RelationStatus
@@ -1008,12 +1008,12 @@ def _market_from_row(row: aiosqlite.Row) -> Market:
         sync_generation=row["sync_generation"],
         sync_generation_complete=bool(row["sync_generation_complete"]),
         tick_size=(
-            None if row["tick_size"] is None else Decimal(row["tick_size"])
+            None if row["tick_size"] is None else decode_decimal(row["tick_size"])
         ),
         minimum_order_size=(
             None
             if row["minimum_order_size"] is None
-            else Decimal(row["minimum_order_size"])
+            else decode_decimal(row["minimum_order_size"])
         ),
         end_at=row["end_at"],
         resolved_at=row["resolved_at"],
@@ -1053,7 +1053,7 @@ def _relation_from_row(row: aiosqlite.Row) -> Relation:
         llm_confidence=(
             None
             if row["llm_confidence"] is None
-            else Decimal(row["llm_confidence"])
+            else decode_decimal(row["llm_confidence"])
         ),
         llm_analysis=(
             None

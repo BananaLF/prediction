@@ -589,6 +589,34 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
     assert encoded == ('["market-1","market-2"]', '{"mapping_version":"v1"}')
     assert decimals == ("0.01", "1")
 
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE markets SET tick_size = '1E-5' WHERE id = 'market-1'"
+        )
+        connection.execute(
+            "UPDATE relations SET llm_confidence = '8.75E-1' "
+            "WHERE id = 'relation-1'"
+        )
+        connection.commit()
+
+    reader_writer = DatabaseWriter(database_path)
+    await reader_writer.start()
+    try:
+        legacy_market = await CatalogRepository(
+            database_path, reader_writer
+        ).get_market("market-1")
+        legacy_relation = await RelationRepository(
+            database_path, reader_writer
+        ).get("relation-1")
+    finally:
+        await reader_writer.close()
+
+    assert legacy_market is not None
+    assert legacy_market.tick_size == Decimal("0.00001")
+    assert legacy_relation is not None
+    assert legacy_relation.llm_confidence == Decimal("0.875")
+
 
 @pytest.mark.parametrize(
     "invalid_digest",

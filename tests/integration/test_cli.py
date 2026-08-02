@@ -247,6 +247,6 @@ def test_doctor_reports_legal_orphans_without_failing(tmp_path: Path) -> None:
         stdout=output,
     ) == 0
     report = json.loads(output.getvalue())
-    assert report["schema_version"] == 2
+    assert report["schema_version"] == 3
     assert report["orphan_markets"] == 1
     assert report["violations"] == []
