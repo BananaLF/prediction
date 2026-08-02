@@ -6,3 +6,4 @@ __pycache__/
 data/*.sqlite3
 data/*.sqlite3-*
 .idea/
+*.egg-info/
