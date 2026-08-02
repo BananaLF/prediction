@@ -1,13 +1,36 @@
-bankroll: "1000"
-minimum_return: "0.0075"
-safety_buffer_rate: "0.0025"
-max_leg_failure_loss: "5"
-max_unhedged_notional: "20"
-default_simulation_quantity: "10"
-conversion_cost: "0"
-maximum_book_age_ms: 1000
-maximum_leg_skew_ms: 250
-maximum_processing_latency_ms: 100
-reconcile_interval_seconds: 30
-queue_capacity: 10000
-database_path: data/predmarket.sqlite3
+database:
+  path: data/predmarket-v1.sqlite3
+  busy_timeout_ms: 5000
+  writer_queue_capacity: 1000
+
+polymarket:
+  sync_interval_seconds: 30
+  request_timeout_seconds: 10
+  reconnect_max_seconds: 60
+  fee_schedule_max_age_seconds: 300
+
+runtime:
+  market_change_queue_capacity: 10000
+
+strategy:
+  bankroll: "1000"
+  minimum_return_rate: "0.0075"
+  maximum_risk_rate: "0.005"
+  maximum_unhedged_notional: "20"
+  safety_buffer_rate: "0.0025"
+  conversion_cost: "0"
+  maximum_book_age_ms: 1000
+  maximum_leg_skew_ms: 250
+
+signal:
+  profit_change_rate: "0.05"
+  risk_rate_change: "0.001"
+  quantity_change_rate: "0.10"
+  minimum_update_interval_seconds: 5
+
+relations:
+  llm_enabled: false
+
+notification:
+  terminal_enabled: true
+  desktop_enabled: true

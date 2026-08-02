@@ -12,7 +12,10 @@
 
 - Source of truth: `docs/superpowers/specs/2026-07-31-greenfield-market-signal-architecture-design.md`.
 - Python must be `>=3.11`; pin `polymarket-client==0.3.0b1`.
-- Runtime is read-only toward Polymarket: public SDK client only; no wallet, authentication, signing, orders, or on-chain mutation.
+- Runtime is read-only toward Polymarket: SDK client only; gateway may inspect
+  the pinned SDK's minimum private connection lifecycle state under strict
+  version/shape tests; no wallet, authentication, signing, orders, direct
+  HTTP/WebSocket, or on-chain mutation.
 - Schema v1 contains exactly 10 project tables; do not migrate or read schema v7.
 - All runtime SQLite writes go through one `DatabaseWriter`; independent relation CLI writes use short transactions, busy timeout, and bounded retries.
 - Use TDD for every behavior: write a focused failing test, run it and capture the expected failure, implement minimally, then run focused and relevant broader tests.
@@ -166,7 +169,8 @@ git commit -m "refactor: establish greenfield project skeleton"
 
 **Interfaces:**
 - Produces: `parse_decimal(text: str) -> Decimal`, `encode_decimal(value: Decimal) -> str`
-- Produces: `FeeSchedule.from_json(data)`, `FeeCalculator.calculate(schedule, price, quantity) -> Decimal`
+- Produces: `FeeSchedule.from_json(data)`,
+  `FeeCalculator.calculate(schedule, price, quantity, *, evaluated_at_ms, max_age_seconds) -> Decimal`
 - Produces: immutable `Event`, `Market`, `Token`, `OrderBook`, `OrderBookLevel`, `Relation`
 - Produces: `OpportunityPresent`, `OpportunityAbsent`, `NotEvaluable`, `StrategyContext`
 
@@ -281,9 +285,13 @@ git commit -m "feat: add schema v1 persistence layer"
 - Produces: `PolymarketGateway.close()`
 - Consumes: Task 2 domain types
 
-- [ ] **Step 1: Inspect installed `polymarket-client==0.3.0b1` public models and record exact adapter fields in fixture tests**
+- [ ] **Step 1: Inspect installed `polymarket-client==0.3.0b1` models and connection lifecycle state, and record exact adapter fields in fixture tests**
 
-Do not bypass the SDK with direct HTTP/WebSocket calls. If the pinned SDK lacks a required public read operation, stop with `BLOCKED` rather than inventing an API.
+Do not bypass the SDK with direct HTTP/WebSocket calls. Public read operations
+remain mandatory. For disconnect/reconnect/drop detection only, gateway may
+inspect the pinned SDK's minimum private state; contract tests must pin the
+exact version, attribute shape, and fail-closed behavior when the shape is
+missing or unknown.
 
 - [ ] **Step 2: Write failing gateway contract tests**
 

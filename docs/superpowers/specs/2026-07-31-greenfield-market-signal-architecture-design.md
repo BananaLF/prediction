@@ -127,6 +127,12 @@ close()
 
 SDK 0.3.0b1 已提供事件/市场分页、订单簿查询和公开 market stream。SDK 仍处于 beta；升级版本必须显式修改依赖锁文件，并通过 gateway contract tests 和 live read-only smoke test。
 
+固定版本的公开订阅句柄不暴露透明重连、断线或丢包生命周期。为满足
+generation fail-closed，`predmarket/polymarket/gateway.py` 可以读取该固定
+版本中最小必要的私有连接状态，但必须集中封装并由版本、属性结构和状态转换
+合同测试锁定。私有结构缺失、改变或产生未知状态时必须立即使 generation
+失效并停止 watch，禁止静默继续；仍禁止绕过 SDK 直接访问 HTTP/WebSocket。
+
 ### 5.3 SyncMarketTask
 
 - 持续同步事件、市场、token 和 event-market 关系。
@@ -952,12 +958,19 @@ CLOSED -> closed_at IS NOT NULL AND close_reason IS NOT NULL
 PROFIT_BELOW_THRESHOLD
 RISK_ABOVE_THRESHOLD
 INSUFFICIENT_DEPTH
+QUANTITY_BELOW_MINIMUM
+INSUFFICIENT_CAPITAL
 MARKET_CLOSED
 EVENT_SETTLED
 ORDERBOOK_INVALID
+ORDERBOOK_STALE
+LEG_SKEW_EXCEEDED
 SDK_DISCONNECTED
 INPUT_METADATA_MISSING
 FEE_SCHEDULE_UNKNOWN
+FEE_SCHEDULE_STALE
+SYNC_GENERATION_INCOMPLETE
+RELATION_NOT_APPROVED
 ```
 
 部分唯一索引：

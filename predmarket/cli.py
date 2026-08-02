@@ -1,177 +1,246 @@
-"""Read-only command line interface."""
+"""Command-line interface for the Greenfield signal service."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
-from decimal import Decimal
+from collections.abc import Callable, Mapping, Sequence
 import json
+from pathlib import Path
+import sqlite3
 import sys
+import time
+from typing import TextIO
 
-from predmarket.commands import dispatch
-
-
-DESCRIPTION = (
-    "read-only prediction-market structural-arbitrage scanner; no orders, "
-    "wallets, or guaranteed profit. Return threshold semantics: 0.75% = 0.0075."
+from predmarket.catalog.relations import (
+    RelationAnalyzer,
+    RelationCliStore,
+    RelationWorkflow,
 )
-
-
-def _positive(value: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be an integer") from exc
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be positive")
-    return parsed
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=DESCRIPTION)
-    parser.add_argument("--config", default="config/default.yaml")
-    parser.add_argument("--json", action="store_true", dest="json_output")
-    commands = parser.add_subparsers(dest="command", required=True)
-
-    sync = commands.add_parser("sync-markets", help="synchronize the public market catalog")
-    sync.add_argument("--limit", type=_positive, default=100)
-    sync.add_argument("--max-pages", type=_positive, default=1000)
-    sync.add_argument("--max-markets", type=_positive, default=100_000)
-    sync.add_argument("--rules-dir", default="rules")
-
-    scan = commands.add_parser("scan-once", help="confirm candidates with REST")
-    scan.add_argument("--limit", type=_positive, default=100)
-    scan.add_argument("--condition")
-    scan.add_argument("--yes-token")
-    scan.add_argument("--no-token")
-    scan.add_argument("--rules-dir", default="rules")
-    scan.add_argument("--relation-id")
-
-    watch = commands.add_parser("watch", help="discover via public WebSocket")
-    watch.add_argument("--max-connections", type=_positive, default=10)
-    watch.add_argument(
-        "--max-events", type=_positive,
-        help="whole-command budget of accepted market events; PONG/invalid frames do not count",
-    )
-    watch.add_argument("--rules-dir", default="rules")
-    watch.add_argument("--relation-id")
-
-    relations = commands.add_parser("relations", help="manage audited rule files")
-    relations.add_argument("--rules-dir", default="rules")
-    relation_commands = relations.add_subparsers(
-        dest="relation_command", required=True
-    )
-    relation_commands.add_parser("list")
-    validate = relation_commands.add_parser("validate")
-    validate.add_argument("path")
-    import_command = relation_commands.add_parser("import")
-    import_command.add_argument("path")
-
-    replay = commands.add_parser("replay", help="replay immutable evidence")
-    replay.add_argument("opportunity_id", nargs="?")
-    replay.add_argument("--bundle-id")
-    validate_opportunity = commands.add_parser(
-        "validate-opportunity", help="validate one opportunity in SQLite"
-    )
-    validate_opportunity.add_argument("opportunity_id", nargs="?")
-    report = commands.add_parser("report", help="bounded evidence summary")
-    report.add_argument("--limit", type=_positive, default=100)
-    return parser
-
-
-def _json_default(value: object) -> object:
-    if isinstance(value, Decimal):
-        return format(value, "f")
-    if hasattr(value, "value"):
-        return value.value
-    if isinstance(value, tuple):
-        return list(value)
-    raise TypeError(f"not JSON serializable: {type(value).__name__}")
+from predmarket.config import AppConfig
+from predmarket.domain.decimal import encode_decimal
+from predmarket.domain.relation import Relation
 
 
 def main(
     argv: Sequence[str] | None = None,
     *,
-    dispatcher: Callable[[argparse.Namespace], Awaitable[object]] = dispatch,
+    stdout: TextIO | None = None,
+    analyzer: RelationAnalyzer | None = None,
+    now_ms: Callable[[], int] | None = None,
 ) -> int:
-    parser = build_parser()
-    try:
-        args = parser.parse_args(argv)
-    except SystemExit as exc:
-        return int(exc.code)
-    validation_command = args.command == "validate-opportunity"
-    if validation_command and not args.opportunity_id:
-        result = {
-            "opportunity_id": None,
-            "status": "fail",
-            "checks": {"completeness": {"status": "fail", "missing": []}},
-            "evidence": {},
-            "errors": [{
-                "code": "INVALID_INPUT",
-                "message": "opportunity_id is required",
-                "context": {"reason": "missing opportunity_id"},
-            }],
-            "selection": {
-                "strategy": "latest_run_for_opportunity",
-                "reason": "input validation failed",
-            },
-        }
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=_json_default))
+    parser = _build_parser()
+    arguments = parser.parse_args(_normalize_config_position(argv))
+    config = AppConfig.load(arguments.config)
+    output = sys.stdout if stdout is None else stdout
+    clock = now_ms or (lambda: time.time_ns() // 1_000_000)
+
+    if arguments.command == "run":
+        from predmarket.app import Supervisor
+
+        return asyncio.run(Supervisor(config, terminal=output).run())
+
+    if arguments.command == "status":
+        _write_json(output, _ReadOnlyCliStore(config.database.path).status())
         return 0
+
+    if arguments.command == "signals":
+        store = _ReadOnlyCliStore(config.database.path)
+        if arguments.signals_command == "list":
+            _write_json(output, store.list_signals())
+            return 0
+        if arguments.signals_command == "show":
+            signal = store.get_signal(arguments.signal_id)
+            if signal is None:
+                raise ValueError(f"signal {arguments.signal_id!r} does not exist")
+            _write_json(output, signal)
+            return 0
+        parser.error("a signals command is required")
+
+    if arguments.command != "relations":
+        parser.error("a command is required")
+
+    store = RelationCliStore(
+        config.database.path,
+        busy_timeout_ms=config.database.busy_timeout_ms,
+    )
+
+    if arguments.relations_command == "list":
+        _write_json(output, [_relation_payload(relation) for relation in store.list()])
+        return 0
+    if arguments.relations_command == "show":
+        relation = asyncio.run(store.get(arguments.relation_id))
+        if relation is None:
+            raise ValueError(f"relation {arguments.relation_id!r} does not exist")
+        _write_json(output, _relation_payload(relation))
+        return 0
+    if arguments.relations_command == "analyze":
+        if not config.relations.llm_enabled:
+            raise ValueError("relation LLM analysis is disabled")
+        if analyzer is None:
+            raise ValueError("relation analyzer is not configured")
+        workflow = RelationWorkflow(store, analyzer, llm_enabled=True)
+        relation = asyncio.run(
+            workflow.analyze(arguments.relation_id, updated_at=clock())
+        )
+        _write_json(output, _relation_payload(relation))
+        return 0
+    if arguments.relations_command == "approve":
+        relation = store.approve_manual(
+            arguments.relation_id,
+            occurred_at=clock(),
+        )
+        _write_json(output, _relation_payload(relation))
+        return 0
+    parser.error("a relations command is required")
+
+
+def _normalize_config_position(argv: Sequence[str] | None) -> list[str]:
+    """Accept the documented ``COMMAND --config PATH`` form as well as global options."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
     try:
-        result = asyncio.run(dispatcher(args))
-    except KeyError:
-        if validation_command:
-            result = {
-                "opportunity_id": args.opportunity_id,
-                "status": "fail",
-                "checks": {"completeness": {"status": "fail", "missing": ["opportunity"]}},
-                "evidence": {},
-                "errors": [{
-                    "code": "NOT_FOUND",
-                    "message": "opportunity was not found",
-                    "context": {"opportunity_id": args.opportunity_id},
-                }],
-                "selection": {
-                    "strategy": "latest_run_for_opportunity",
-                    "reason": "no opportunity row found",
-                },
-            }
-        else:
-            print("operational error: KeyError", file=sys.stderr)
-            return 1
-    except (FileNotFoundError, ValueError, TypeError) as exc:
-        if validation_command:
-            result = {
-                "opportunity_id": args.opportunity_id,
-                "status": "fail",
-                "checks": {"completeness": {"status": "fail", "missing": []}},
-                "evidence": {},
-                "errors": [{
-                    "code": "INVALID_INPUT",
-                    "message": "opportunity validation input is invalid",
-                    "context": {"reason": str(exc)},
-                }],
-                "selection": {
-                    "strategy": "latest_run_for_opportunity",
-                    "reason": "input validation failed",
-                },
-            }
-        else:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-    except KeyboardInterrupt:
-        return 1
-    except Exception as exc:
-        print(f"operational error: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
-    if args.json_output or validation_command:
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=_json_default))
-    elif result is not None:
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=_json_default, indent=2))
-    return 0
+        config_index = arguments.index("--config")
+    except ValueError:
+        return arguments
+    if config_index + 1 >= len(arguments):
+        return arguments
+    config = arguments[config_index : config_index + 2]
+    return config + arguments[:config_index] + arguments[config_index + 2 :]
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Polymarket signal service")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/default.yaml"),
+        help="configuration YAML path",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("run", help="run the read-only market signal service")
+    commands.add_parser("status", help="show local service database status")
+    signals = commands.add_parser("signals", help="inspect persisted signals")
+    signal_commands = signals.add_subparsers(dest="signals_command", required=True)
+    signal_commands.add_parser("list", help="list persisted signals")
+    signal_show = signal_commands.add_parser("show", help="show one signal")
+    signal_show.add_argument("signal_id")
+    relations = commands.add_parser(
+        "relations",
+        help="inspect, analyze, and manually approve implication relations",
+    )
+    relation_commands = relations.add_subparsers(
+        dest="relations_command",
+        required=True,
+    )
+    relation_commands.add_parser("list", help="list all relations")
+    show = relation_commands.add_parser("show", help="show one relation")
+    show.add_argument("relation_id")
+    analyze = relation_commands.add_parser(
+        "analyze",
+        help="run the configured analyzer for one relation",
+    )
+    analyze.add_argument("relation_id")
+    approve = relation_commands.add_parser(
+        "approve",
+        help="manually approve an LLM-recommended relation",
+    )
+    approve.add_argument("relation_id")
+    return parser
+
+
+def _relation_payload(relation: Relation) -> dict[str, object]:
+    return {
+        "id": relation.id,
+        "market_a_id": relation.market_a_id,
+        "market_b_id": relation.market_b_id,
+        "status": relation.status.value,
+        "discovery_source": relation.discovery_source.value,
+        "llm_confidence": (
+            None
+            if relation.llm_confidence is None
+            else encode_decimal(relation.llm_confidence)
+        ),
+        "llm_analysis": (
+            None
+            if relation.llm_analysis is None
+            else _thaw_json(relation.llm_analysis)
+        ),
+        "created_at": relation.created_at,
+        "updated_at": relation.updated_at,
+    }
+
+
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
+def _write_json(output: TextIO, payload: object) -> None:
+    print(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        file=output,
+    )
+
+
+class _ReadOnlyCliStore:
+    """The CLI's dedicated read-only SQLite boundary."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = Path(path)
+
+    def status(self) -> dict[str, object]:
+        with self._connect() as connection:
+            signals = int(
+                connection.execute("SELECT COUNT(*) FROM arbitrage_signals").fetchone()[0]
+            )
+            events = int(
+                connection.execute("SELECT COUNT(*) FROM system_events").fetchone()[0]
+            )
+        return {"database": str(self._path), "signals": signals, "system_events": events}
+
+    def list_signals(self) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM arbitrage_signals ORDER BY opened_at DESC, CAST(id AS BLOB)"
+            ).fetchall()
+        return [_signal_payload(row) for row in rows]
+
+    def get_signal(self, signal_id: str) -> dict[str, object] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM arbitrage_signals WHERE id = ?", (signal_id,)
+            ).fetchone()
+        return None if row is None else _signal_payload(row)
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            f"file:{self._path}?mode=ro", uri=True, isolation_level=None
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        return connection
+
+
+def _signal_payload(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": str(row["id"]),
+        "opportunity_key": str(row["opportunity_key"]),
+        "strategy_type": str(row["strategy_type"]),
+        "market_ids": list(json.loads(str(row["market_ids_json"]))),
+        "relation_id": row["relation_id"],
+        "execution_mode": str(row["execution_mode"]),
+        "status": str(row["status"]),
+        "opened_at": int(row["opened_at"]),
+        "updated_at": int(row["updated_at"]),
+        "closed_at": row["closed_at"],
+        "close_reason": row["close_reason"],
+        "latest_revision": int(row["latest_revision"]),
+    }
