@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import replace
 from decimal import Decimal
 from io import StringIO
-import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -146,7 +146,7 @@ class _FailingNotifier:
 
 @pytest.mark.asyncio
 async def test_supervisor_syncs_before_watch_and_terminates_after_watch_crash(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     calls: list[str] = []
     events = _Events()
@@ -161,10 +161,18 @@ async def test_supervisor_syncs_before_watch_and_terminates_after_watch_crash(
         sleep=_wait_for_cancellation,
     )
 
-    assert await supervisor.run() == 1
+    with caplog.at_level(logging.INFO, logger="predmarket.app"):
+        assert await supervisor.run() == 1
 
     assert calls == ["sync", "watch-start", "watch-run", "watch-close"]
-    assert "RUNTIME_TASK_EXITED" in output.getvalue()
+    assert output.getvalue() == ""
+    assert "runtime_starting" in caplog.text
+    assert "component_initialized component=database" in caplog.text
+    assert "component_initialized component=watch_task" in caplog.text
+    assert "runtime_started" in caplog.text
+    assert "runtime_task_exited" in caplog.text
+    assert "watch crashed" in caplog.text
+    assert "runtime_stopped" in caplog.text
     assert events.entries == []
 
 
@@ -185,18 +193,7 @@ async def test_supervisor_notifies_when_initial_generation_skips_malformed_marke
 
     assert await supervisor.run() == 1
 
-    rendered = output.getvalue()
-    assert "SYNC_MARKET_SKIPPED: Malformed markets were skipped from the sync catalog" in rendered
-    details = json.loads(rendered.splitlines()[1].split(" details: ", 1)[1])
-    assert details == {
-        "markets": [
-            {
-                "market_id": "market-2278824",
-                "error": "events must contain exactly one event reference",
-            }
-        ],
-        "sync_generation": "sync-initial-skipped",
-    }
+    assert output.getvalue() == ""
 
 
 @pytest.mark.asyncio
@@ -226,7 +223,7 @@ async def test_supervisor_treats_cancellation_as_normal_shutdown(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_supervisor_notifies_startup_failure_with_constructed_default_notifier(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     output = StringIO()
     supervisor = Supervisor(
@@ -239,7 +236,9 @@ async def test_supervisor_notifies_startup_failure_with_constructed_default_noti
 
     assert await supervisor.run() == 1
 
-    assert "RUNTIME_STARTUP_FAILED: Signal service startup failed: initial sync failed" in output.getvalue()
+    assert output.getvalue() == ""
+    assert "runtime_startup_failed" in caplog.text
+    assert "initial sync failed" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -278,11 +277,7 @@ async def test_periodic_sync_notifies_when_generation_is_incomplete(
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    rendered = output.getvalue()
-    assert "SYNC_GENERATION_INCOMPLETE" in rendered
-    details = json.loads(rendered.splitlines()[1].split(" details: ", 1)[1])
-    assert details["error"] == 'market request failed; api_response={"id":"200"}'
-    assert details["sync_generation"] == "sync-periodic"
+    assert output.getvalue() == ""
 
 
 @pytest.mark.asyncio
@@ -306,24 +301,16 @@ async def test_periodic_sync_notifies_when_generation_skips_malformed_markets(
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    rendered = output.getvalue()
-    assert "SYNC_MARKET_SKIPPED: Malformed markets were skipped from the sync catalog" in rendered
-    details = json.loads(rendered.splitlines()[1].split(" details: ", 1)[1])
-    assert details == {
-        "markets": [
-            {
-                "market_id": "market-2278824",
-                "error": "events must contain exactly one event reference",
-            }
-        ],
-        "sync_generation": "sync-periodic-skipped",
-    }
+    assert output.getvalue() == ""
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage", ("initialize", "integrity", "writer"))
+@pytest.mark.parametrize("stage", ("initialize", "startup", "writer"))
 async def test_supervisor_reports_pre_notifier_database_failures_to_terminal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     output = StringIO()
 
@@ -332,11 +319,11 @@ async def test_supervisor_reports_pre_notifier_database_failures_to_terminal(
             raise RuntimeError("database initialize failed")
 
         monkeypatch.setattr("predmarket.app.initialize_database", fail_initialize)
-    elif stage == "integrity":
-        def fail_integrity(_: Path) -> None:
-            raise RuntimeError("database integrity failed")
+    elif stage == "startup":
+        def fail_startup(_: Path) -> None:
+            raise RuntimeError("database startup failed")
 
-        monkeypatch.setattr("predmarket.app.check_database_integrity", fail_integrity)
+        monkeypatch.setattr("predmarket.app.check_database_startup", fail_startup)
     else:
         async def fail_writer_start(_: DatabaseWriter) -> None:
             raise RuntimeError("database writer failed")
@@ -351,7 +338,9 @@ async def test_supervisor_reports_pre_notifier_database_failures_to_terminal(
     )
 
     assert await supervisor.run() == 1
-    assert f"RUNTIME_STARTUP_FAILED: Signal service startup failed: database {stage} failed" in output.getvalue()
+    assert output.getvalue() == ""
+    assert "runtime_startup_failed" in caplog.text
+    assert f"database {stage} failed" in caplog.text
 
 
 @pytest.mark.asyncio

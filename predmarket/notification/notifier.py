@@ -1,36 +1,27 @@
-"""Best-effort desktop notifications with an always-on terminal channel."""
+"""Best-effort desktop notifications with logging-based observability."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
 import inspect
-import json
+import logging
 from pathlib import Path
 import subprocess
-import sys
 import time
 from typing import Any, TextIO
 
 from predmarket.signals.manager import SignalNotification
 
 
-_OPERATIONAL_ERROR_EVENTS = frozenset(
-    {
-        "SYNC_GENERATION_INCOMPLETE",
-        "SYNC_MARKET_SKIPPED",
-        "RUNTIME_STARTUP_FAILED",
-        "RUNTIME_TASK_EXITED",
-    }
-)
+_LOGGER = logging.getLogger(__name__)
 
 
 class Notifier:
     """Deliver operational and signal notifications without blocking the service.
 
-    Terminal output is intentionally emitted before the optional desktop channel.
-    A desktop failure is audited through the application's existing system-event
-    repository and must never fail signal persistence or supervision.
+    A desktop failure is logged and audited through the application's existing
+    system-event repository, and must never fail signal persistence or supervision.
     """
 
     def __init__(
@@ -45,7 +36,6 @@ class Notifier:
             raise TypeError("terminal must be a text output stream or None")
         if desktop is not None and not callable(desktop):
             raise TypeError("desktop must be callable or None")
-        self._terminal = sys.stdout if terminal is None else terminal
         self._desktop = desktop
         self._system_events = system_events
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
@@ -58,7 +48,7 @@ class Notifier:
         message: str | None = None,
         details: Mapping[str, object] | None = None,
     ) -> None:
-        """Print a notification, then attempt desktop delivery if configured."""
+        """Attempt desktop delivery if configured."""
         if notification is not None:
             if not isinstance(notification, SignalNotification):
                 raise TypeError("notification must be a SignalNotification")
@@ -76,20 +66,6 @@ class Notifier:
         if details is not None and not isinstance(details, Mapping):
             raise TypeError("details must be a mapping or None")
 
-        print(f"{event_type}: {message}", file=self._terminal, flush=True)
-        if details is not None and event_type in _OPERATIONAL_ERROR_EVENTS:
-            rendered_details = json.dumps(
-                details,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            )
-            print(
-                f"{event_type} details: {rendered_details}",
-                file=self._terminal,
-                flush=True,
-            )
         if self._desktop is None:
             return
         try:
@@ -104,6 +80,11 @@ class Notifier:
         notification_event_type: str,
         error: Exception,
     ) -> None:
+        _LOGGER.error(
+            "desktop_notification_failed event_type=%s error=%s",
+            notification_event_type,
+            error,
+        )
         if self._system_events is None:
             return
         try:
@@ -124,8 +105,8 @@ class Notifier:
             if inspect.isawaitable(result):
                 await result
         except Exception:
-            # Notification reporting must not compromise the primary terminal
-            # channel or a previously committed signal lifecycle transition.
+            # Notification reporting must not compromise a previously committed
+            # signal lifecycle transition.
             return
 
 

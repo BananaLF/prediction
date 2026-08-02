@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from io import StringIO
-import json
+import logging
 
 import pytest
 
@@ -19,7 +19,9 @@ class _SystemEvents:
 
 
 @pytest.mark.asyncio
-async def test_terminal_notification_survives_desktop_failure() -> None:
+async def test_notification_logs_desktop_failure_without_terminal_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     output = StringIO()
     events = _SystemEvents()
 
@@ -33,13 +35,20 @@ async def test_terminal_notification_survives_desktop_failure() -> None:
         clock_ms=lambda: 42,
     )
 
-    await notifier.notify(
-        event_type="SIGNAL_OPENED",
-        message="signal-1 opened",
-        details={"signal_id": "signal-1"},
-    )
+    with caplog.at_level(logging.ERROR, logger="predmarket.notification.notifier"):
+        await notifier.notify(
+            event_type="SIGNAL_OPENED",
+            message="signal-1 opened",
+            details={"signal_id": "signal-1"},
+        )
 
-    assert "SIGNAL_OPENED: signal-1 opened" in output.getvalue()
+    assert output.getvalue() == ""
+    assert any(
+        "desktop_notification_failed" in record.getMessage()
+        and "SIGNAL_OPENED" in record.getMessage()
+        and "desktop unavailable" in record.getMessage()
+        for record in caplog.records
+    )
     assert events.entries == [
         {
             "component": "NOTIFIER",
@@ -56,7 +65,7 @@ async def test_terminal_notification_survives_desktop_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_operational_error_notification_prints_json_details() -> None:
+async def test_operational_error_notification_does_not_print_details() -> None:
     output = StringIO()
     notifier = Notifier(terminal=output)
 
@@ -66,13 +75,7 @@ async def test_operational_error_notification_prints_json_details() -> None:
         details={"error": 'market request failed; api_response={"id":"200"}'},
     )
 
-    rendered = output.getvalue()
-    assert "SYNC_GENERATION_INCOMPLETE: Market sync generation was incomplete" in rendered
-    details_line = rendered.splitlines()[1]
-    details = json.loads(details_line.split(" details: ", 1)[1])
-    assert details == {
-        "error": 'market request failed; api_response={"id":"200"}',
-    }
+    assert output.getvalue() == ""
 
 
 def test_macos_desktop_notification_escapes_double_quoted_applescript_literals(

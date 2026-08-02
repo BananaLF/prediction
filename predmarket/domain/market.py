@@ -78,7 +78,7 @@ class Event:
 @dataclass(frozen=True)
 class Market:
     id: str
-    event_id: str
+    event_id: str | None
     condition_id: str
     question: str
     status: MarketStatus
@@ -102,7 +102,8 @@ class Market:
 
     def __post_init__(self) -> None:
         _identifier(self.id, "market id")
-        _identifier(self.event_id, "event id")
+        if self.event_id is not None:
+            _identifier(self.event_id, "event id")
         _identifier(self.condition_id, "condition id")
         _nonempty(self.question, "market question")
         _enum(self.status, MarketStatus, "market status")
