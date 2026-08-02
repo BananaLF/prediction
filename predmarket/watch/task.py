@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import inspect
+import logging
 from typing import Any, Protocol
 
 from predmarket.catalog.changes import MarketChange, MarketChangeType
@@ -33,6 +34,7 @@ from predmarket.watch.cache import (
 
 
 _NO_CHANGE = object()
+_LOGGER = logging.getLogger(__name__)
 
 
 class WatchCleanupError(RuntimeError):
@@ -161,6 +163,7 @@ class WatchTask:
         self._cache = cache or OrderBookCache()
         self._subscription: Any | None = None
         self._active_token_ids: tuple[str, ...] = ()
+        self._active_market_ids: tuple[str, ...] = ()
         self._started = False
         self._closed = False
         self._operation_lock = asyncio.Lock()
@@ -184,8 +187,9 @@ class WatchTask:
             if self._started:
                 return
             snapshot = await self._catalog.load_catalog()
-            token_ids = _watchable_token_ids(snapshot)
+            token_ids, market_ids = _watchable_subscription(snapshot)
             self._active_token_ids = token_ids
+            self._active_market_ids = market_ids
             recover_open_signals = getattr(
                 self._signal_manager, "close_unwatchable_for_active_tokens", None
             )
@@ -195,6 +199,8 @@ class WatchTask:
                     await result
             if token_ids:
                 await self._recover(token_ids)
+            else:
+                self._log_subscription_success()
             self._started = True
 
     async def run(self) -> None:
@@ -265,7 +271,7 @@ class WatchTask:
                 return
             self._prepare_current_subscription_close_retry()
             snapshot = await self._catalog.load_catalog()
-            new_token_ids = _watchable_token_ids(snapshot)
+            new_token_ids, new_market_ids = _watchable_subscription(snapshot)
             if (
                 new_token_ids == self._active_token_ids
                 and change.change_type is MarketChangeType.MARKET_UPDATED
@@ -291,6 +297,7 @@ class WatchTask:
             )
             await self._rotate_to(
                 new_token_ids,
+                new_market_ids=new_market_ids,
                 explicitly_closed=explicitly_closed,
                 close_reason=reason,
             )
@@ -331,6 +338,11 @@ class WatchTask:
                 )
                 await self._rotate_to(
                     retained,
+                    new_market_ids=tuple(
+                        market_id
+                        for market_id in self._active_market_ids
+                        if market_id != message.market_id
+                    ),
                     explicitly_closed=token_ids,
                     close_reason=DecisionReason.EVENT_SETTLED,
                 )
@@ -448,6 +460,7 @@ class WatchTask:
         self,
         new_token_ids: tuple[str, ...],
         *,
+        new_market_ids: tuple[str, ...],
         explicitly_closed: tuple[str, ...],
         close_reason: DecisionReason,
     ) -> None:
@@ -475,8 +488,11 @@ class WatchTask:
                 detail="subscription_rotated",
             )
         self._active_token_ids = new_token_ids
+        self._active_market_ids = new_market_ids
         if new_token_ids:
             await self._recover(new_token_ids)
+        else:
+            self._log_subscription_success()
 
     async def _invalidate_close_recover(
         self,
@@ -555,6 +571,15 @@ class WatchTask:
             await self._close_current_subscription()
             return
         await self._evaluate_tokens(token_ids)
+        self._log_subscription_success()
+
+    def _log_subscription_success(self) -> None:
+        _LOGGER.info(
+            "watch_subscribed markets=%d tokens=%d generation=%d",
+            len(self._active_market_ids),
+            len(self._active_token_ids),
+            self._cache.generation,
+        )
 
     async def _close_current_subscription(self) -> None:
         subscription = self._subscription
@@ -642,7 +667,9 @@ class WatchTask:
                 )
 
 
-def _watchable_token_ids(snapshot: CatalogSnapshot) -> tuple[str, ...]:
+def _watchable_subscription(
+    snapshot: CatalogSnapshot,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     if not isinstance(snapshot, CatalogSnapshot):
         raise TypeError("catalog must return CatalogSnapshot")
     watchable_market_ids = {
@@ -656,12 +683,24 @@ def _watchable_token_ids(snapshot: CatalogSnapshot) -> tuple[str, ...]:
             and market.resolved_at is None
         )
     }
-    return tuple(
+    token_ids = tuple(
         sorted(
             (token.id for token in snapshot.tokens if token.market_id in watchable_market_ids),
             key=_utf8,
         )
     )
+    market_ids = tuple(sorted({
+        token.market_id
+        for token in snapshot.tokens
+        if token.id in frozenset(token_ids)
+    }, key=_utf8))
+    return token_ids, market_ids
+
+
+def _watchable_token_ids(snapshot: CatalogSnapshot) -> tuple[str, ...]:
+    """Return watchable token ids for compatibility with existing callers."""
+
+    return _watchable_subscription(snapshot)[0]
 
 
 def _payload_token_ids(payload: Mapping[str, Any]) -> tuple[str, ...]:

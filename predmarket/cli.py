@@ -6,6 +6,7 @@ import argparse
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
 import json
+import logging
 from pathlib import Path
 import sqlite3
 import sys
@@ -20,8 +21,16 @@ from predmarket.catalog.relations import (
 from predmarket.config import AppConfig
 from predmarket.domain.decimal import encode_decimal
 from predmarket.domain.relation import Relation
-from predmarket.persistence.integrity import database_diagnostics
+from predmarket.persistence.integrity import (
+    database_diagnostics,
+    run_database_doctor,
+)
 from predmarket.persistence.migration import migrate_database
+
+
+_LOG_LEVEL_NAMES = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+_APPLICATION_LOGGER_NAME = "predmarket"
+_RUNTIME_HANDLER_MARKER = "_predmarket_runtime_handler"
 
 
 def main(
@@ -52,7 +61,7 @@ def main(
         )
         return 0
 
-    if arguments.command == "doctor":
+    if arguments.command == "doctor" and arguments.database is not None:
         diagnostics = database_diagnostics(arguments.database)
         _write_json(output, diagnostics)
         return 0 if not diagnostics["violations"] else 1
@@ -60,9 +69,18 @@ def main(
     config = AppConfig.load(arguments.config)
 
     if arguments.command == "run":
+        _configure_logging(
+            arguments.log_level,
+            terminal_enabled=config.notification.terminal_enabled,
+        )
         from predmarket.app import Supervisor
 
         return asyncio.run(Supervisor(config, terminal=output).run())
+
+    if arguments.command == "doctor":
+        report = run_database_doctor(config.database.path)
+        _write_json(output, report.to_payload())
+        return report.exit_code
 
     if arguments.command == "status":
         _write_json(output, _ReadOnlyCliStore(config.database.path).status())
@@ -132,6 +150,29 @@ def _normalize_config_position(argv: Sequence[str] | None) -> list[str]:
     return config + arguments[:config_index] + arguments[config_index + 2 :]
 
 
+def _configure_logging(level_name: str, *, terminal_enabled: bool) -> None:
+    level = getattr(logging, level_name)
+    if not isinstance(level, int):
+        raise ValueError(f"unknown logging level: {level_name}")
+
+    application_logger = logging.getLogger(_APPLICATION_LOGGER_NAME)
+    application_logger.setLevel(level)
+    application_logger.propagate = False
+
+    for handler in list(application_logger.handlers):
+        if getattr(handler, _RUNTIME_HANDLER_MARKER, False):
+            application_logger.removeHandler(handler)
+            handler.close()
+
+    if terminal_enabled:
+        handler = logging.StreamHandler(sys.stderr)
+        setattr(handler, _RUNTIME_HANDLER_MARKER, True)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+        )
+        application_logger.addHandler(handler)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket signal service")
     parser.add_argument(
@@ -141,7 +182,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="configuration YAML path",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("run", help="run the read-only market signal service")
+    run = commands.add_parser("run", help="run the read-only market signal service")
+    run.add_argument(
+        "--log-level",
+        type=str.upper,
+        choices=_LOG_LEVEL_NAMES,
+        default="INFO",
+        help="runtime logging level",
+    )
     commands.add_parser("status", help="show local service database status")
     migrate = commands.add_parser(
         "migrate",
@@ -150,8 +198,15 @@ def _build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--to", dest="target_version", type=int, required=True)
     migrate.add_argument("--database", type=Path, required=True)
     migrate.add_argument("--backup", type=Path, required=True)
-    doctor = commands.add_parser("doctor", help="check local database integrity")
-    doctor.add_argument("--database", type=Path, required=True)
+    doctor = commands.add_parser(
+        "doctor",
+        help="check database structure and persisted data without modifying it",
+    )
+    doctor.add_argument(
+        "--database",
+        type=Path,
+        help="database path override; otherwise use the configured database",
+    )
     signals = commands.add_parser("signals", help="inspect persisted signals")
     signal_commands = signals.add_subparsers(dest="signals_command", required=True)
     signal_commands.add_parser("list", help="list persisted signals")

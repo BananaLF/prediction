@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from decimal import Decimal
+import logging
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -162,6 +163,24 @@ class _FailingCatalog:
         raise RuntimeError("forced catalog rollback")
 
 
+class _RecordingCatalog:
+    def __init__(self, delegate: CatalogRepository) -> None:
+        self._delegate = delegate
+        self.saves: list[dict[str, tuple[object, ...]]] = []
+
+    async def load_catalog(self) -> object:
+        return await self._delegate.load_catalog()
+
+    async def save_catalog(self, **values: object) -> None:
+        self.saves.append(
+            {
+                name: tuple(value)  # type: ignore[arg-type]
+                for name, value in values.items()
+            }
+        )
+        await self._delegate.save_catalog(**values)
+
+
 class _MarkerFailingSystemEvents:
     def __init__(self, delegate: SystemEventRepository) -> None:
         self._delegate = delegate
@@ -310,6 +329,7 @@ async def _seed(
 
 async def test_complete_generation_drains_gateway_and_commits_before_publish(
     catalog_runtime,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     catalog, system_events = catalog_runtime
     gateway = _FakeGateway(
@@ -326,11 +346,20 @@ async def test_complete_generation_drains_gateway_and_commits_before_publish(
         generation_factory=lambda: "sync-1",
     )
 
-    result = await task.run_once()
+    with caplog.at_level(logging.INFO, logger="predmarket.catalog.sync"):
+        result = await task.run_once()
 
     assert result.complete is True
     assert result.sync_generation == "sync-1"
     assert (result.events_seen, result.markets_seen, result.tokens_seen) == (1, 2, 4)
+    assert result.markets_persisted == 2
+    assert any(
+        "sync_completed" in record.getMessage()
+        and "sync_generation=sync-1" in record.getMessage()
+        and "markets_seen=2" in record.getMessage()
+        and "markets_persisted=2" in record.getMessage()
+        for record in caplog.records
+    )
     assert gateway.event_calls == gateway.market_calls == 1
     assert [change.change_type for change in queue.items] == [
         MarketChangeType.MARKET_ADDED,
@@ -838,23 +867,37 @@ async def test_incomplete_generation_preserves_existing_active_state_and_emits_n
     events: object,
     markets: object,
     expected_error: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     catalog, system_events = catalog_runtime
     await _seed(catalog, ("market-1", "market-2"))
+    recording_catalog = _RecordingCatalog(catalog)
     queue = _RecordingQueue()
     task = SyncMarketTask(
         gateway=_FakeGateway(events=events, markets=markets),
-        catalog=catalog,
+        catalog=recording_catalog,
         changes=queue,
         system_events=system_events,
         clock_ms=lambda: 300,
         generation_factory=lambda: "sync-incomplete",
     )
 
-    result = await task.run_once()
+    with caplog.at_level(logging.ERROR, logger="predmarket.catalog.sync"):
+        result = await task.run_once()
 
     assert result.complete is False
     assert expected_error in result.error
+    expected_persisted = (
+        len(recording_catalog.saves[-1]["markets"])
+        if recording_catalog.saves
+        else 0
+    )
+    assert result.markets_persisted == expected_persisted
+    assert any(
+        "sync_incomplete" in record.getMessage()
+        and f"markets_persisted={expected_persisted}" in record.getMessage()
+        for record in caplog.records
+    )
     for market_id in ("market-1", "market-2"):
         market = await catalog.get_market(market_id)
         assert market is not None

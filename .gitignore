@@ -7,3 +7,5 @@ data/*.sqlite3
 data/*.sqlite3-*
 .idea/
 *.egg-info/
+.superpowers/
+.hypothesis

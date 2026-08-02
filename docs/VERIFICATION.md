@@ -1,12 +1,23 @@
 # Verification
 
-Run these commands from the repository root with Python 3.11 or newer:
+Run this command from the repository root to create/reuse a Python 3.11+ virtual
+environment, install the editable project with test dependencies, and run the
+complete offline verification:
 
 ```console
-python -m pip install -e ".[test]"
-pytest -q
-python -m predmarket --help
-predmarket --help
+./scripts/build_env.sh
+```
+
+The script prefers `uv` and falls back to a local Python 3.11+ interpreter with
+venv `pip`. To keep the environment activated in the current shell, use
+`source scripts/build_env.sh`. Direct execution cannot activate its parent
+shell. For troubleshooting, the equivalent checks inside an already prepared
+environment are:
+
+```console
+.venv/bin/python -m pytest -q
+.venv/bin/python -m predmarket --help
+.venv/bin/predmarket --help
 python -m compileall -q predmarket
 git diff --check
 ```
@@ -22,12 +33,20 @@ python -m predmarket --help
 predmarket --help
 python -m predmarket status --config config/default.yaml
 python -m predmarket run --config config/default.yaml
+python -m predmarket doctor --config config/default.yaml
 python -m predmarket signals list --config config/default.yaml
 python -m predmarket relations list --config config/default.yaml
 ```
 
 The four module-form service examples above are parser-only examples for the
 documentation test; they are not runtime smoke commands.
+
+For an initialized temporary database, `doctor` is the full read-only semantic
+check. Its JSON output has stable categories and finding codes. Exit status `0`
+means healthy, `1` means findings were reported, and `2` means the database
+could not be checked. A normal `run` startup failure is handled separately: it
+stops before the writer and runtime tasks start, and should be investigated as
+a structural/schema problem. `doctor` does not initialize or repair a database.
 
 The `predmarket` console entry point is available only after the editable
 install.  In the current `tests/integration/test_documented_commands.py`,
