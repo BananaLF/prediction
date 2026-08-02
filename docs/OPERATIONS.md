@@ -9,11 +9,12 @@ predmarket signals list --config config/default.yaml
 ```
 
 The default configuration is `config/default.yaml`; it stores local evidence in
-`data/predmarket-v1.sqlite3`. `run` is the long-running read-only observer: it
-initializes Schema v1, synchronizes public Polymarket data, watches order books,
-evaluates strategies, and sends notifications. `status` and `signals list` are
-local SQLite reads, so use them after `run` has initialized the database. They do
-not make Polymarket requests.
+`data/predmarket-v1.sqlite3`. `run` is the long-running observer: it reads only
+public Polymarket data, writes local evidence, relations, signals, and
+operational state, initializes Schema v1, watches order books, evaluates
+strategies, and sends notifications. `status` and `signals list` are local
+SQLite reads, so use them after `run` has initialized the database. They do not
+make Polymarket requests.
 
 Terminal output is the primary operational channel. With the default
 configuration, terminal and macOS desktop notifications are enabled; important

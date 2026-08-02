@@ -2,10 +2,10 @@
 
 ## Architecture and boundaries
 
-`predmarket` is a local, read-only Polymarket signal service. It observes public
-market and order-book data, preserves local evidence, and reports verifiable
-opportunities. It does not authenticate, hold a wallet, sign, send, cancel, or
-execute orders.
+`predmarket` is a local signal service that reads only public Polymarket market
+and order-book data. It writes evidence, relations, signals, and operational
+state to local SQLite, then reports verifiable opportunities. It does not
+authenticate, hold a wallet, sign, send, cancel, or execute orders.
 
 The runtime is assembled in `predmarket/app.py`:
 

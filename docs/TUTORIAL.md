@@ -4,10 +4,10 @@ Run every command below from the repository root.
 
 ## 1. Install and inspect the CLI
 
-Use Python `>=3.11`. The project pins the read-only Polymarket SDK to
-`polymarket-client==0.3.0b1`; `pip install -e .` installs that dependency and
-the `predmarket` console entry from the current checkout. The `python3` command
-below must resolve to Python 3.11 or newer:
+Use Python `>=3.11`. The project pins `polymarket-client==0.3.0b1` for
+read-only access to Polymarket's public data; `pip install -e .` installs that
+dependency and the `predmarket` console entry from the current checkout. The
+`python3` command below must resolve to Python 3.11 or newer:
 
 ```console
 python3 --version
@@ -19,7 +19,9 @@ predmarket --help
 
 ## 2. Start the local observer
 
-Start the long-running, read-only service with the supplied configuration:
+Start the long-running observer with the supplied configuration. It reads only
+public Polymarket data and writes evidence, relations, signals, and operational
+state to local SQLite:
 
 ```console
 predmarket run --config config/default.yaml
@@ -27,7 +29,7 @@ predmarket run --config config/default.yaml
 
 `run` initializes the configured SQLite database before it starts public
 Polymarket sync, order-book monitoring, strategy evaluation, and notifications.
-It writes local evidence but never authenticates, signs, or trades.
+It never authenticates, signs, or trades on Polymarket.
 
 Leave this process running. Use `Ctrl-C` for an orderly stop; after it exits,
 start the same command again to resume observing the existing local database.
