@@ -27,6 +27,11 @@ python scripts/reset_database.py --config config/default.yaml
 python scripts/reset_database.py --config config/default.yaml --execute
 ```
 
+With the repository `config/default.yaml`, the configured default database is
+`data/predmarket-v1.sqlite3`, relative to the repository working directory.
+Keep `config/default.yaml` as the configuration template; use a copied config
+with a temporary database path for reset or verification examples.
+
 The first reset command is a dry run: it prints the absolute configured SQLite
 main path and the only files execution can remove.  After reviewing it, stop
 Predmarket processes before using `--execute`.  Reset rejects a running
