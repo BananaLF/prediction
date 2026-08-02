@@ -135,20 +135,20 @@ def _assert_violation(path: Path, code: str) -> None:
     assert code in captured.value.violations
 
 
-def test_integrity_accepts_a_valid_schema_v1_database(tmp_path: Path) -> None:
+def test_integrity_accepts_a_valid_schema_v3_database(tmp_path: Path) -> None:
     database_path = tmp_path / "market.db"
     _seed_valid_database(database_path)
 
     check_database_integrity(database_path)
 
 
-def test_integrity_reports_stable_error_for_incomplete_schema_v1(
+def test_integrity_reports_stable_error_for_incomplete_schema_v3(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "market.db"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 1")
+        connection.execute("PRAGMA user_version = 3")
 
     _assert_violation(database_path, "SCHEMA_INVALID")
 
@@ -238,7 +238,7 @@ def test_integrity_rejects_noncanonical_decimal(
 ) -> None:
     database_path = tmp_path / "market.db"
     _seed_valid_database(database_path)
-    _corrupt(database_path, sql)
+    _corrupt(database_path, sql, ignore_checks=True)
 
     _assert_violation(database_path, code)
 

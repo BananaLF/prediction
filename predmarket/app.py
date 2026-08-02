@@ -140,7 +140,7 @@ class Supervisor:
         self,
     ) -> tuple[DatabaseWriter, Any, Notifier, Any, Any]:
         # Initialize before the integrity read and before constructing the SDK
-        # boundary, so the v1 ten-table schema is an invariant of every run.
+        # boundary, so the v3 ten-table schema is an invariant of every run.
         initialize_database(self._config.database.path)
         check_database_integrity(self._config.database.path)
         writer = DatabaseWriter(

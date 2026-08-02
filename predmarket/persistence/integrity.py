@@ -37,7 +37,7 @@ class DatabaseIntegrityError(RuntimeError):
 
 
 def check_database_integrity(path: Path) -> None:
-    """Raise with stable violation codes when a schema-v1 database is unsafe."""
+    """Raise with stable violation codes when a schema-v3 database is unsafe."""
     database_path = Path(path)
     connection = sqlite3.connect(
         f"file:{database_path}?mode=ro",

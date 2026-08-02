@@ -7,7 +7,7 @@ import pytest
 
 import predmarket.persistence.schema as schema_module
 from predmarket.domain.signal import DecisionReason
-from predmarket.persistence.schema import initialize_database
+from predmarket.persistence.schema import SCHEMA_V2, initialize_database
 
 
 PROJECT_TABLES = {
@@ -28,6 +28,16 @@ def _connect(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
+
+
+def _create_schema_v2_database(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(
+            "BEGIN IMMEDIATE;\n"
+            + SCHEMA_V2
+            + "\nPRAGMA user_version = 2;\nCOMMIT;\n"
+        )
 
 
 def _insert_catalog(connection: sqlite3.Connection) -> None:
@@ -123,7 +133,7 @@ def _insert_revision(
     )
 
 
-def test_initialize_database_creates_exact_schema_v1_and_wal(tmp_path: Path) -> None:
+def test_initialize_database_creates_exact_schema_v3_and_wal(tmp_path: Path) -> None:
     database_path = tmp_path / "market.db"
 
     initialize_database(database_path)
@@ -139,7 +149,7 @@ def test_initialize_database_creates_exact_schema_v1_and_wal(tmp_path: Path) -> 
             )
         }
         assert tables == PROJECT_TABLES
-        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
         assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
@@ -191,14 +201,14 @@ def test_initialize_database_rejects_nonempty_unknown_schema_without_mutation(
     assert database_path.read_bytes() == original_bytes
 
 
-def test_initialize_database_accepts_an_existing_schema_v1(tmp_path: Path) -> None:
+def test_initialize_database_accepts_an_existing_schema_v3(tmp_path: Path) -> None:
     database_path = tmp_path / "market.db"
     initialize_database(database_path)
 
     initialize_database(database_path)
 
     with _connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
 
 
 def test_initialize_database_rolls_back_a_partially_failing_schema_script(
@@ -208,7 +218,7 @@ def test_initialize_database_rolls_back_a_partially_failing_schema_script(
     database_path = tmp_path / "market.db"
     monkeypatch.setattr(
         schema_module,
-        "SCHEMA_V1",
+        "SCHEMA_V3",
         """
         CREATE TABLE partial_table (id INTEGER PRIMARY KEY);
         CREATE TABLE broken_table (;
@@ -226,6 +236,131 @@ def test_initialize_database_rolls_back_a_partially_failing_schema_script(
             """
         ).fetchall()
         assert tables == []
+
+
+def test_schema_decimal_columns_require_canonical_plain_decimal_text(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    initialize_database(database_path)
+
+    with _connect(database_path) as connection:
+        _insert_catalog(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE markets SET tick_size = '1E-5' WHERE id = 'market-1'"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE markets SET tick_size = '0.010' WHERE id = 'market-1'"
+            )
+        connection.execute(
+            "UPDATE markets SET tick_size = ? WHERE id = 'market-1'",
+            ("0." + "0" * 499 + "1",),
+        )
+        assert connection.execute(
+            "SELECT tick_size FROM markets WHERE id = 'market-1'"
+        ).fetchone() == ("0." + "0" * 499 + "1",)
+
+
+def test_schema_v2_migration_normalizes_legacy_decimal_spellings(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _create_schema_v2_database(database_path)
+    with _connect(database_path) as connection:
+        _insert_catalog(connection)
+        connection.execute(
+            "UPDATE markets SET tick_size = '1E-5', minimum_order_size = '001.2300' "
+            "WHERE id = 'market-1'"
+        )
+        connection.execute(
+            "UPDATE markets SET event_id = NULL WHERE id = 'market-2'"
+        )
+        connection.execute(
+            "UPDATE events SET market_ids_json = '[\"market-1\"]' WHERE id = 'event-1'"
+        )
+        connection.execute(
+            "UPDATE tokens SET fee_schedule_json = ? WHERE id = 'token-1'",
+            (
+                '{"enabled":true,"model":"FLAT",'
+                '"parameters":{"rate":"1E-5"},"source":"legacy"}',
+            ),
+        )
+
+    initialize_database(database_path)
+
+    with _connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute(
+            "SELECT tick_size, minimum_order_size FROM markets WHERE id = 'market-1'"
+        ).fetchone() == ("0.00001", "1.23")
+        assert connection.execute(
+            "SELECT event_id FROM markets WHERE id = 'market-2'"
+        ).fetchone() == (None,)
+        assert connection.execute(
+            "SELECT fee_schedule_json FROM tokens WHERE id = 'token-1'"
+        ).fetchone() == (
+            '{"enabled":true,"model":"FLAT","parameters":{"rate":"0.00001"},'
+            '"source":"legacy"}',
+        )
+
+
+@pytest.mark.parametrize(
+    "fee_schedule_json",
+    [
+        '{"enabled":true,"model":"FLAT","parameters":{"rate":1},"source":"legacy"}',
+        '{"enabled":true,"model":"FLAT","parameters":{"rate":"2"},"source":"legacy"}',
+        '{"enabled":true,"model":"FLAT","parameters":{"rate":"NaN"},"source":"legacy"}',
+        '{"enabled":true,"model":"FLAT","parameters":{"rate":[]},"source":"legacy"}',
+    ],
+)
+def test_schema_v2_migration_rolls_back_invalid_fee_schedule_data(
+    tmp_path: Path,
+    fee_schedule_json: str,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _create_schema_v2_database(database_path)
+    with _connect(database_path) as connection:
+        _insert_catalog(connection)
+        connection.execute(
+            "UPDATE tokens SET fee_schedule_json = ? WHERE id = 'token-1'",
+            (fee_schedule_json,),
+        )
+
+    with pytest.raises((ValueError, sqlite3.IntegrityError)):
+        initialize_database(database_path)
+
+    with _connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute(
+            "SELECT fee_schedule_json FROM tokens WHERE id = 'token-1'"
+        ).fetchone() == (fee_schedule_json,)
+
+
+@pytest.mark.parametrize("legacy_value", ["NaN", "2", "-0.1"])
+def test_schema_v2_migration_rolls_back_invalid_decimal_data(
+    tmp_path: Path,
+    legacy_value: str,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _create_schema_v2_database(database_path)
+    with _connect(database_path) as connection:
+        _insert_catalog(connection)
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE markets SET tick_size = ? WHERE id = 'market-1'",
+            (legacy_value,),
+        )
+
+    with pytest.raises((ValueError, sqlite3.IntegrityError)):
+        initialize_database(database_path)
+
+    with _connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute(
+            "SELECT tick_size FROM markets WHERE id = 'market-1'"
+        ).fetchone() == (legacy_value,)
 
 
 def test_relation_and_signal_strategy_constraints_are_enforced(
