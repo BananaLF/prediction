@@ -137,6 +137,31 @@ async def test_supervisor_syncs_before_watch_and_terminates_after_watch_crash(
 
 
 @pytest.mark.asyncio
+async def test_supervisor_treats_cancellation_as_normal_shutdown(tmp_path: Path) -> None:
+    calls: list[str] = []
+    sync = _IncompletePeriodicSync()
+    supervisor = Supervisor(
+        _config(tmp_path),
+        gateway=object(),
+        sync_task_factory=lambda **_: sync,
+        watch_task_factory=lambda **_: _Watch(calls, crash=False),
+        sleep=_wait_for_cancellation,
+    )
+    running = asyncio.create_task(supervisor.run())
+
+    try:
+        await asyncio.wait_for(sync.called.wait(), timeout=1)
+        running.cancel()
+        assert await running == 0
+    finally:
+        if not running.done():
+            running.cancel()
+            await running
+
+    assert calls == ["watch-close"]
+
+
+@pytest.mark.asyncio
 async def test_supervisor_notifies_startup_failure_with_constructed_default_notifier(
     tmp_path: Path,
 ) -> None:
