@@ -102,6 +102,7 @@ Predmarket 解决的问题是：从 Polymarket 公开市场和订单簿中发现
 
 ### CLI 入口
 
+- 以下命令均应从仓库根目录执行。
 - 安装后以 `predmarket` 作为主入口，默认配置为 `config/default.yaml`，默认数据库为 `data/predmarket-v1.sqlite3`；配置相对路径按当前工作目录解析。
 - `python -m predmarket` 保留为兼容入口，功能与主入口一致。
 
