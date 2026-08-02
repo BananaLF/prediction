@@ -1,14 +1,23 @@
 # Tutorial
 
-Run every command below from the repository root. Install the project first so
-the `predmarket` console entry is available (for example, with the project's
-normal Python package installation), then inspect its command surface:
+Run every command below from the repository root.
+
+## 1. Install and inspect the CLI
+
+Use Python `>=3.11`. The project pins the read-only Polymarket SDK to
+`polymarket-client==0.3.0b1`; `pip install -e .` installs that dependency and
+the `predmarket` console entry from the current checkout. The `python3` command
+below must resolve to Python 3.11 or newer:
 
 ```console
+python3 --version
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
 predmarket --help
 ```
 
-## 1. Start the local observer
+## 2. Start the local observer
 
 Start the long-running, read-only service with the supplied configuration:
 
@@ -26,7 +35,7 @@ The watcher invalidates old WebSocket generations and rebuilds them from REST
 snapshots after disconnections, so it does not evaluate a mixture of old and new
 books.
 
-## 2. Query local evidence from another terminal
+## 3. Query local evidence from another terminal
 
 Open a second terminal in the repository root:
 
@@ -40,7 +49,7 @@ These commands query local SQLite only and do not access Polymarket. The databas
 must already have been initialized by `run`; otherwise the read-only query cannot
 open its tables.
 
-## 3. Inspect and approve a relation
+## 4. Inspect and approve a relation
 
 Choose an actual ID from `relations list` and replace `RELATION_ID` below:
 
@@ -59,7 +68,7 @@ feature. Standard `predmarket` has no analyzer provider. Setting `llm_enabled:
 true` only enables the workflow when a caller programmatically injects a valid
 analyzer; it neither creates nor configures one.
 
-## 4. Recover, inspect events, and clean local evidence
+## 5. Recover, inspect events, and clean local evidence
 
 For a WebSocket interruption or queue overflow, keep the service running and
 watch its terminal notifications while it refreshes via REST. Operational events
