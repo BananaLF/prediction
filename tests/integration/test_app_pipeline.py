@@ -47,6 +47,20 @@ class _Sync:
         return type("Result", (), {"complete": True})()
 
 
+class _SkippedInitialSync:
+    async def run_once(self):
+        return type(
+            "Result",
+            (),
+            {
+                "complete": True,
+                "sync_generation": "sync-initial-skipped",
+                "skipped_market_ids": ("market-2278824",),
+                "warnings": ("events must contain exactly one event reference",),
+            },
+        )()
+
+
 class _FailingSync:
     async def run_once(self):
         raise RuntimeError("initial sync failed")
@@ -65,6 +79,24 @@ class _IncompletePeriodicSync:
                 "complete": False,
                 "error": 'market request failed; api_response={"id":"200"}',
                 "sync_generation": "sync-periodic",
+            },
+        )()
+
+
+class _SkippedPeriodicSync:
+    def __init__(self) -> None:
+        self.called = asyncio.Event()
+
+    async def run_once(self):
+        self.called.set()
+        return type(
+            "Result",
+            (),
+            {
+                "complete": True,
+                "sync_generation": "sync-periodic-skipped",
+                "skipped_market_ids": ("market-2278824",),
+                "warnings": ("events must contain exactly one event reference",),
             },
         )()
 
@@ -134,6 +166,37 @@ async def test_supervisor_syncs_before_watch_and_terminates_after_watch_crash(
     assert calls == ["sync", "watch-start", "watch-run", "watch-close"]
     assert "RUNTIME_TASK_EXITED" in output.getvalue()
     assert events.entries == []
+
+
+@pytest.mark.asyncio
+async def test_supervisor_notifies_when_initial_generation_skips_malformed_markets(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    notifier = Notifier(terminal=output)
+    supervisor = Supervisor(
+        _config(tmp_path),
+        gateway=object(),
+        notifier=notifier,
+        sync_task_factory=lambda **_: _SkippedInitialSync(),
+        watch_task_factory=lambda **_: _Watch([], crash=True),
+        sleep=_wait_for_cancellation,
+    )
+
+    assert await supervisor.run() == 1
+
+    rendered = output.getvalue()
+    assert "SYNC_MARKET_SKIPPED: Malformed markets were skipped from the sync catalog" in rendered
+    details = json.loads(rendered.splitlines()[1].split(" details: ", 1)[1])
+    assert details == {
+        "markets": [
+            {
+                "market_id": "market-2278824",
+                "error": "events must contain exactly one event reference",
+            }
+        ],
+        "sync_generation": "sync-initial-skipped",
+    }
 
 
 @pytest.mark.asyncio
@@ -220,6 +283,41 @@ async def test_periodic_sync_notifies_when_generation_is_incomplete(
     details = json.loads(rendered.splitlines()[1].split(" details: ", 1)[1])
     assert details["error"] == 'market request failed; api_response={"id":"200"}'
     assert details["sync_generation"] == "sync-periodic"
+
+
+@pytest.mark.asyncio
+async def test_periodic_sync_notifies_when_generation_skips_malformed_markets(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    notifier = Notifier(terminal=output)
+    sync = _SkippedPeriodicSync()
+    supervisor = Supervisor(
+        _config(tmp_path),
+        notifier=notifier,
+        sleep=lambda _: asyncio.sleep(0),
+    )
+    task = asyncio.create_task(supervisor._sync_forever(sync, notifier))
+
+    try:
+        await asyncio.wait_for(sync.called.wait(), timeout=1)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    rendered = output.getvalue()
+    assert "SYNC_MARKET_SKIPPED: Malformed markets were skipped from the sync catalog" in rendered
+    details = json.loads(rendered.splitlines()[1].split(" details: ", 1)[1])
+    assert details == {
+        "markets": [
+            {
+                "market_id": "market-2278824",
+                "error": "events must contain exactly one event reference",
+            }
+        ],
+        "sync_generation": "sync-periodic-skipped",
+    }
 
 
 @pytest.mark.asyncio

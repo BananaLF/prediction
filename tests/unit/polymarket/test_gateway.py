@@ -7,6 +7,7 @@ from decimal import Decimal
 import importlib.metadata
 import json
 from pathlib import Path
+import re
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
@@ -475,6 +476,30 @@ async def test_list_active_markets_maps_tokens_and_authoritative_fee_schedules(
     assert zero_fee.enabled is False
 
 
+async def test_list_active_markets_skips_one_malformed_market_with_warning(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    payload = deepcopy(sdk_fixture)
+    payload["markets"][0].events = ()
+    client = FakePublicClient(**payload)
+    gateway = PolymarketGateway(
+        client=client,
+        clock_ms=lambda: 1_785_405_970_000,
+        page_size=1,
+    )
+
+    snapshots = await gateway.list_active_markets()
+
+    assert tuple(snapshot.market.id for snapshot in snapshots) == ("201",)
+    assert tuple(warning.market_id for warning in gateway.market_mapping_warnings) == (
+        "200",
+    )
+    warning = gateway.market_mapping_warnings[0]
+    assert "events must contain exactly one event reference" in warning.error
+    assert '"events":[]' in warning.error
+    assert len(warning.error.rsplit("api_response=", 1)[1]) <= 8_192
+
+
 async def test_market_mapping_error_includes_bounded_api_response(
     sdk_fixture: dict[str, tuple[Any, ...]],
 ) -> None:
@@ -487,15 +512,14 @@ async def test_market_mapping_error_includes_bounded_api_response(
         page_size=1,
     )
 
-    with pytest.raises(
-        GatewayMappingError,
-        match=r"market 200.*enabled fees require a fee schedule.*api_response=",
-    ) as raised:
-        await gateway.list_active_markets()
+    snapshots = await gateway.list_active_markets()
 
-    message = str(raised.value)
-    assert '"id":"200"' in message
-    assert len(message.rsplit("api_response=", 1)[1]) <= 8_192
+    assert tuple(snapshot.market.id for snapshot in snapshots) == ("201",)
+    warning = gateway.market_mapping_warnings[0]
+    assert warning.market_id == "200"
+    assert "enabled fees require a fee schedule" in warning.error
+    assert '"id":"200"' in warning.error
+    assert len(warning.error.rsplit("api_response=", 1)[1]) <= 8_192
 
 
 @pytest.mark.parametrize("contradictory_flag", ["closed", "archived"])
@@ -509,8 +533,12 @@ async def test_contradictory_active_market_state_is_rejected(
     client = FakePublicClient(**payload)
     gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
 
-    with pytest.raises(GatewayMappingError, match=r"market 200.*contradictory"):
-        await gateway.list_active_markets()
+    snapshots = await gateway.list_active_markets()
+
+    assert tuple(snapshot.market.id for snapshot in snapshots) == ("201",)
+    warning = gateway.market_mapping_warnings[0]
+    assert warning.market_id == "200"
+    assert "contradictory" in warning.error
 
 
 async def test_get_order_books_preserves_complete_l2_and_request_coverage(
@@ -1594,11 +1622,14 @@ async def test_malformed_sdk_entities_fail_closed_with_context(
     client = FakePublicClient(**payload)
     gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
 
-    with pytest.raises(GatewayMappingError, match=match):
-        if entity == "event":
+    if entity == "event":
+        with pytest.raises(GatewayMappingError, match=match):
             await gateway.list_active_events()
-        else:
-            await gateway.list_active_markets()
+    else:
+        snapshots = await gateway.list_active_markets()
+        assert tuple(snapshot.market.id for snapshot in snapshots) == ("201",)
+        assert gateway.market_mapping_warnings[0].market_id == "200"
+        assert re.search(match, gateway.market_mapping_warnings[0].error)
 
 
 async def test_incomplete_order_book_batch_is_rejected(

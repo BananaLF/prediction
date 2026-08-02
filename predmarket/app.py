@@ -80,6 +80,7 @@ class Supervisor:
         try:
             writer, gateway, notifier, sync, watch = await self._build_runtime()
             initial = await sync.run_once()
+            await _notify_skipped_markets(notifier, initial)
             while not initial.complete:
                 await notifier.notify(
                     event_type="SYNC_GENERATION_INCOMPLETE",
@@ -88,6 +89,7 @@ class Supervisor:
                 )
                 await self._sleep(self._config.polymarket.sync_interval_seconds)
                 initial = await sync.run_once()
+                await _notify_skipped_markets(notifier, initial)
 
             await watch.start()
             sync_task = asyncio.create_task(
@@ -238,6 +240,7 @@ class Supervisor:
         while True:
             await self._sleep(self._config.polymarket.sync_interval_seconds)
             result = await sync.run_once()
+            await _notify_skipped_markets(notifier, result)
             if getattr(result, "complete", True) is False:
                 await notifier.notify(
                     event_type="SYNC_GENERATION_INCOMPLETE",
@@ -273,6 +276,27 @@ class Supervisor:
             message="Market-change queue entered degraded mode",
             details={"incoming_change_id": overflow.incoming.change_id},
         )
+
+
+async def _notify_skipped_markets(notifier: Notifier, result: Any) -> None:
+    market_ids = tuple(getattr(result, "skipped_market_ids", ()))
+    if not market_ids:
+        return
+    warnings = tuple(getattr(result, "warnings", ()))
+    await notifier.notify(
+        event_type="SYNC_MARKET_SKIPPED",
+        message="Malformed markets were skipped from the sync catalog",
+        details={
+            "sync_generation": getattr(result, "sync_generation", None),
+            "markets": [
+                {
+                    "market_id": market_id,
+                    "error": warnings[index] if index < len(warnings) else None,
+                }
+                for index, market_id in enumerate(market_ids)
+            ],
+        },
+    )
 
 
 class _ApplicationContextSource:
