@@ -1,10 +1,12 @@
 # Signal strategy
 
-Predmarket is a read-only signal system: it records bounded, evidence-backed
-pricing relationships and does not place, cancel, sign, or settle trades.  A
-strategy decision is made only from the affected token's current catalog,
-order-book, fee, and relationship evidence.  Invalid or incomplete evidence is
-not evaluable; a candidate that misses a feasibility threshold is recorded as
+Predmarket is read-only with respect to Polymarket's public interfaces: it
+reads public REST and WebSocket data and has no external trading write path.  It
+records local evidence, pricing relationships, signals, and their calculations
+in SQLite; it does not place, cancel, sign, or settle trades.  A strategy
+decision is made only from the affected token's current catalog, order-book,
+fee, and relationship evidence.  Invalid or incomplete evidence is not
+evaluable; a candidate that misses a feasibility threshold is recorded as
 absent rather than actionable.
 
 ## Strategy paths

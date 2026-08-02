@@ -1,10 +1,12 @@
 # Security model
 
-Predmarket is a read-only local signal system.  External market data enters
-only through public REST and WebSocket access in `PolymarketGateway`.  It has no
-authentication, wallet, signing, order-placement, cancellation, or on-chain
-write path.  Local SQLite writes are serialized through `DatabaseWriter`;
-readers consume stored snapshots and do not mutate external systems.
+Predmarket is read-only at the Polymarket public-interface boundary.  External
+market data enters only through public REST and WebSocket access in
+`PolymarketGateway`; it has no authentication, wallet, signing, order-placement,
+cancellation, or on-chain write path.  It does write local SQLite: `DatabaseWriter`
+serializes local snapshots/evidence, signals, relations, and operational state
+such as `system_events`; readers consume stored snapshots and do not mutate
+external systems.
 
 Prices, amounts, and strategy calculations use `Decimal` (or canonical stored
 decimal strings).  The system fails closed when required invariants, numeric
