@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from predmarket.persistence import integrity
 from predmarket.persistence.integrity import (
     DatabaseIntegrityError,
     check_database_integrity,
+    check_database_startup,
+    run_database_doctor,
 )
 from predmarket.persistence.schema import initialize_database
 
@@ -140,6 +144,128 @@ def test_integrity_accepts_a_valid_schema_v1_database(tmp_path: Path) -> None:
     _seed_valid_database(database_path)
 
     check_database_integrity(database_path)
+
+
+def test_startup_check_skips_full_semantic_scans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+
+    for name in (
+        "_check_id_arrays",
+        "_check_json_payloads",
+        "_check_decimals",
+        "_check_latest_revisions",
+        "_check_revision_payloads",
+    ):
+        monkeypatch.setattr(
+            integrity,
+            name,
+            lambda *_args, _name=name: pytest.fail(
+                f"startup check ran semantic scan {_name}"
+            ),
+        )
+
+    check_database_startup(database_path)
+
+
+def test_doctor_reports_a_healthy_database(tmp_path: Path) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+
+    report = run_database_doctor(database_path)
+    payload = report.to_payload()
+
+    assert report.exit_code == 0
+    assert payload["status"] == "ok"
+    assert payload["summary"] == {"errors": 0, "warnings": 0}
+    assert payload["findings"] == []
+
+
+def test_doctor_orders_findings_and_json_safe_records() -> None:
+    report = integrity.DatabaseDoctorReport(
+        database=Path("market.db"),
+        status="issues",
+        findings=(
+            integrity._IntegrityFinding(
+                code="JSON_PAYLOAD_INVALID",
+                category="json_payloads",
+                severity="error",
+                records=({"id": "b"}, {"id": b"a"}),
+            ),
+            integrity._IntegrityFinding(
+                code="EVENT_MARKETS_MISMATCH",
+                category="id_arrays",
+                severity="error",
+                records=({"id": "z"},),
+            ),
+        ),
+    )
+
+    payload = report.to_payload()
+
+    assert [finding["code"] for finding in payload["findings"]] == [
+        "EVENT_MARKETS_MISMATCH",
+        "JSON_PAYLOAD_INVALID",
+    ]
+    assert payload["findings"][1]["records"] == [
+        {"id": "b"},
+        {"id": {"type": "bytes", "hex": "61"}},
+    ]
+    json.dumps(payload)
+
+
+def test_doctor_reports_structural_findings_after_version_mismatch(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA user_version = 2")
+        connection.execute("DROP TABLE events")
+
+    payload = run_database_doctor(database_path).to_payload()
+
+    assert {finding["code"] for finding in payload["findings"]} >= {
+        "SCHEMA_VERSION_MISMATCH",
+        "SCHEMA_INVALID",
+    }
+
+
+def test_doctor_reports_affected_records_for_semantic_findings(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+    _corrupt(
+        database_path,
+        "UPDATE events SET market_ids_json = '[\"market-1\"]' WHERE id = 'event-1'",
+    )
+
+    report = run_database_doctor(database_path)
+    finding = next(
+        item
+        for item in report.to_payload()["findings"]
+        if item["code"] == "EVENT_MARKETS_MISMATCH"
+    )
+
+    assert report.exit_code == 1
+    assert finding["category"] == "id_arrays"
+    assert finding["severity"] == "error"
+    assert finding["records"] == [
+        {"field": "market_ids_json", "id": "event-1", "table": "events"}
+    ]
+
+
+def test_doctor_returns_unavailable_for_a_missing_database(tmp_path: Path) -> None:
+    report = run_database_doctor(tmp_path / "missing.sqlite3")
+    payload = report.to_payload()
+
+    assert report.exit_code == 2
+    assert payload["status"] == "unavailable"
+    assert payload["error"]["code"] == "DATABASE_UNAVAILABLE"
 
 
 def test_integrity_reports_stable_error_for_incomplete_schema_v1(

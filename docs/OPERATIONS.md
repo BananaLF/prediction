@@ -5,6 +5,7 @@ Run commands from the repository root. The daily interfaces are:
 ```console
 predmarket run --config config/default.yaml
 predmarket status --config config/default.yaml
+predmarket doctor --config config/default.yaml
 predmarket signals list --config config/default.yaml
 ```
 
@@ -15,6 +16,22 @@ operational state, initializes Schema v1, watches order books, evaluates
 strategies, and sends notifications. `status` and `signals list` are local
 SQLite reads, so use them after `run` has initialized the database. They do not
 make Polymarket requests.
+
+`run` performs only the required startup checks: Schema v1, SQLite structural
+integrity, foreign-key basics, and the expected project tables. It does not scan
+all persisted application payloads during startup. Use the read-only doctor for
+the full semantic scan:
+
+```console
+predmarket doctor --config config/default.yaml
+```
+
+`doctor` emits JSON findings grouped into `schema`, `id_arrays`,
+`json_payloads`, `decimals`, and `revisions`. Each finding includes a stable
+code and affected records where available. It never initializes, repairs, or
+rewrites the database. Exit status `0` means no findings, `1` means errors or
+warnings were found, and `2` means the database could not be checked (including
+an unavailable or invalid invocation).
 
 Runtime status is emitted through Python `logging` to `stderr`. The default
 level is `INFO`; use `--log-level DEBUG|INFO|WARNING|ERROR|CRITICAL` on

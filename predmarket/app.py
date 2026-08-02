@@ -20,7 +20,7 @@ from predmarket.domain.signal import (
     StrategyType,
 )
 from predmarket.notification.notifier import Notifier, macos_desktop_notification
-from predmarket.persistence.integrity import check_database_integrity
+from predmarket.persistence.integrity import check_database_startup
 from predmarket.persistence.repositories import (
     CatalogRepository,
     RelationRepository,
@@ -160,7 +160,7 @@ class Supervisor:
         # Initialize before the integrity read and before constructing the SDK
         # boundary, so the v1 ten-table schema is an invariant of every run.
         initialize_database(self._config.database.path)
-        check_database_integrity(self._config.database.path)
+        check_database_startup(self._config.database.path)
         _LOGGER.info("component_initialized component=database")
         writer = DatabaseWriter(
             self._config.database.path,
