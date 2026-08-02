@@ -21,6 +21,7 @@ from predmarket.catalog.relations import (
 from predmarket.config import AppConfig
 from predmarket.domain.decimal import encode_decimal
 from predmarket.domain.relation import Relation
+from predmarket.persistence.integrity import run_database_doctor
 
 
 _LOG_LEVEL_NAMES = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -49,6 +50,11 @@ def main(
         from predmarket.app import Supervisor
 
         return asyncio.run(Supervisor(config, terminal=output).run())
+
+    if arguments.command == "doctor":
+        report = run_database_doctor(config.database.path)
+        _write_json(output, report.to_payload())
+        return report.exit_code
 
     if arguments.command == "status":
         _write_json(output, _ReadOnlyCliStore(config.database.path).status())
@@ -159,6 +165,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="runtime logging level",
     )
     commands.add_parser("status", help="show local service database status")
+    commands.add_parser(
+        "doctor",
+        help="check database structure and persisted data without modifying it",
+    )
     signals = commands.add_parser("signals", help="inspect persisted signals")
     signal_commands = signals.add_subparsers(dest="signals_command", required=True)
     signal_commands.add_parser("list", help="list persisted signals")

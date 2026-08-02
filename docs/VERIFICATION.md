@@ -22,12 +22,20 @@ python -m predmarket --help
 predmarket --help
 python -m predmarket status --config config/default.yaml
 python -m predmarket run --config config/default.yaml
+python -m predmarket doctor --config config/default.yaml
 python -m predmarket signals list --config config/default.yaml
 python -m predmarket relations list --config config/default.yaml
 ```
 
 The four module-form service examples above are parser-only examples for the
 documentation test; they are not runtime smoke commands.
+
+For an initialized temporary database, `doctor` is the full read-only semantic
+check. Its JSON output has stable categories and finding codes. Exit status `0`
+means healthy, `1` means findings were reported, and `2` means the database
+could not be checked. A normal `run` startup failure is handled separately: it
+stops before the writer and runtime tasks start, and should be investigated as
+a structural/schema problem. `doctor` does not initialize or repair a database.
 
 The `predmarket` console entry point is available only after the editable
 install.  In the current `tests/integration/test_documented_commands.py`,

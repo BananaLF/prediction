@@ -305,7 +305,7 @@ async def test_periodic_sync_notifies_when_generation_skips_malformed_markets(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage", ("initialize", "integrity", "writer"))
+@pytest.mark.parametrize("stage", ("initialize", "startup", "writer"))
 async def test_supervisor_reports_pre_notifier_database_failures_to_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -319,11 +319,11 @@ async def test_supervisor_reports_pre_notifier_database_failures_to_terminal(
             raise RuntimeError("database initialize failed")
 
         monkeypatch.setattr("predmarket.app.initialize_database", fail_initialize)
-    elif stage == "integrity":
-        def fail_integrity(_: Path) -> None:
-            raise RuntimeError("database integrity failed")
+    elif stage == "startup":
+        def fail_startup(_: Path) -> None:
+            raise RuntimeError("database startup failed")
 
-        monkeypatch.setattr("predmarket.app.check_database_integrity", fail_integrity)
+        monkeypatch.setattr("predmarket.app.check_database_startup", fail_startup)
     else:
         async def fail_writer_start(_: DatabaseWriter) -> None:
             raise RuntimeError("database writer failed")
