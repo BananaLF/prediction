@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from dataclasses import replace
+import logging
 from pathlib import Path
 import sqlite3
 
@@ -130,26 +131,43 @@ async def _open_manager(
 
 
 @pytest.mark.asyncio
-async def test_signal_manager_persists_open_update_noop_and_close_lifecycle(tmp_path: Path) -> None:
+async def test_signal_manager_persists_open_update_noop_and_close_lifecycle(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     writer, _catalog_repo, _signals, manager = await _open_manager(tmp_path)
     try:
-        signal_id = await manager.apply(_present(), "opportunity-1", None)
-        assert signal_id is not None
-        assert await manager.apply(_present(), "opportunity-1", 1) == signal_id
-        assert await manager.apply(_present(expected_profit="0.24"), "opportunity-1", 1) == signal_id
+        with caplog.at_level(logging.INFO, logger="predmarket.signals.manager"):
+            signal_id = await manager.apply(_present(), "opportunity-1", None)
+            assert signal_id is not None
+            assert await manager.apply(_present(), "opportunity-1", 1) == signal_id
+            assert await manager.apply(_present(expected_profit="0.24"), "opportunity-1", 1) == signal_id
 
-        absent = OpportunityAbsent(
-            reason_code=DecisionReason.PROFIT_BELOW_THRESHOLD,
-            calculation=_present().calculation,
-            legs=_present().legs,
-            evidence=_present().evidence,
-        )
-        assert await manager.apply(absent, "opportunity-1", 2) == signal_id
+            absent = OpportunityAbsent(
+                reason_code=DecisionReason.PROFIT_BELOW_THRESHOLD,
+                calculation=_present().calculation,
+                legs=_present().legs,
+                evidence=_present().evidence,
+            )
+            assert await manager.apply(absent, "opportunity-1", 2) == signal_id
 
-        reopened = await manager.apply(_present(), "opportunity-1", 3)
-        assert reopened is not None and reopened != signal_id
+            reopened = await manager.apply(_present(), "opportunity-1", 3)
+            assert reopened is not None and reopened != signal_id
     finally:
         await writer.close()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert [message.split()[0] for message in messages] == [
+        "signal_transition",
+        "signal_transition",
+        "signal_transition",
+        "signal_transition",
+    ]
+    assert [
+        next(part.split("=", 1)[1] for part in message.split() if part.startswith("event_type="))
+        for message in messages
+    ] == ["OPENED", "UPDATED", "CLOSED", "OPENED"]
+    assert all("strategy_type=BINARY_UNDERPRICED" in message for message in messages)
 
     with sqlite3.connect(tmp_path / "signals.db") as connection:
         rows = connection.execute(

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
 import json
+import logging
 from pathlib import Path
 import sqlite3
 import sys
@@ -22,6 +23,11 @@ from predmarket.domain.decimal import encode_decimal
 from predmarket.domain.relation import Relation
 
 
+_LOG_LEVEL_NAMES = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+_APPLICATION_LOGGER_NAME = "predmarket"
+_RUNTIME_HANDLER_MARKER = "_predmarket_runtime_handler"
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -36,6 +42,10 @@ def main(
     clock = now_ms or (lambda: time.time_ns() // 1_000_000)
 
     if arguments.command == "run":
+        _configure_logging(
+            arguments.log_level,
+            terminal_enabled=config.notification.terminal_enabled,
+        )
         from predmarket.app import Supervisor
 
         return asyncio.run(Supervisor(config, terminal=output).run())
@@ -108,6 +118,29 @@ def _normalize_config_position(argv: Sequence[str] | None) -> list[str]:
     return config + arguments[:config_index] + arguments[config_index + 2 :]
 
 
+def _configure_logging(level_name: str, *, terminal_enabled: bool) -> None:
+    level = getattr(logging, level_name)
+    if not isinstance(level, int):
+        raise ValueError(f"unknown logging level: {level_name}")
+
+    application_logger = logging.getLogger(_APPLICATION_LOGGER_NAME)
+    application_logger.setLevel(level)
+    application_logger.propagate = False
+
+    for handler in list(application_logger.handlers):
+        if getattr(handler, _RUNTIME_HANDLER_MARKER, False):
+            application_logger.removeHandler(handler)
+            handler.close()
+
+    if terminal_enabled:
+        handler = logging.StreamHandler(sys.stderr)
+        setattr(handler, _RUNTIME_HANDLER_MARKER, True)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+        )
+        application_logger.addHandler(handler)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket signal service")
     parser.add_argument(
@@ -117,7 +150,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="configuration YAML path",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("run", help="run the read-only market signal service")
+    run = commands.add_parser("run", help="run the read-only market signal service")
+    run.add_argument(
+        "--log-level",
+        type=str.upper,
+        choices=_LOG_LEVEL_NAMES,
+        default="INFO",
+        help="runtime logging level",
+    )
     commands.add_parser("status", help="show local service database status")
     signals = commands.add_parser("signals", help="inspect persisted signals")
     signal_commands = signals.add_subparsers(dest="signals_command", required=True)

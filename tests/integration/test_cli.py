@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from io import StringIO
 import json
+import logging
 from pathlib import Path
+import re
 import sqlite3
 
+import pytest
 import yaml
 
-from predmarket.cli import _build_parser, main
+from predmarket.cli import _build_parser, _configure_logging, main
 from predmarket.persistence.schema import initialize_database
 
 
@@ -55,6 +58,50 @@ def test_cli_has_only_service_and_relation_command_families() -> None:
     assert set(action.choices) == {"run", "status", "signals", "relations"}
     assert {"trade", "order", "wallet", "auth", "login"}.isdisjoint(
         action.choices
+    )
+
+
+def test_run_parser_accepts_case_insensitive_log_level() -> None:
+    arguments = _build_parser().parse_args(["run", "--log-level", "debug"])
+
+    assert arguments.log_level == "DEBUG"
+
+
+def test_run_parser_defaults_to_info() -> None:
+    arguments = _build_parser().parse_args(["run"])
+
+    assert arguments.log_level == "INFO"
+
+
+def test_run_parser_rejects_unknown_log_level() -> None:
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["run", "--log-level", "TRACE"])
+
+
+def test_configure_logging_writes_formatted_records_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    application_logger = logging.getLogger("predmarket")
+    original_handlers = list(application_logger.handlers)
+    original_level = application_logger.level
+    original_propagate = application_logger.propagate
+
+    try:
+        _configure_logging("DEBUG", terminal_enabled=True)
+        logging.getLogger("predmarket.cli").info("cli test")
+        captured = capsys.readouterr()
+    finally:
+        for handler in list(application_logger.handlers):
+            if handler not in original_handlers:
+                application_logger.removeHandler(handler)
+                handler.close()
+        application_logger.setLevel(original_level)
+        application_logger.propagate = original_propagate
+
+    assert captured.out == ""
+    assert re.search(
+        r"\d{4}-\d{2}-\d{2} .* INFO predmarket\.cli - cli test\n",
+        captured.err,
     )
 
 

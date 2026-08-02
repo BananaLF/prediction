@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from decimal import Decimal
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -245,6 +246,18 @@ class FakeGateway:
             subscription=subscription,
             subscription_generation=generation,
         )
+
+
+class FailSecondRecoveryGateway(FakeGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recovery_calls = 0
+
+    async def recover_market_session(self, token_ids: tuple[str, ...]):
+        self.recovery_calls += 1
+        if self.recovery_calls == 2:
+            raise RuntimeError("recovery unavailable")
+        return await super().recover_market_session(token_ids)
 
 
 class FakeCatalog:
@@ -585,6 +598,63 @@ async def test_market_add_rebuilds_subscription_and_closes_old_generation() -> N
     assert gateway.requests[-1] == ("token-1", "token-2", "token-3", "token-4")
     assert signals.closed[-1][0] == ("token-1", "token-2")
     assert signals.closed[-1][1].reason_code is DecisionReason.ORDERBOOK_INVALID
+    await watch.close()
+
+
+async def test_start_and_rotation_log_unique_subscribed_market_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    watch, _, catalog, _, _, _ = _watch()
+    with caplog.at_level(logging.INFO, logger="predmarket.watch.task"):
+        await watch.start()
+        catalog.snapshot = _catalog(second_market=True)
+        await watch.handle_market_change(
+            MarketChange(
+                change_id="change-log-count",
+                change_type=MarketChangeType.MARKET_ADDED,
+                event_id="event-1",
+                market_id="market-2",
+                token_ids=("token-3", "token-4"),
+                occurred_at=200,
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages[0].startswith("watch_subscribed ")
+    assert "markets=1" in messages[0]
+    assert "tokens=2" in messages[0]
+    assert "generation=1" in messages[0]
+    assert messages[-1].startswith("watch_subscribed ")
+    assert "markets=2" in messages[-1]
+    assert "tokens=4" in messages[-1]
+    assert "generation=2" in messages[-1]
+    await watch.close()
+
+
+async def test_failed_rotation_does_not_log_successful_subscription(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gateway = FailSecondRecoveryGateway()
+    watch, _, catalog, _, _, _ = _watch(gateway=gateway)
+    with caplog.at_level(logging.INFO, logger="predmarket.watch.task"):
+        await watch.start()
+        catalog.snapshot = _catalog(second_market=True)
+        with pytest.raises(RuntimeError, match="recovery unavailable"):
+            await watch.handle_market_change(
+                MarketChange(
+                    change_id="change-log-failure",
+                    change_type=MarketChangeType.MARKET_ADDED,
+                    event_id="event-1",
+                    market_id="market-2",
+                    token_ids=("token-3", "token-4"),
+                    occurred_at=200,
+                )
+            )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert [message for message in messages if message.startswith("watch_subscribed ")] == [
+        "watch_subscribed markets=1 tokens=2 generation=1"
+    ]
     await watch.close()
 
 

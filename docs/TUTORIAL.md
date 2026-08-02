@@ -73,9 +73,10 @@ analyzer; it neither creates nor configures one.
 ## 5. Recover, inspect events, and clean local evidence
 
 For a WebSocket interruption or queue overflow, keep the service running and
-watch its terminal notifications while it refreshes via REST. Operational events
-are persisted locally; after stopping the service, inspect recent events with a
-SQLite client, for example:
+watch its `stderr` logs while it refreshes via REST. Use
+`predmarket run --log-level DEBUG` when more detail is needed. Operational
+events are persisted locally; after stopping the service, inspect recent events
+with a SQLite client, for example:
 
 ```console
 sqlite3 data/predmarket-v1.sqlite3 'SELECT occurred_at, severity, event_type, message FROM system_events ORDER BY id DESC LIMIT 20;'

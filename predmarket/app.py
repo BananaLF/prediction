@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 import inspect
+import logging
 import time
 from typing import Any, TextIO
 
@@ -35,6 +36,7 @@ from predmarket.watch.cache import CacheState, OrderBookCache
 
 Clock = Callable[[], int]
 Factory = Callable[..., Any]
+_LOGGER = logging.getLogger(__name__)
 
 
 class Supervisor:
@@ -73,6 +75,7 @@ class Supervisor:
 
     async def run(self) -> int:
         """Start the pipeline and return non-zero on an unexpected task exit."""
+        _LOGGER.info("runtime_starting")
         writer: DatabaseWriter | None = None
         gateway: Any | None = None
         watch: Any | None = None
@@ -92,6 +95,7 @@ class Supervisor:
                 await _notify_skipped_markets(notifier, initial)
 
             await watch.start()
+            _LOGGER.info("runtime_started")
             sync_task = asyncio.create_task(
                 self._sync_forever(sync, notifier), name="SyncMarketTask"
             )
@@ -104,6 +108,17 @@ class Supervisor:
                 error = task.exception()
                 task_name = task.get_name()
                 detail = "returned" if error is None else f"failed: {error}"
+                if error is None:
+                    _LOGGER.error(
+                        "runtime_task_exited task=%s reason=returned", task_name
+                    )
+                else:
+                    _LOGGER.error(
+                        "runtime_task_exited task=%s error=%s",
+                        task_name,
+                        error,
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
                 await notifier.notify(
                     event_type="RUNTIME_TASK_EXITED",
                     message=f"{task_name} exited unexpectedly ({detail})",
@@ -114,8 +129,10 @@ class Supervisor:
             # asyncio.run() cancels the main task on the first Ctrl+C. Treat
             # that cancellation as an intentional shutdown so the runner can
             # return normally after this method's cleanup completes.
+            _LOGGER.info("runtime_stopping reason=cancelled")
             return 0
         except Exception as error:
+            _LOGGER.exception("runtime_startup_failed error=%s", error)
             notifier = self._runtime_notifier
             if notifier is not None:
                 try:
@@ -135,6 +152,7 @@ class Supervisor:
                 await _maybe_await(getattr(gateway, "close", None))
             if writer is not None:
                 await writer.close()
+            _LOGGER.info("runtime_stopped")
 
     async def _build_runtime(
         self,
@@ -143,16 +161,19 @@ class Supervisor:
         # boundary, so the v1 ten-table schema is an invariant of every run.
         initialize_database(self._config.database.path)
         check_database_integrity(self._config.database.path)
+        _LOGGER.info("component_initialized component=database")
         writer = DatabaseWriter(
             self._config.database.path,
             queue_size=self._config.database.writer_queue_capacity,
             busy_timeout_ms=self._config.database.busy_timeout_ms,
         )
         await writer.start()
+        _LOGGER.info("component_initialized component=database_writer")
         catalog = CatalogRepository(self._config.database.path, writer)
         relations = RelationRepository(self._config.database.path, writer)
         signals = SignalRepository(self._config.database.path, writer)
         system_events = SystemEventRepository(self._config.database.path, writer)
+        _LOGGER.info("component_initialized component=repositories")
         notifier = self._provided_notifier or Notifier(
             terminal=self._terminal,
             desktop=(
@@ -164,6 +185,7 @@ class Supervisor:
             clock_ms=self._clock_ms,
         )
         self._runtime_notifier = notifier
+        _LOGGER.info("component_initialized component=notifier")
         changes = MarketChangeQueue(
             self._config.runtime.market_change_queue_capacity,
             record_system_event=lambda overflow: self._record_overflow(
@@ -171,12 +193,14 @@ class Supervisor:
             ),
             notify=lambda overflow: self._notify_overflow(notifier, overflow),
         )
+        _LOGGER.info("component_initialized component=market_change_queue")
         gateway = self._provided_gateway
         if gateway is None:
             # This is the one and only Polymarket integration boundary.
             from predmarket.polymarket.gateway import PolymarketGateway
 
             gateway = PolymarketGateway()
+        _LOGGER.info("component_initialized component=gateway")
         if self._sync_task_factory is None:
             from predmarket.catalog.sync import SyncMarketTask
 
@@ -195,6 +219,7 @@ class Supervisor:
                 system_events=system_events,
                 clock_ms=self._clock_ms,
             )
+        _LOGGER.info("component_initialized component=sync_task")
         subscription_generation = _SubscriptionGenerationSource()
         router = _SignalManagerRouter(
             signals, notifier, self._clock_ms, subscription_generation
@@ -231,6 +256,7 @@ class Supervisor:
                     clock_ms=self._clock_ms,
                 ),
             )
+        _LOGGER.info("component_initialized component=watch_task")
         cache = getattr(watch, "cache", None)
         if isinstance(cache, OrderBookCache):
             subscription_generation.bind(cache)

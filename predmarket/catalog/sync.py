@@ -95,6 +95,7 @@ class SyncResult:
     complete: bool
     events_seen: int
     markets_seen: int
+    markets_persisted: int
     tokens_seen: int
     changes_published: int
     changes_dropped: int
@@ -225,6 +226,7 @@ class SyncMarketTask:
                 generation=generation,
                 occurred_at=occurred_at,
             )
+            markets_persisted = len(partial.markets)
             if partial.events or partial.markets or partial.tokens:
                 await self._catalog.save_catalog(
                     events=partial.events,
@@ -259,11 +261,21 @@ class SyncMarketTask:
                     failed_change_ids=(),
                     cursor_persistence_failed=True,
                 )
+            _LOGGER.error(
+                "sync_incomplete sync_generation=%s markets_seen=%d "
+                "markets_persisted=%d tokens_seen=%d error=%s",
+                generation,
+                len(snapshots),
+                markets_persisted,
+                sum(len(item.tokens) for item in snapshots),
+                error_message,
+            )
             return SyncResult(
                 sync_generation=generation,
                 complete=False,
                 events_seen=len(events),
                 markets_seen=len(snapshots),
+                markets_persisted=markets_persisted,
                 tokens_seen=sum(len(item.tokens) for item in snapshots),
                 changes_published=0,
                 changes_dropped=0,
@@ -290,6 +302,7 @@ class SyncMarketTask:
             markets=prepared.markets,
             tokens=prepared.tokens,
         )
+        markets_persisted = len(prepared.markets)
         published = 0
         dropped = 0
         admitted: list[tuple[MarketChange, tuple[str, ...]]] = []
@@ -350,11 +363,23 @@ class SyncMarketTask:
                     ],
                 },
             )
+        _LOGGER.info(
+            "sync_completed sync_generation=%s markets_seen=%d "
+            "markets_persisted=%d tokens_seen=%d changes_published=%d "
+            "changes_dropped=%d",
+            generation,
+            len(snapshots),
+            markets_persisted,
+            sum(len(item.tokens) for item in snapshots),
+            published,
+            dropped,
+        )
         return SyncResult(
             sync_generation=generation,
             complete=True,
             events_seen=len(events),
             markets_seen=len(snapshots),
+            markets_persisted=markets_persisted,
             tokens_seen=sum(len(item.tokens) for item in snapshots),
             changes_published=published,
             changes_dropped=dropped,
