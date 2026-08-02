@@ -22,7 +22,7 @@ from predmarket.persistence.repositories import (
     CatalogSnapshot,
     SystemEventRepository,
 )
-from predmarket.polymarket.gateway import MarketSnapshot
+from predmarket.polymarket.gateway import MarketMappingWarning, MarketSnapshot
 
 
 T = TypeVar("T")
@@ -102,6 +102,8 @@ class SyncResult:
     degraded: bool = False
     publication_marker_failures: int = 0
     cursor_persistence_failed: bool = False
+    skipped_market_ids: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 class SyncMarketTask:
@@ -157,6 +159,7 @@ class SyncMarketTask:
         errors: list[str] = []
         events: list[Event] = []
         snapshots: list[MarketSnapshot] = []
+        market_warnings: tuple[MarketMappingWarning, ...] = ()
 
         try:
             raw_events = await self._gateway.list_active_events()
@@ -169,6 +172,7 @@ class SyncMarketTask:
 
         try:
             raw_snapshots = await self._gateway.list_active_markets()
+            market_warnings = _gateway_market_mapping_warnings(self._gateway)
         except Exception as error:
             errors.append(_error_text("market request failed", error))
         else:
@@ -208,6 +212,7 @@ class SyncMarketTask:
                 events=events,
                 snapshots=snapshots,
                 previous=previous,
+                skipped_market_ids={warning.market_id for warning in market_warnings},
             )
             if validation_error is not None:
                 errors.append(validation_error)
@@ -265,6 +270,10 @@ class SyncMarketTask:
                 error=error_message,
                 degraded=self._degraded,
                 cursor_persistence_failed=cursor_error is not None,
+                skipped_market_ids=tuple(
+                    warning.market_id for warning in market_warnings
+                ),
+                warnings=tuple(warning.error for warning in market_warnings),
             )
 
         prepared = _prepare_complete(
@@ -323,6 +332,24 @@ class SyncMarketTask:
                 failed_change_ids=tuple(failed_change_ids),
                 cursor_persistence_failed=cursor_error is not None,
             )
+        if market_warnings:
+            await self._system_events.append(
+                component="SYNC",
+                severity="WARNING",
+                event_type="SYNC_MARKET_SKIPPED",
+                message="Malformed markets were skipped from the sync catalog",
+                occurred_at=occurred_at,
+                details={
+                    "sync_generation": generation,
+                    "markets": [
+                        {
+                            "market_id": warning.market_id,
+                            "error": warning.error,
+                        }
+                        for warning in market_warnings
+                    ],
+                },
+            )
         return SyncResult(
             sync_generation=generation,
             complete=True,
@@ -334,6 +361,10 @@ class SyncMarketTask:
             degraded=self._degraded,
             publication_marker_failures=len(marker_errors),
             cursor_persistence_failed=cursor_error is not None,
+            skipped_market_ids=tuple(
+                warning.market_id for warning in market_warnings
+            ),
+            warnings=tuple(warning.error for warning in market_warnings),
         )
 
     async def _record_publication_marker(
@@ -495,6 +526,21 @@ def _validated_snapshots(
     return snapshots, None
 
 
+def _gateway_market_mapping_warnings(
+    gateway: object,
+) -> tuple[MarketMappingWarning, ...]:
+    values = getattr(gateway, "market_mapping_warnings", ())
+    if values is None or isinstance(values, (str, bytes)):
+        raise ValueError("market mapping warnings collection is invalid")
+    try:
+        materialized = tuple(values)
+    except TypeError as error:
+        raise ValueError("market mapping warnings collection is invalid") from error
+    if any(not isinstance(value, MarketMappingWarning) for value in materialized):
+        raise ValueError("market mapping warning entity failed validation")
+    return materialized
+
+
 async def _refresh_missing_markets(
     *,
     gateway: _Gateway,
@@ -557,7 +603,9 @@ def _validate_complete_source(
     events: Sequence[Event],
     snapshots: Sequence[MarketSnapshot],
     previous: CatalogSnapshot,
+    skipped_market_ids: Iterable[str] = (),
 ) -> str | None:
+    skipped_ids = set(skipped_market_ids)
     event_ids = {event.id for event in events}
     old_event_ids = {event.id for event in previous.events}
     markets_by_event: dict[str, list[str]] = defaultdict(list)
@@ -579,12 +627,13 @@ def _validate_complete_source(
         markets_by_event[market.event_id].append(market.id)
     for event in events:
         if not markets_by_event[event.id]:
-            return f"active event {event.id} has no parsed market"
+            if not skipped_ids.intersection(event.market_ids):
+                return f"active event {event.id} has no parsed market"
         known_market_ids = (
             set(markets_by_event[event.id])
             | old_market_ids_by_event[event.id]
         )
-        unknown_market_ids = set(event.market_ids) - known_market_ids
+        unknown_market_ids = set(event.market_ids) - known_market_ids - skipped_ids
         if unknown_market_ids:
             unknown = sorted(unknown_market_ids, key=_utf8)[0]
             return (
@@ -719,9 +768,12 @@ def _prepare_complete(
             )
         else:
             event = incoming
+        market_ids = tuple(market_ids_by_event[event_id])
+        if not market_ids:
+            continue
         final_events[event_id] = replace(
             event,
-            market_ids=tuple(market_ids_by_event[event_id]),
+            market_ids=market_ids,
             sync_generation=generation,
             sync_generation_complete=True,
             created_at=old.created_at if old is not None else occurred_at,

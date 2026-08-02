@@ -20,6 +20,7 @@ from predmarket.persistence.writer import DatabaseWriter
 from predmarket.polymarket.gateway import (
     MAPPING_VERSION,
     GatewayMappingError,
+    MarketMappingWarning,
     MarketSnapshot,
 )
 
@@ -97,6 +98,7 @@ def _snapshot(
 class _FakeGateway:
     events: Any
     markets: Any
+    market_mapping_warnings: tuple[MarketMappingWarning, ...] = ()
     refreshed: dict[str, Any] | None = None
     refresh_delay: float = 0
     event_calls: int = 0
@@ -373,6 +375,82 @@ async def test_complete_generation_deactivates_only_missing_market(
         MarketChangeType.MARKET_DEACTIVATED
     ]
     assert queue.items[0].market_id == "market-2"
+
+
+async def test_malformed_new_market_is_skipped_without_blocking_generation(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    warning = MarketMappingWarning(
+        market_id="market-new",
+        error="market market-new: malformed events; api_response={\"id\":\"market-new\"}",
+    )
+    gateway = _FakeGateway(
+        events=(_event(("market-new",)),),
+        markets=(),
+        market_mapping_warnings=(warning,),
+    )
+    queue = _RecordingQueue()
+    task = SyncMarketTask(
+        gateway=gateway,
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 210,
+        generation_factory=lambda: "sync-skipped-new",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is True
+    assert result.skipped_market_ids == ("market-new",)
+    assert result.warnings == (warning.error,)
+    assert await catalog.get_market("market-new") is None
+    assert await catalog.get_event("event-1") is None
+    rows = await system_events.read_after(0)
+    skipped = [row for row in rows if row["event_type"] == "SYNC_MARKET_SKIPPED"]
+    assert skipped[-1]["details"] == {
+        "sync_generation": "sync-skipped-new",
+        "markets": [{"market_id": "market-new", "error": warning.error}],
+    }
+
+
+async def test_malformed_existing_market_is_retained_but_deactivated(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    await _seed(catalog, ("market-old",))
+    warning = MarketMappingWarning(
+        market_id="market-old",
+        error="market market-old: malformed events; api_response={\"id\":\"market-old\"}",
+    )
+    queue = _RecordingQueue()
+    task = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-old",)),),
+            markets=(),
+            market_mapping_warnings=(warning,),
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 220,
+        generation_factory=lambda: "sync-skipped-existing",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is True
+    retained = await catalog.get_market("market-old")
+    assert retained is not None
+    assert retained.status is MarketStatus.CLOSED
+    assert retained.active is False
+    assert retained.accepting_orders is False
+    assert retained.enable_orderbook is False
+    assert [change.change_type for change in queue.items] == [
+        MarketChangeType.MARKET_DEACTIVATED
+    ]
+    assert queue.items[0].market_id == "market-old"
 
 
 async def test_all_authoritatively_resolved_event_markets_publish_event_settled(

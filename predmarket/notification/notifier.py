@@ -18,6 +18,7 @@ from predmarket.signals.manager import SignalNotification
 _OPERATIONAL_ERROR_EVENTS = frozenset(
     {
         "SYNC_GENERATION_INCOMPLETE",
+        "SYNC_MARKET_SKIPPED",
         "RUNTIME_STARTUP_FAILED",
         "RUNTIME_TASK_EXITED",
     }

@@ -37,6 +37,22 @@ _MAX_MAPPING_RESPONSE_CHARS = 8_192
 class GatewayMappingError(ValueError):
     """The SDK returned an entity that cannot satisfy the domain contract."""
 
+    def __init__(self, message: str, *, market_id: str | None = None) -> None:
+        super().__init__(message)
+        self.market_id = market_id
+
+
+@dataclass(frozen=True, slots=True)
+class MarketMappingWarning:
+    """A malformed individual market omitted from one sync response."""
+
+    market_id: str
+    error: str
+
+    def __post_init__(self) -> None:
+        _require_string(self.market_id, "market mapping warning market id")
+        _require_string(self.error, "market mapping warning error")
+
 
 class GatewayLifecycleError(RuntimeError):
     """The pinned SDK lifecycle contract is absent or has changed."""
@@ -581,7 +597,12 @@ class PolymarketGateway:
         self._condition_id_by_market_id: dict[str, str] = {}
         self._token_identity_by_id: dict[str, tuple[str, str]] = {}
         self._token_ids_by_market_id: dict[str, frozenset[str]] = {}
+        self._market_mapping_warnings: tuple[MarketMappingWarning, ...] = ()
         self._closed = False
+
+    @property
+    def market_mapping_warnings(self) -> tuple[MarketMappingWarning, ...]:
+        return self._market_mapping_warnings
 
     async def list_active_events(self) -> tuple[Event, ...]:
         received_at = self._now()
@@ -604,19 +625,33 @@ class PolymarketGateway:
         generation = self._current_sync_generation(received_at)
         paginator = self._client.list_markets(closed=False, page_size=self._page_size)
         snapshots: list[MarketSnapshot] = []
+        warnings: list[MarketMappingWarning] = []
+        self._market_mapping_warnings = ()
         async for page in paginator:
             for sdk_market in page.items:
-                snapshot = _map_market(
-                    sdk_market,
-                    received_at=received_at,
-                    sync_generation=generation,
-                )
+                try:
+                    snapshot = _map_market(
+                        sdk_market,
+                        received_at=received_at,
+                        sync_generation=generation,
+                    )
+                except GatewayMappingError as error:
+                    if error.market_id is None:
+                        raise
+                    warnings.append(
+                        MarketMappingWarning(
+                            market_id=error.market_id,
+                            error=str(error),
+                        )
+                    )
+                    continue
                 if (
                     snapshot.market.status is MarketStatus.ACTIVE
                     and snapshot.market.active
                 ):
                     self._remember_market(snapshot)
                     snapshots.append(snapshot)
+        self._market_mapping_warnings = tuple(warnings)
         return tuple(snapshots)
 
     async def get_order_books(self, token_ids: Sequence[str]) -> tuple[OrderBook, ...]:
@@ -1155,7 +1190,8 @@ def _map_market(
     except (AttributeError, TypeError, ValueError) as error:
         raise GatewayMappingError(
             f"market {market_id}: {error}; "
-            f"api_response={_api_response_summary(sdk_market)}"
+            f"api_response={_api_response_summary(sdk_market)}",
+            market_id=market_id,
         ) from error
 
 
