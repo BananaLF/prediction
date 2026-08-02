@@ -61,21 +61,22 @@ def _seed_doctor_issue(path: Path) -> None:
                 neg_risk_conversion_supported, market_ids_json,
                 sync_generation, sync_generation_complete, created_at, updated_at
             ) VALUES ('event-1', 'Event', 'ACTIVE', 0, 0, 0,
-                      '[]', 'sync-1', 1, 1, 1)
+                      '["market-1",1]', 'sync-1', 1, 1, 1)
             """
         )
 
 
-def test_cli_has_only_service_and_relation_command_families() -> None:
+def test_cli_has_service_inspection_migration_and_relation_commands() -> None:
     parser = _build_parser()
     action = next(item for item in parser._actions if item.dest == "command")
 
     assert set(action.choices) == {
         "run",
         "status",
-        "doctor",
         "signals",
         "relations",
+        "migrate",
+        "doctor",
     }
     assert {"trade", "order", "wallet", "auth", "login"}.isdisjoint(
         action.choices
@@ -222,3 +223,30 @@ def test_signals_list_and_show_include_canonical_market_ids(tmp_path: Path) -> N
         }
     ]
     assert json.loads(shown.getvalue())["market_ids"] == ["market-a", "market-b"]
+
+
+def test_doctor_reports_legal_orphans_without_failing(tmp_path: Path) -> None:
+    database_path = tmp_path / "doctor.sqlite3"
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO markets (
+                id, event_id, condition_id, question, status, active,
+                accepting_orders, enable_orderbook, neg_risk,
+                neg_risk_member_complete, sync_generation,
+                sync_generation_complete, created_at, updated_at
+            ) VALUES ('market-orphan', NULL, 'condition-orphan', 'Orphan?',
+                      'ACTIVE', 1, 1, 1, 0, 0, 'sync-1', 1, 1, 1)
+            """
+        )
+
+    output = StringIO()
+    assert main(
+        ["doctor", "--database", str(database_path)],
+        stdout=output,
+    ) == 0
+    report = json.loads(output.getvalue())
+    assert report["schema_version"] == 3
+    assert report["orphan_markets"] == 1
+    assert report["violations"] == []

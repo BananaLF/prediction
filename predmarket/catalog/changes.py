@@ -34,8 +34,11 @@ class MarketChange:
         _identifier(self.change_id, "change_id")
         if not isinstance(self.change_type, MarketChangeType):
             raise ValueError("change_type must be a MarketChangeType")
-        if self.change_type is MarketChangeType.EVENT_SETTLED:
+        if self.event_id is not None:
             _identifier(self.event_id, "event_id")
+        if self.change_type is MarketChangeType.EVENT_SETTLED:
+            if self.event_id is None:
+                raise ValueError("event_id is required for EVENT_SETTLED")
             if self.market_id is not None:
                 _identifier(self.market_id, "market_id")
         elif self.event_id is not None:

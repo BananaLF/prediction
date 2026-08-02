@@ -429,14 +429,12 @@ CREATE INDEX system_events_severity_occurred_at_idx
     ON system_events(severity, occurred_at);
 """
 
-# Schema v2 is supplied by the preceding market/event relation migration. Keep
-# its nullable market.event_id contract as the source for the v3 DDL so that
-# orphan markets remain valid after Decimal migration.
+# v1 is retained as the source schema for the explicit on-disk migration.
+# The only v2 structural change is that a market may temporarily have no event.
 SCHEMA_V2 = SCHEMA_V1.replace(
     "event_id TEXT NOT NULL REFERENCES events(id)",
     "event_id TEXT REFERENCES events(id)",
 )
-
 
 _SCHEMA_TABLES = (
     "events",

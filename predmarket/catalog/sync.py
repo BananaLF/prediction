@@ -309,11 +309,14 @@ class SyncMarketTask:
         for change in prepared.changes:
             if await self._changes.put(change):
                 published += 1
-                affected_market_ids = tuple(
-                    market.id
-                    for market in prepared.markets
-                    if market.event_id == change.event_id
-                )
+                if change.market_id is not None:
+                    affected_market_ids = (change.market_id,)
+                else:
+                    affected_market_ids = tuple(
+                        market.id
+                        for market in prepared.markets
+                        if market.event_id == change.event_id
+                    )
                 admitted.append((change, affected_market_ids))
             else:
                 dropped += 1
@@ -630,13 +633,8 @@ def _validate_complete_source(
     previous: CatalogSnapshot,
     skipped_market_ids: Iterable[str] = (),
 ) -> str | None:
-    skipped_ids = set(skipped_market_ids)
     event_ids = {event.id for event in events}
     old_event_ids = {event.id for event in previous.events}
-    markets_by_event: dict[str, list[str]] = defaultdict(list)
-    old_market_ids_by_event: dict[str, set[str]] = defaultdict(set)
-    for old_market in previous.markets:
-        old_market_ids_by_event[old_market.event_id].add(old_market.id)
     for snapshot in snapshots:
         market = snapshot.market
         authoritative_resolved = (
@@ -644,28 +642,15 @@ def _validate_complete_source(
             and market.resolved_at is not None
             and market.event_id in old_event_ids
         )
-        if market.event_id not in event_ids and not authoritative_resolved:
+        if (
+            market.event_id is not None
+            and market.event_id not in event_ids
+            and not authoritative_resolved
+        ):
             return (
                 f"market {market.id} references event {market.event_id} "
                 "missing from the complete generation"
             )
-        markets_by_event[market.event_id].append(market.id)
-    for event in events:
-        if not markets_by_event[event.id]:
-            if not skipped_ids.intersection(event.market_ids):
-                return f"active event {event.id} has no parsed market"
-        known_market_ids = (
-            set(markets_by_event[event.id])
-            | old_market_ids_by_event[event.id]
-        )
-        unknown_market_ids = set(event.market_ids) - known_market_ids - skipped_ids
-        if unknown_market_ids:
-            unknown = sorted(unknown_market_ids, key=_utf8)[0]
-            return (
-                f"event {event.id} declares market {unknown} "
-                "that was never parsed"
-            )
-
     old_markets = {market.id: market for market in previous.markets}
     old_tokens_by_market: dict[str, set[str]] = defaultdict(set)
     for token in previous.tokens:
@@ -673,10 +658,9 @@ def _validate_complete_source(
     for snapshot in snapshots:
         old = old_markets.get(snapshot.market.id)
         if old is not None and (
-            old.event_id != snapshot.market.event_id
-            or old.condition_id != snapshot.market.condition_id
+            old.condition_id != snapshot.market.condition_id
         ):
-            return f"market {old.id} changed event or condition identity"
+            return f"market {old.id} changed condition identity"
         old_token_ids = old_tokens_by_market.get(snapshot.market.id, set())
         new_token_ids = {token.id for token in snapshot.tokens}
         if old_token_ids and old_token_ids != new_token_ids:
@@ -720,15 +704,17 @@ def _prepare_complete(
                 updated_at=occurred_at,
             )
             continue
-        event = incoming_events.get(item.market.event_id) or old_events[
-            item.market.event_id
-        ]
+        event = None
+        if item.market.event_id is not None:
+            event = incoming_events.get(item.market.event_id) or old_events[
+                item.market.event_id
+            ]
         market = item.market
         authoritative_market_resolution = (
             market.status is MarketStatus.RESOLVED
             and market.resolved_at is not None
         )
-        if not authoritative_market_resolution and (
+        if event is not None and not authoritative_market_resolution and (
             event.status is not MarketStatus.ACTIVE
             or event.resolved_at is not None
         ):
@@ -755,7 +741,8 @@ def _prepare_complete(
 
     market_ids_by_event: dict[str, list[str]] = defaultdict(list)
     for market in final_markets.values():
-        market_ids_by_event[market.event_id].append(market.id)
+        if market.event_id is not None:
+            market_ids_by_event[market.event_id].append(market.id)
 
     final_events: dict[str, Event] = {}
     for event_id in set(old_events) | set(incoming_events):
@@ -794,8 +781,6 @@ def _prepare_complete(
         else:
             event = incoming
         market_ids = tuple(market_ids_by_event[event_id])
-        if not market_ids:
-            continue
         final_events[event_id] = replace(
             event,
             market_ids=market_ids,
@@ -862,12 +847,12 @@ def _prepare_incomplete(
     for item in snapshots:
         old_market = old_markets.get(item.market.id)
         parent_exists = (
-            item.market.event_id in incoming_events
+            item.market.event_id is None
+            or item.market.event_id in incoming_events
             or item.market.event_id in old_events
         )
         identity_is_stable = old_market is None or (
-            old_market.event_id == item.market.event_id
-            and old_market.condition_id == item.market.condition_id
+            old_market.condition_id == item.market.condition_id
         )
         token_identity_is_stable = all(
             token.id not in old_tokens
@@ -925,19 +910,23 @@ def _prepare_incomplete(
 
     all_market_ids_by_event: dict[str, set[str]] = defaultdict(set)
     for old in previous.markets:
-        all_market_ids_by_event[old.event_id].add(old.id)
+        if old.event_id is not None:
+            all_market_ids_by_event[old.event_id].add(old.id)
     for market in market_upserts.values():
-        all_market_ids_by_event[market.event_id].add(market.id)
+        if market.event_id is not None:
+            all_market_ids_by_event[market.event_id].add(market.id)
 
     event_upserts: dict[str, Event] = {}
     affected_event_ids = set(incoming_events)
-    affected_event_ids.update(market.event_id for market in market_upserts.values())
+    affected_event_ids.update(
+        market.event_id
+        for market in market_upserts.values()
+        if market.event_id is not None
+    )
     for event_id in affected_event_ids:
         old = old_events.get(event_id)
         incoming = incoming_events.get(event_id)
         market_ids = all_market_ids_by_event[event_id]
-        if not market_ids:
-            continue
         if incoming is None:
             if old is None:
                 continue
@@ -971,13 +960,14 @@ def _prepare_incomplete(
             updated_at=occurred_at,
         )
 
-    # A new market is safe only when its parent event can be stored in the same
-    # transaction. Existing parents are included above to preserve dual-write.
+    # A linked new market is safe only when its parent event can be stored in
+    # the same transaction. Existing parents are included above to preserve
+    # dual-write; orphan markets have no parent prerequisite.
     permitted_event_ids = set(event_upserts)
     market_upserts = {
         market_id: market
         for market_id, market in market_upserts.items()
-        if market.event_id in permitted_event_ids
+        if market.event_id is None or market.event_id in permitted_event_ids
     }
     permitted_market_ids = set(market_upserts)
     token_upserts = {
@@ -1048,11 +1038,17 @@ def _catalog_changes(
         old = old_markets.get(market_id)
         old_watchable = old is not None and _watchable(old)
         watchable = _watchable(market)
-        old_event = None if old is None else old_events.get(old.event_id)
+        old_event = (
+            None
+            if old is None or old.event_id is None
+            else old_events.get(old.event_id)
+        )
         prior_generation_incomplete = old is not None and (
             not old.sync_generation_complete
-            or old_event is None
-            or not old_event.sync_generation_complete
+            or (
+                old_event is not None
+                and not old_event.sync_generation_complete
+            )
             or any(
                 not token.sync_generation_complete
                 for token in old_tokens_by_market[market_id]
@@ -1074,23 +1070,38 @@ def _catalog_changes(
         elif not old_watchable and watchable:
             change_type = MarketChangeType.MARKET_ADDED
         elif watchable and old is not None:
-            event = events[market.event_id]
+            event = (
+                None
+                if market.event_id is None
+                else events.get(market.event_id)
+            )
             market_changed = _market_signature(old) != _market_signature(market)
             event_changed = (
-                old_event is None
-                or _event_signature(old_event) != _event_signature(event)
+                (old_event is None) != (event is None)
+                or (
+                    old_event is not None
+                    and event is not None
+                    and _event_signature(old_event) != _event_signature(event)
+                )
             )
             token_changed = _token_signatures(
                 old_tokens_by_market[market_id]
             ) != _token_signatures(market_tokens)
             if market_changed or event_changed or token_changed:
                 change_type = MarketChangeType.MARKET_UPDATED
+                event_critical_changed = (
+                    (old_event is None) != (event is None)
+                    or (
+                        old_event is not None
+                        and event is not None
+                        and _event_critical_signature(old_event)
+                        != _event_critical_signature(event)
+                    )
+                )
                 critical = (
                     _market_critical_signature(old)
                     != _market_critical_signature(market)
-                    or old_event is None
-                    or _event_critical_signature(old_event)
-                    != _event_critical_signature(event)
+                    or event_critical_changed
                     or token_changed
                 )
         if change_type is not None:

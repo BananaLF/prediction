@@ -56,13 +56,14 @@ class CatalogRepository:
         async def command(connection: aiosqlite.Connection) -> None:
             affected_event_ids = {event.id for event in materialized_events}
             for market in materialized_markets:
-                affected_event_ids.add(market.event_id)
+                if market.event_id is not None:
+                    affected_event_ids.add(market.event_id)
                 cursor = await connection.execute(
                     "SELECT event_id FROM markets WHERE id = ?",
                     (market.id,),
                 )
                 row = await cursor.fetchone()
-                if row is not None:
+                if row is not None and row[0] is not None:
                     affected_event_ids.add(row[0])
             for event in materialized_events:
                 await connection.execute(_UPSERT_EVENT, _event_values(event))
@@ -74,7 +75,7 @@ class CatalogRepository:
                 affected_event_ids,
                 key=lambda value: value.encode("utf-8"),
             ):
-                await _validate_stored_event_markets(connection, event_id)
+                await _rebuild_event_market_ids(connection, event_id)
 
         await self._writer.execute(command)
 
@@ -83,7 +84,7 @@ class CatalogRepository:
 
         async def command(connection: aiosqlite.Connection) -> None:
             await connection.execute(_UPSERT_EVENT, _event_values(event))
-            await _validate_event_markets(connection, event.id, event.market_ids)
+            await _rebuild_event_market_ids(connection, event.id)
 
         await self._writer.execute(command)
 
@@ -91,16 +92,25 @@ class CatalogRepository:
         _require_type(market, Market, "market")
 
         async def command(connection: aiosqlite.Connection) -> None:
-            await connection.execute(_UPSERT_MARKET, _market_values(market))
             cursor = await connection.execute(
-                "SELECT market_ids_json FROM events WHERE id = ?",
-                (market.event_id,),
+                "SELECT event_id FROM markets WHERE id = ?",
+                (market.id,),
             )
             row = await cursor.fetchone()
-            if row is None:
-                raise ValueError(f"event {market.event_id!r} does not exist")
-            expected = tuple(json.loads(row[0]))
-            await _validate_event_markets(connection, market.event_id, expected)
+            old_event_id = None if row is None else row[0]
+            if market.event_id is not None:
+                cursor = await connection.execute(
+                    "SELECT 1 FROM events WHERE id = ?",
+                    (market.event_id,),
+                )
+                if await cursor.fetchone() is None:
+                    raise ValueError(f"event {market.event_id!r} does not exist")
+            await connection.execute(_UPSERT_MARKET, _market_values(market))
+            for event_id in sorted(
+                {value for value in (old_event_id, market.event_id) if value is not None},
+                key=lambda value: value.encode("utf-8"),
+            ):
+                await _rebuild_event_market_ids(connection, event_id)
 
         await self._writer.execute(command)
 
@@ -160,6 +170,25 @@ class CatalogRepository:
             markets=tuple(_market_from_row(row) for row in market_rows),
             tokens=tuple(_token_from_row(row) for row in token_rows),
         )
+
+    async def has_watchable_catalog(self) -> bool:
+        """Return whether committed rows can provide at least one watch token."""
+        row = await _fetch_one(
+            self._path,
+            """
+            SELECT 1
+            FROM markets
+            JOIN tokens ON tokens.market_id = markets.id
+            WHERE markets.status = 'ACTIVE'
+              AND markets.active = 1
+              AND markets.accepting_orders = 1
+              AND markets.enable_orderbook = 1
+              AND markets.resolved_at IS NULL
+            LIMIT 1
+            """,
+            (),
+        )
+        return row is not None
 
 
 class RelationRepository:
@@ -846,7 +875,7 @@ def _event_values(event: Event) -> tuple[Any, ...]:
             else _encode_json_object(event.neg_risk_metadata)
         ),
         event.neg_risk_synced_at,
-        _encode_ids(event.market_ids),
+        _encode_ids(event.market_ids, allow_empty=True),
         event.sync_generation,
         int(event.sync_generation_complete),
         event.start_at,
@@ -1036,9 +1065,9 @@ def _relation_from_row(row: aiosqlite.Row) -> Relation:
     )
 
 
-def _encode_ids(values: Sequence[str]) -> str:
+def _encode_ids(values: Sequence[str], *, allow_empty: bool = False) -> str:
     materialized = tuple(values)
-    if not materialized or any(
+    if (not allow_empty and not materialized) or any(
         not isinstance(value, str) or not value for value in materialized
     ):
         raise ValueError("ID arrays must contain non-empty strings")
@@ -1109,11 +1138,16 @@ def _require_type(value: Any, item_type: type[Any], field_name: str) -> None:
         raise ValueError(f"{field_name} must be a {item_type.__name__}")
 
 
-async def _validate_event_markets(
+async def _rebuild_event_market_ids(
     connection: aiosqlite.Connection,
     event_id: str,
-    expected: tuple[str, ...],
 ) -> None:
+    cursor = await connection.execute(
+        "SELECT 1 FROM events WHERE id = ?",
+        (event_id,),
+    )
+    if await cursor.fetchone() is None:
+        raise ValueError(f"event {event_id!r} does not exist")
     cursor = await connection.execute(
         """
         SELECT id FROM markets
@@ -1123,25 +1157,9 @@ async def _validate_event_markets(
         (event_id,),
     )
     actual = tuple(row[0] for row in await cursor.fetchall())
-    if actual != expected:
-        raise ValueError(f"event {event_id!r} market_ids do not match its markets")
-
-
-async def _validate_stored_event_markets(
-    connection: aiosqlite.Connection,
-    event_id: str,
-) -> None:
-    cursor = await connection.execute(
-        "SELECT market_ids_json FROM events WHERE id = ?",
-        (event_id,),
-    )
-    row = await cursor.fetchone()
-    if row is None:
-        raise ValueError(f"event {event_id!r} does not exist")
-    await _validate_event_markets(
-        connection,
-        event_id,
-        tuple(json.loads(row[0])),
+    await connection.execute(
+        "UPDATE events SET market_ids_json = ? WHERE id = ?",
+        (_encode_ids(actual, allow_empty=True), event_id),
     )
 
 

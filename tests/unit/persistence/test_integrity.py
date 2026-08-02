@@ -223,7 +223,7 @@ def test_doctor_reports_structural_findings_after_version_mismatch(
     database_path = tmp_path / "market.db"
     _seed_valid_database(database_path)
     with sqlite3.connect(database_path) as connection:
-        connection.execute("PRAGMA user_version = 2")
+        connection.execute("PRAGMA user_version = 1")
         connection.execute("DROP TABLE events")
 
     payload = run_database_doctor(database_path).to_payload()
@@ -284,7 +284,6 @@ def test_integrity_reports_stable_error_for_incomplete_schema_v3(
     "invalid_json",
     [
         '"market-1"',
-        "[]",
         '["market-1",1]',
         '["market-1","market-1"]',
         '["market-2","market-1"]',
@@ -310,6 +309,23 @@ def test_integrity_rejects_invalid_id_arrays(
         if table == "events"
         else "SIGNAL_MARKET_IDS_INVALID",
     )
+
+
+def test_integrity_accepts_an_event_without_markets(tmp_path: Path) -> None:
+    database_path = tmp_path / "market.db"
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO events (
+                id, title, status, neg_risk, neg_risk_complete,
+                neg_risk_conversion_supported, market_ids_json,
+                sync_generation, sync_generation_complete, created_at, updated_at
+            ) VALUES ('event-empty', 'Event', 'ACTIVE', 0, 0, 0, '[]', 'sync-1', 1, 1, 1)
+            """
+        )
+
+    check_database_integrity(database_path)
 
 
 def test_integrity_rejects_event_market_dual_write_mismatch(tmp_path: Path) -> None:

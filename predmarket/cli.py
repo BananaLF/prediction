@@ -21,7 +21,11 @@ from predmarket.catalog.relations import (
 from predmarket.config import AppConfig
 from predmarket.domain.decimal import encode_decimal
 from predmarket.domain.relation import Relation
-from predmarket.persistence.integrity import run_database_doctor
+from predmarket.persistence.integrity import (
+    database_diagnostics,
+    run_database_doctor,
+)
+from predmarket.persistence.migration import migrate_database
 
 
 _LOG_LEVEL_NAMES = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -38,9 +42,31 @@ def main(
 ) -> int:
     parser = _build_parser()
     arguments = parser.parse_args(_normalize_config_position(argv))
-    config = AppConfig.load(arguments.config)
     output = sys.stdout if stdout is None else stdout
     clock = now_ms or (lambda: time.time_ns() // 1_000_000)
+
+    if arguments.command == "migrate":
+        migrate_database(
+            arguments.database,
+            arguments.backup,
+            target_version=arguments.target_version,
+        )
+        _write_json(
+            output,
+            {
+                "backup": str(arguments.backup),
+                "database": str(arguments.database),
+                "schema_version": arguments.target_version,
+            },
+        )
+        return 0
+
+    if arguments.command == "doctor" and arguments.database is not None:
+        diagnostics = database_diagnostics(arguments.database)
+        _write_json(output, diagnostics)
+        return 0 if not diagnostics["violations"] else 1
+
+    config = AppConfig.load(arguments.config)
 
     if arguments.command == "run":
         _configure_logging(
@@ -165,9 +191,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="runtime logging level",
     )
     commands.add_parser("status", help="show local service database status")
-    commands.add_parser(
+    migrate = commands.add_parser(
+        "migrate",
+        help="explicitly migrate a legacy database schema",
+    )
+    migrate.add_argument("--to", dest="target_version", type=int, required=True)
+    migrate.add_argument("--database", type=Path, required=True)
+    migrate.add_argument("--backup", type=Path, required=True)
+    doctor = commands.add_parser(
         "doctor",
         help="check database structure and persisted data without modifying it",
+    )
+    doctor.add_argument(
+        "--database",
+        type=Path,
+        help="database path override; otherwise use the configured database",
     )
     signals = commands.add_parser("signals", help="inspect persisted signals")
     signal_commands = signals.add_subparsers(dest="signals_command", required=True)

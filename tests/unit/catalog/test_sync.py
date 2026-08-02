@@ -372,6 +372,73 @@ async def test_complete_generation_drains_gateway_and_commits_before_publish(
     assert all(token.sync_generation_complete for token in stored.tokens)
 
 
+async def test_complete_generation_accepts_orphan_markets_and_empty_events(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    orphan = _snapshot("market-orphan")
+    orphan = replace(
+        orphan,
+        market=replace(orphan.market, event_id=None),
+    )
+    queue = _RecordingQueue(catalog)
+    task = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(()),),
+            markets=(orphan,),
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 105,
+        generation_factory=lambda: "sync-orphan-complete",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is True
+    stored_event = await catalog.get_event("event-1")
+    stored_market = await catalog.get_market("market-orphan")
+    assert stored_event is not None
+    assert stored_event.market_ids == ()
+    assert stored_market is not None
+    assert stored_market.event_id is None
+    assert [(change.change_type, change.event_id, change.market_id) for change in queue.items] == [
+        (MarketChangeType.MARKET_ADDED, None, "market-orphan")
+    ]
+
+
+async def test_incomplete_generation_persists_orphan_market_snapshot(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    orphan = _snapshot("market-orphan")
+    orphan = replace(
+        orphan,
+        market=replace(orphan.market, event_id=None),
+    )
+    task = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=RuntimeError("event request failed"),
+            markets=(orphan,),
+        ),
+        catalog=catalog,
+        changes=_RecordingQueue(),
+        system_events=system_events,
+        clock_ms=lambda: 106,
+        generation_factory=lambda: "sync-orphan-incomplete",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is False
+    stored_market = await catalog.get_market("market-orphan")
+    assert stored_market is not None
+    assert stored_market.event_id is None
+    assert stored_market.sync_generation == "sync-orphan-incomplete"
+    assert stored_market.sync_generation_complete is False
+
+
 async def test_complete_generation_deactivates_only_missing_market(
     catalog_runtime,
 ) -> None:
@@ -435,7 +502,9 @@ async def test_malformed_new_market_is_skipped_without_blocking_generation(
     assert result.skipped_market_ids == ("market-new",)
     assert result.warnings == (warning.error,)
     assert await catalog.get_market("market-new") is None
-    assert await catalog.get_event("event-1") is None
+    stored_event = await catalog.get_event("event-1")
+    assert stored_event is not None
+    assert stored_event.market_ids == ()
     rows = await system_events.read_after(0)
     skipped = [row for row in rows if row["event_type"] == "SYNC_MARKET_SKIPPED"]
     assert skipped[-1]["details"] == {
@@ -679,7 +748,7 @@ async def test_closed_unresolved_market_is_refreshed_until_later_resolution(
     ]
 
 
-async def test_complete_generation_rejects_unknown_declared_event_member(
+async def test_complete_generation_rebuilds_stale_event_market_members(
     catalog_runtime,
 ) -> None:
     catalog, system_events = catalog_runtime
@@ -698,12 +767,14 @@ async def test_complete_generation_rejects_unknown_declared_event_member(
 
     result = await task.run_once()
 
-    assert result.complete is False
-    assert "market-never-parsed" in result.error
+    assert result.complete is True
+    stored_event = await catalog.get_event("event-1")
+    assert stored_event is not None
+    assert stored_event.market_ids == ("market-1",)
     stored = await catalog.get_market("market-1")
     assert stored is not None
-    assert stored.sync_generation_complete is False
-    assert queue.items == []
+    assert stored.sync_generation_complete is True
+    assert [change.market_id for change in queue.items] == ["market-1"]
 
 
 async def test_incomplete_generation_never_creates_complete_neg_risk_proof(

@@ -675,7 +675,7 @@ async def test_relation_analysis_rejects_string_subclass_digest_before_admission
     assert trap.calls == 0
 
 
-async def test_catalog_single_entity_write_cannot_break_event_market_consistency(
+async def test_catalog_single_entity_write_rebuilds_event_market_consistency(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "market.db"
@@ -726,21 +726,22 @@ async def test_catalog_single_entity_write_cannot_break_event_market_consistency
             tokens=(),
         )
         assert (await catalog.get_market("market-1")).question == "Updated question?"  # type: ignore[union-attr]
-        with pytest.raises(ValueError, match="market_ids"):
-            await catalog.save_market(extra_market)
-        with pytest.raises(ValueError, match="market_ids"):
-            await catalog.save_catalog(
-                events=(),
-                markets=(extra_market,),
-                tokens=(),
-            )
+        await catalog.save_market(extra_market)
+        await catalog.save_catalog(
+            events=(),
+            markets=(replace(extra_market, question="Updated second question?"),),
+            tokens=(),
+        )
+        stored_event = await catalog.get_event(event.id)
+        assert stored_event is not None
+        assert stored_event.market_ids == ("market-1", "market-2")
     finally:
         await writer.close()
 
     assert await CatalogRepository(
         database_path,
         DatabaseWriter(database_path),
-    ).get_market("market-2") is None
+    ).get_market("market-2") is not None
 
 
 async def test_system_and_signal_repositories_use_writer_and_short_reads(

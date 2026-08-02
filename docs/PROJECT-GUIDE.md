@@ -86,8 +86,17 @@ Decimal-valued SQLite columns use `TEXT`, not IEEE-754 `REAL`. New writes use a
 canonical plain-decimal string: no exponent notation, plus sign, leading or
 trailing redundant zeroes, or negative zero. There is no fixed scale, so prices,
 quantities, fees, and risk values retain arbitrarily long fractional parts in
-Python's `Decimal` type. Schema v2 migration normalizes legacy spellings before
+Python's `Decimal` type. The v2-to-v3 migration normalizes legacy spellings before
 the rows enter v3; reads accept legacy Decimal spellings at the compatibility
 boundary and return `Decimal`. Fee-schedule parameters use the same canonical
 strings inside JSON. Decimal columns are not used as numeric SQLite indexes,
 because their `TEXT` ordering is lexical rather than numeric.
+
+`markets.event_id` is nullable because an upstream market may be valid even
+when its event response is absent. `events.market_ids` is a derived reverse
+index rebuilt from locally stored markets; an event may therefore have an
+empty list. A market without an event is not a database integrity violation.
+During startup, an incomplete sync does not block `Watch` when the committed
+database already contains at least one active, orderbook-enabled market with a
+token. Sync remains a degraded background task until a complete generation is
+available.
