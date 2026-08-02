@@ -177,8 +177,116 @@ class DatabaseIntegrityError(RuntimeError):
         )
 
 
+def database_diagnostics(path: Path) -> dict[str, object]:
+    """Return a read-only health report without treating orphan markets as errors."""
+    database_path = Path(path)
+    try:
+        check_database_integrity(database_path)
+    except DatabaseIntegrityError as error:
+        violations = list(error.violations)
+    else:
+        violations = []
+
+    connection = sqlite3.connect(
+        f"file:{database_path}?mode=ro",
+        uri=True,
+    )
+    try:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        sqlite_integrity = [
+            row[0] for row in connection.execute("PRAGMA integrity_check")
+        ]
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+        tables = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_schema
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
+        counts: dict[str, int] = {
+            "orphan_markets": 0,
+            "events_without_markets": 0,
+            "watchable_markets": 0,
+            "watchable_tokens": 0,
+        }
+        generations: list[dict[str, object]] = []
+        if {"events", "markets", "tokens"}.issubset(tables):
+            counts["orphan_markets"] = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM markets WHERE event_id IS NULL"
+                ).fetchone()[0]
+            )
+            counts["events_without_markets"] = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM events AS events
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM markets WHERE markets.event_id = events.id
+                    )
+                    """
+                ).fetchone()[0]
+            )
+            counts["watchable_markets"] = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM markets
+                    WHERE status = 'ACTIVE' AND active = 1
+                      AND accepting_orders = 1 AND enable_orderbook = 1
+                      AND resolved_at IS NULL
+                    """
+                ).fetchone()[0]
+            )
+            counts["watchable_tokens"] = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM tokens
+                    JOIN markets ON markets.id = tokens.market_id
+                    WHERE markets.status = 'ACTIVE' AND markets.active = 1
+                      AND markets.accepting_orders = 1
+                      AND markets.enable_orderbook = 1
+                      AND markets.resolved_at IS NULL
+                    """
+                ).fetchone()[0]
+            )
+            generations = [
+                {
+                    "generation": row[0],
+                    "complete": bool(row[1]),
+                    "rows": int(row[2]),
+                }
+                for row in connection.execute(
+                    """
+                    SELECT sync_generation, MIN(sync_generation_complete), COUNT(*)
+                    FROM (
+                        SELECT sync_generation, sync_generation_complete FROM events
+                        UNION ALL
+                        SELECT sync_generation, sync_generation_complete FROM markets
+                        UNION ALL
+                        SELECT sync_generation, sync_generation_complete FROM tokens
+                    )
+                    GROUP BY sync_generation
+                    ORDER BY CAST(sync_generation AS BLOB)
+                    """
+                )
+            ]
+        return {
+            "database": str(database_path),
+            "schema_version": version,
+            "sqlite_integrity": "ok" if sqlite_integrity == ["ok"] else sqlite_integrity,
+            "foreign_keys": "ok" if not foreign_key_errors else "failed",
+            "violations": violations,
+            **counts,
+            "sync_generations": generations,
+        }
+    finally:
+        connection.close()
+
+
 def check_database_integrity(path: Path) -> None:
-    """Raise with stable violation codes when a schema-v1 database is unsafe."""
+    """Raise with stable violation codes when a schema-v2 database is unsafe."""
     collector = _collect_database_findings(path, include_semantic=True)
     if collector.violations:
         raise DatabaseIntegrityError(collector.violations)
@@ -300,7 +408,7 @@ def _check_id_arrays(
     for row in connection.execute(
         "SELECT id, market_ids_json FROM events ORDER BY CAST(id AS BLOB)"
     ):
-        market_ids = _canonical_id_array(row["market_ids_json"])
+        market_ids = _canonical_id_array(row["market_ids_json"], allow_empty=True)
         if market_ids is None:
             _add(
                 violations,
@@ -701,14 +809,18 @@ def _check_revision_payloads(
             )
 
 
-def _canonical_id_array(encoded: Any) -> tuple[str, ...] | None:
+def _canonical_id_array(
+    encoded: Any,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...] | None:
     if not isinstance(encoded, str):
         return None
     try:
         values = json.loads(encoded)
     except json.JSONDecodeError:
         return None
-    if not isinstance(values, list) or not values:
+    if not isinstance(values, list) or (not allow_empty and not values):
         return None
     if any(not isinstance(value, str) or not value for value in values):
         return None

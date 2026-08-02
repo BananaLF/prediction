@@ -1111,9 +1111,13 @@ def _map_market(
         outcomes = getattr(sdk_market, "outcomes")
         trading = getattr(sdk_market, "trading")
         events = tuple(getattr(sdk_market, "events"))
-        if len(events) != 1:
-            raise ValueError("events must contain exactly one event reference")
-        event_id = _require_string(getattr(events[0], "id"), "event id")
+        if len(events) > 1:
+            raise ValueError("events must contain at most one event reference")
+        event_id = (
+            None
+            if not events
+            else _require_string(getattr(events[0], "id"), "event id")
+        )
         condition_id = _require_string(
             getattr(sdk_market, "condition_id"),
             "condition id",

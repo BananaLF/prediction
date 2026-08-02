@@ -12,12 +12,40 @@ predmarket signals list --config config/default.yaml
 The default configuration is `config/default.yaml`; it stores local evidence in
 `data/predmarket-v1.sqlite3`. `run` is the long-running observer: it reads only
 public Polymarket data, writes local evidence, relations, signals, and
-operational state, initializes Schema v1, watches order books, evaluates
+operational state, initializes Schema v2, watches order books, evaluates
 strategies, and sends notifications. `status` and `signals list` are local
 SQLite reads, so use them after `run` has initialized the database. They do not
 make Polymarket requests.
 
-`run` performs only the required startup checks: Schema v1, SQLite structural
+If the first sync is incomplete because an event request fails, `run` starts
+`watch` as soon as the committed database contains a valid active market with a
+token. The sync task continues retrying and reports the incomplete generations;
+this is a degraded startup, not a database-integrity bypass.
+
+## Schema migration and diagnosis
+
+Schema v1 databases must be migrated explicitly while the service is stopped.
+The migration creates the requested backup and changes only the market/event
+relation constraint:
+
+```console
+predmarket migrate --to 2 --database data/predmarket-v1.sqlite3 --backup data/predmarket-v1.sqlite3.before-v2
+predmarket doctor --database data/predmarket-v1.sqlite3
+```
+
+`doctor` is read-only. It reports schema and SQLite integrity, orphan markets,
+events without markets, and whether the catalog has a watchable market/token.
+An orphan market is valid when its market and token data satisfy the normal
+domain constraints.
+
+Terminal output is the primary operational channel. With the default
+configuration, terminal and macOS desktop notifications are enabled; important
+conditions are also stored in `system_events`. There is no separate configured
+application log file in the default configuration. Check a running process in
+its terminal, and use `status` for the configured database, signal count, and
+system-event count.
+
+`run` performs only the required startup checks: Schema v2, SQLite structural
 integrity, foreign-key basics, and the expected project tables. It does not scan
 all persisted application payloads during startup. Use the read-only doctor for
 the full semantic scan:
