@@ -65,6 +65,8 @@ predmarket run --config config/default.yaml
 
 `predmarket run` 会读取默认配置、初始化数据库并启动长期运行的公开数据采集。停止服务后，可在另一个终端运行查询命令查看本地结果。
 
+运行状态通过 Python `logging` 输出到 `stderr`，默认级别为 `INFO`。可在启动命令中使用 `--log-level DEBUG|INFO|WARNING|ERROR|CRITICAL` 调整级别，例如 `predmarket run --config config/default.yaml --log-level DEBUG`。
+
 不使用 uv 的等价入口是：
 
 ```console

@@ -23,8 +23,9 @@ The runtime is assembled in `predmarket/app.py`:
   injected analyzer is supplied, and manually approves implication relations.
 - `Persistence` (`predmarket/persistence/`) supplies the Schema v1 repositories
   and serializes writes through `DatabaseWriter`; `Notifier`
-  (`predmarket/notification/notifier.py`) reports signal and operational events
-  to the terminal and optional macOS desktop channel.
+  (`predmarket/notification/notifier.py`) sends signal and operational events
+  to the optional macOS desktop channel. Runtime status is emitted through
+  Python `logging`.
 
 `predmarket/polymarket/gateway.py` is the only external-access boundary: it owns
 all public Polymarket REST and WebSocket access. The other components depend on
@@ -47,8 +48,8 @@ analyzer exists.
 WebSocket recovery invalidates the affected subscription generation, obtains a
 fresh REST snapshot via the gateway, and only then resumes book-based evaluation.
 The bounded market-change queue can evict or drop stale work while preserving
-critical control changes; an overflow records a `system_events` entry and sends a
-terminal notification. The affected evidence must be refreshed before it can be
+critical control changes; an overflow records a `system_events` entry and logs
+the degraded condition. The affected evidence must be refreshed before it can be
 used again. Startup, sync, metadata, order-book, strategy, and persistence
 invariant failures are all handled fail closed.
 

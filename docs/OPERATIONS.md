@@ -16,12 +16,22 @@ strategies, and sends notifications. `status` and `signals list` are local
 SQLite reads, so use them after `run` has initialized the database. They do not
 make Polymarket requests.
 
-Terminal output is the primary operational channel. With the default
-configuration, terminal and macOS desktop notifications are enabled; important
-conditions are also stored in `system_events`. There is no separate configured
-application log file in the default configuration. Check a running process in
-its terminal, and use `status` for the configured database, signal count, and
-system-event count.
+Runtime status is emitted through Python `logging` to `stderr`. The default
+level is `INFO`; use `--log-level DEBUG|INFO|WARNING|ERROR|CRITICAL` on
+`predmarket run` to change it, for example:
+
+```console
+predmarket run --config config/default.yaml --log-level DEBUG
+```
+
+The log includes component initialization, sync completion or failure
+(`markets_seen` and `markets_persisted`), the number of unique markets and
+tokens currently subscribed by the watcher, and every committed signal
+transition. `stdout` remains available for query-command JSON output. With the
+default configuration, macOS desktop notifications remain enabled and
+important conditions are also stored in `system_events`. The
+`notification.terminal_enabled` setting controls the runtime `stderr` handler;
+the notifier itself does not print terminal messages.
 
 ## Long-running recovery and shutdown
 
@@ -33,8 +43,8 @@ evaluation. Do not treat an old book as current while recovery is in progress.
 The market-change queue has a configured bound (`runtime.market_change_queue_capacity`,
 10,000 by default). On overflow, the service enters a degraded path: stale work
 may be evicted or dropped, but critical control changes are preserved. It records
-`MARKET_CHANGE_QUEUE_OVERFLOW` in `system_events` and emits a terminal
-notification; wait for fresh evidence before relying on the affected market.
+`MARKET_CHANGE_QUEUE_OVERFLOW` in `system_events` and logs the degraded
+condition; wait for fresh evidence before relying on the affected market.
 
 Inspect persisted operational events after stopping the service, or from another
 local SQLite client:

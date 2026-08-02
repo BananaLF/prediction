@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 import inspect
 import json
+import logging
 from pathlib import Path
 import time
 from typing import Any
@@ -33,6 +34,7 @@ from predmarket.persistence.repositories import SignalRepository
 
 Clock = Callable[[], int]
 StateSource = Mapping[str, Any] | Callable[[str], Any] | None
+_LOGGER = logging.getLogger(__name__)
 
 
 class SignalRevisionConflict(RuntimeError):
@@ -626,7 +628,18 @@ class SignalManager:
         return context
 
     async def _notify_after_commit(self, notification: SignalNotification) -> None:
-        if self._notifier is None or notification.event_type == "NOOP":
+        if notification.event_type == "NOOP":
+            return
+        _LOGGER.info(
+            "signal_transition signal_id=%s opportunity_key=%s event_type=%s "
+            "revision=%d strategy_type=%s",
+            notification.signal_id,
+            notification.opportunity_key,
+            notification.event_type,
+            notification.revision,
+            self._strategy_type.value,
+        )
+        if self._notifier is None:
             return
         callback = getattr(self._notifier, "notify", self._notifier)
         try:
@@ -635,6 +648,11 @@ class SignalManager:
                 await result
         except Exception:
             # Notification is deliberately outside the database transaction.
+            _LOGGER.exception(
+                "signal_notification_failed signal_id=%s event_type=%s",
+                notification.signal_id,
+                notification.event_type,
+            )
             return
 
 
