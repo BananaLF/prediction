@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -23,6 +24,7 @@ DOCUMENTS = (
     Path("README.md"),
     Path("SECURITY.md"),
     Path("STRATEGY.md"),
+    Path("docs/PRD.md"),
     Path("docs/PROJECT-GUIDE.md"),
     Path("docs/TUTORIAL.md"),
     Path("docs/OPERATIONS.md"),
@@ -35,8 +37,18 @@ def _documented_predmarket_commands() -> list[list[str]]:
     for document in DOCUMENTS:
         for line in document.read_text().splitlines():
             stripped = line.strip()
-            if stripped.startswith("python -m predmarket"):
-                commands.append(shlex.split(stripped)[3:])
+            if not (
+                stripped == "predmarket"
+                or stripped.startswith("predmarket ")
+                or stripped == "python -m predmarket"
+                or stripped.startswith("python -m predmarket ")
+            ):
+                continue
+            parts = shlex.split(stripped)
+            if parts[:1] == ["predmarket"]:
+                commands.append(parts[1:])
+            elif len(parts) >= 3 and parts[:3] == ["python", "-m", "predmarket"]:
+                commands.append(parts[3:])
     return commands
 
 
@@ -61,9 +73,18 @@ def test_documented_local_commands_parse_without_runtime_side_effects() -> None:
         parser.parse_args(_normalize_config_position(command))
 
 
-def test_documented_help_command_exits_without_network_or_database_access() -> None:
+@pytest.mark.parametrize(
+    "command",
+    ([sys.executable, "-m", "predmarket", "--help"], ["predmarket", "--help"]),
+)
+def test_documented_help_command_exits_without_network_or_database_access(
+    command: list[str],
+) -> None:
+    if command[0] == "predmarket" and shutil.which("predmarket") is None:
+        pytest.skip("predmarket console entry is not installed")
+
     result = subprocess.run(
-        [sys.executable, "-m", "predmarket", "--help"],
+        command,
         capture_output=True,
         text=True,
         check=False,
