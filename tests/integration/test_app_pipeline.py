@@ -48,6 +48,52 @@ class _Sync:
         return type("Result", (), {"complete": True})()
 
 
+class _BlockingInitialSync:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run_once(self):
+        self.started.set()
+        await self.release.wait()
+        return type("Result", (), {"complete": True})()
+
+
+class _SerialSync:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+        self.first_started = asyncio.Event()
+        self.release_first = asyncio.Event()
+        self.second_started = asyncio.Event()
+
+    async def run_once(self):
+        self.calls += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if self.calls == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            elif self.calls == 2:
+                self.second_started.set()
+            return type("Result", (), {"complete": True})()
+        finally:
+            self.active -= 1
+
+
+class _GateSleep:
+    def __init__(self) -> None:
+        self.called = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, _: float) -> None:
+        self.called.set()
+        await self.release.wait()
+        self.release.clear()
+
+
 class _SkippedInitialSync:
     async def run_once(self):
         return type(
@@ -178,16 +224,70 @@ async def test_supervisor_syncs_before_watch_and_terminates_after_watch_crash(
     with caplog.at_level(logging.INFO, logger="predmarket.app"):
         assert await supervisor.run() == 1
 
-    assert calls == ["sync", "watch-start", "watch-run", "watch-close"]
+    assert calls[:2] == ["watch-start", "watch-run"]
+    assert calls[-1] == "watch-close"
     assert output.getvalue() == ""
     assert "runtime_starting" in caplog.text
     assert "component_initialized component=database" in caplog.text
     assert "component_initialized component=watch_task" in caplog.text
+    assert "component_started component=watch_task" in caplog.text
+    assert "component_started component=sync_task" in caplog.text
     assert "runtime_started" in caplog.text
     assert "runtime_task_exited" in caplog.text
     assert "watch crashed" in caplog.text
     assert "runtime_stopped" in caplog.text
     assert events.entries == []
+
+
+@pytest.mark.asyncio
+async def test_supervisor_starts_watch_before_initial_sync_completes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    sync = _BlockingInitialSync()
+    calls: list[str] = []
+    supervisor = Supervisor(
+        _config(tmp_path),
+        gateway=object(),
+        sync_task_factory=lambda **_: sync,
+        watch_task_factory=lambda **_: _Watch(calls, crash=False),
+        sleep=_wait_for_cancellation,
+    )
+    running = asyncio.create_task(supervisor.run())
+
+    try:
+        with caplog.at_level(logging.INFO, logger="predmarket.app"):
+            await asyncio.wait_for(sync.started.wait(), timeout=1)
+            assert calls[:2] == ["watch-start", "watch-run"]
+            assert "component_started component=watch_task" in caplog.text
+            assert "component_started component=sync_task" in caplog.text
+            assert "runtime_started" in caplog.text
+    finally:
+        sync.release.set()
+        running.cancel()
+        assert await running == 0
+
+    assert calls[-1] == "watch-close"
+
+
+@pytest.mark.asyncio
+async def test_sync_forever_runs_immediately_and_serially(tmp_path: Path) -> None:
+    sync = _SerialSync()
+    sleep = _GateSleep()
+    supervisor = Supervisor(_config(tmp_path), gateway=object(), sleep=sleep)
+    task = asyncio.create_task(supervisor._sync_forever(sync, Notifier(terminal=StringIO())))
+
+    try:
+        await asyncio.wait_for(sync.first_started.wait(), timeout=1)
+        assert not sleep.called.is_set()
+        sync.release_first.set()
+        await asyncio.wait_for(sleep.called.wait(), timeout=1)
+        sleep.release.set()
+        await asyncio.wait_for(sync.second_started.wait(), timeout=1)
+        assert sync.max_active == 1
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 @pytest.mark.asyncio
@@ -256,7 +356,7 @@ async def test_supervisor_starts_watch_from_existing_catalog_during_incomplete_i
         terminal=StringIO(),
         sync_task_factory=lambda **_: _IncompleteWatchableSync(),
         watch_task_factory=lambda **_: _Watch(calls, crash=True),
-        sleep=lambda _: pytest.fail("watchable catalog should bypass sync retry"),
+        sleep=_wait_for_cancellation,
     )
 
     assert await supervisor.run() == 1
@@ -285,11 +385,11 @@ async def test_supervisor_treats_cancellation_as_normal_shutdown(tmp_path: Path)
             running.cancel()
             await running
 
-    assert calls == ["watch-close"]
+    assert calls == ["watch-start", "watch-run", "watch-close"]
 
 
 @pytest.mark.asyncio
-async def test_supervisor_notifies_startup_failure_with_constructed_default_notifier(
+async def test_supervisor_reports_background_sync_failure_with_constructed_default_notifier(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     output = StringIO()
@@ -304,7 +404,7 @@ async def test_supervisor_notifies_startup_failure_with_constructed_default_noti
     assert await supervisor.run() == 1
 
     assert output.getvalue() == ""
-    assert "runtime_startup_failed" in caplog.text
+    assert "runtime_task_exited" in caplog.text
     assert "initial sync failed" in caplog.text
 
 

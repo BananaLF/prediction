@@ -81,28 +81,16 @@ class Supervisor:
         watch: Any | None = None
         tasks: tuple[asyncio.Task[Any], ...] = ()
         try:
-            writer, gateway, notifier, catalog, sync, watch = await self._build_runtime()
-            initial = await sync.run_once()
-            await _notify_skipped_markets(notifier, initial)
-            while not initial.complete:
-                await notifier.notify(
-                    event_type="SYNC_GENERATION_INCOMPLETE",
-                    message="Initial market sync was incomplete",
-                    details={"error": getattr(initial, "error", None)},
-                )
-                if await catalog.has_watchable_catalog():
-                    break
-                await self._sleep(self._config.polymarket.sync_interval_seconds)
-                initial = await sync.run_once()
-                await _notify_skipped_markets(notifier, initial)
-
+            writer, gateway, notifier, sync, watch = await self._build_runtime()
             await watch.start()
-            _LOGGER.info("runtime_started")
+            watch_task = asyncio.create_task(watch.run(), name="WatchTask")
+            _LOGGER.info("component_started component=watch_task")
             sync_task = asyncio.create_task(
                 self._sync_forever(sync, notifier), name="SyncMarketTask"
             )
-            watch_task = asyncio.create_task(watch.run(), name="WatchTask")
-            tasks = (sync_task, watch_task)
+            _LOGGER.info("component_started component=sync_task")
+            _LOGGER.info("runtime_started")
+            tasks = (watch_task, sync_task)
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 if task.cancelled():
@@ -158,7 +146,7 @@ class Supervisor:
 
     async def _build_runtime(
         self,
-    ) -> tuple[DatabaseWriter, Any, Notifier, CatalogRepository, Any, Any]:
+    ) -> tuple[DatabaseWriter, Any, Notifier, Any, Any]:
         # Initialize before the integrity read and before constructing the SDK
         # boundary, so the v3 ten-table schema is an invariant of every run.
         initialize_database(self._config.database.path)
@@ -262,22 +250,28 @@ class Supervisor:
         cache = getattr(watch, "cache", None)
         if isinstance(cache, OrderBookCache):
             subscription_generation.bind(cache)
-        return writer, gateway, notifier, catalog, sync, watch
+        return writer, gateway, notifier, sync, watch
 
     async def _sync_forever(self, sync: Any, notifier: Notifier) -> None:
+        is_initial = True
         while True:
-            await self._sleep(self._config.polymarket.sync_interval_seconds)
             result = await sync.run_once()
             await _notify_skipped_markets(notifier, result)
             if getattr(result, "complete", True) is False:
                 await notifier.notify(
                     event_type="SYNC_GENERATION_INCOMPLETE",
-                    message="Market sync generation was incomplete",
+                    message=(
+                        "Initial market sync was incomplete"
+                        if is_initial
+                        else "Market sync generation was incomplete"
+                    ),
                     details={
                         "error": getattr(result, "error", None),
                         "sync_generation": getattr(result, "sync_generation", None),
                     },
                 )
+            is_initial = False
+            await self._sleep(self._config.polymarket.sync_interval_seconds)
 
     async def _record_overflow(
         self, system_events: SystemEventRepository, overflow: MarketChangeOverflow

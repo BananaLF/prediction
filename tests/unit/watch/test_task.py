@@ -463,6 +463,22 @@ async def test_close_wakes_run_with_no_active_tokens() -> None:
     assert running.done() is True
 
 
+async def test_start_and_close_allow_an_empty_catalog_without_recovery() -> None:
+    watch, gateway, _, _, _, _ = _watch(
+        catalog=FakeCatalog(CatalogSnapshot(events=(), markets=(), tokens=()))
+    )
+
+    await watch.start()
+    assert watch.active_token_ids == ()
+    assert gateway.requests == []
+
+    running = asyncio.create_task(watch.run())
+    await asyncio.sleep(0)
+    await watch.close()
+    await asyncio.wait_for(asyncio.shield(running), timeout=0.1)
+    assert running.done() is True
+
+
 async def test_acquired_change_is_acknowledged_once_when_reader_cleanup_is_cancelled() -> None:
     # Catches cancellation between successful queue get and pending-reader cleanup.
     gateway = FakeGateway()
