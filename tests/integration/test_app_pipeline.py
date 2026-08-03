@@ -91,6 +91,7 @@ class _GateSleep:
     async def __call__(self, _: float) -> None:
         self.called.set()
         await self.release.wait()
+        self.release.clear()
 
 
 class _SkippedInitialSync:
@@ -384,7 +385,7 @@ async def test_supervisor_treats_cancellation_as_normal_shutdown(tmp_path: Path)
             running.cancel()
             await running
 
-    assert calls == ["watch-close"]
+    assert calls == ["watch-start", "watch-run", "watch-close"]
 
 
 @pytest.mark.asyncio
