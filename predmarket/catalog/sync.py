@@ -155,6 +155,7 @@ class SyncMarketTask:
         return self._degraded
 
     async def run_once(self) -> SyncResult:
+        _LOGGER.info("正在开始执行第一次扫描")
         occurred_at = self._now()
         generation = self._new_generation()
         errors: list[str] = []

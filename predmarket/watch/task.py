@@ -186,7 +186,9 @@ class WatchTask:
                 raise RuntimeError("watch is closed")
             if self._started:
                 return
+            _LOGGER.info("watch_task loading database")
             snapshot = await self._catalog.load_catalog()
+            _LOGGER.info("watch_task load database market=%d ,event=%d", len(snapshot.markets),len(snapshot.events))
             token_ids, market_ids = _watchable_subscription(snapshot)
             self._active_token_ids = token_ids
             self._active_market_ids = market_ids
@@ -689,11 +691,7 @@ def _watchable_subscription(
             key=_utf8,
         )
     )
-    market_ids = tuple(sorted({
-        token.market_id
-        for token in snapshot.tokens
-        if token.id in frozenset(token_ids)
-    }, key=_utf8))
+    market_ids = tuple(sorted(watchable_market_ids, key=_utf8))
     return token_ids, market_ids
 
 
