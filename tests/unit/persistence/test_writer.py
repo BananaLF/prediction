@@ -5,7 +5,9 @@ from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 import sqlite3
+from typing import Any
 
+import aiosqlite
 import pytest
 
 import predmarket.persistence.writer as writer_module
@@ -34,6 +36,48 @@ from predmarket.persistence.writer import (
     DatabaseWriter,
     DatabaseWriterClosedError,
 )
+
+
+class _CountingConnection:
+    def __init__(self, delegate: aiosqlite.Connection) -> None:
+        self._delegate = delegate
+        self.round_trips = 0
+
+    async def execute(
+        self,
+        sql: str,
+        parameters: tuple[Any, ...] = (),
+    ) -> aiosqlite.Cursor:
+        self.round_trips += 1
+        return await self._delegate.execute(sql, parameters)
+
+    async def executemany(
+        self,
+        sql: str,
+        parameters: Any,
+    ) -> aiosqlite.Cursor:
+        self.round_trips += 1
+        return await self._delegate.executemany(sql, parameters)
+
+
+class _CountingWriter:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self.round_trips = 0
+
+    async def execute(self, command: Any) -> Any:
+        async with aiosqlite.connect(self._path, isolation_level=None) as delegate:
+            await delegate.execute("PRAGMA foreign_keys = ON")
+            await delegate.execute("BEGIN IMMEDIATE")
+            connection = _CountingConnection(delegate)
+            try:
+                result = await command(connection)
+                await delegate.commit()
+            except BaseException:
+                await delegate.rollback()
+                raise
+        self.round_trips += connection.round_trips
+        return result
 
 
 async def test_writer_serializes_commands_and_returns_results(tmp_path: Path) -> None:
@@ -735,6 +779,25 @@ async def test_catalog_single_entity_write_rebuilds_event_market_consistency(
         stored_event = await catalog.get_event(event.id)
         assert stored_event is not None
         assert stored_event.market_ids == ("market-1", "market-2")
+
+        second_event = replace(
+            event,
+            id="event-2",
+            title="Second event",
+            market_ids=(),
+        )
+        await catalog.save_event(second_event)
+        await catalog.save_catalog(
+            events=(),
+            markets=(replace(extra_market, event_id=second_event.id),),
+            tokens=(),
+        )
+        stored_event = await catalog.get_event(event.id)
+        stored_second_event = await catalog.get_event(second_event.id)
+        assert stored_event is not None
+        assert stored_event.market_ids == ("market-1",)
+        assert stored_second_event is not None
+        assert stored_second_event.market_ids == ("market-2",)
     finally:
         await writer.close()
 
@@ -742,6 +805,120 @@ async def test_catalog_single_entity_write_rebuilds_event_market_consistency(
         database_path,
         DatabaseWriter(database_path),
     ).get_market("market-2") is not None
+
+
+async def test_catalog_bulk_save_uses_bounded_database_round_trips(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    initialize_database(database_path)
+    writer = _CountingWriter(database_path)
+    catalog = CatalogRepository(database_path, writer)  # type: ignore[arg-type]
+    event = Event(
+        id="event-bulk",
+        title="Bulk event",
+        status=MarketStatus.ACTIVE,
+        market_ids=tuple(f"market-{index:03d}" for index in range(32)),
+        sync_generation="sync-bulk",
+        sync_generation_complete=True,
+    )
+    markets = tuple(
+        Market(
+            id=f"market-{index:03d}",
+            event_id=event.id,
+            condition_id=f"condition-{index:03d}",
+            question=f"Question {index}?",
+            status=MarketStatus.ACTIVE,
+            active=True,
+            accepting_orders=True,
+            enable_orderbook=True,
+            sync_generation="sync-bulk",
+            sync_generation_complete=True,
+        )
+        for index in range(32)
+    )
+    tokens = tuple(
+        Token(
+            id=f"token-{index:03d}-{position}",
+            market_id=market.id,
+            outcome=outcome,
+            position=position,
+            sync_generation="sync-bulk",
+            sync_generation_complete=True,
+        )
+        for index, market in enumerate(markets)
+        for position, outcome in enumerate(("YES", "NO"))
+    )
+
+    await catalog.save_catalog(events=(event,), markets=markets, tokens=tokens)
+
+    assert writer.round_trips <= 20
+    stored_event = await catalog.get_event(event.id)
+    assert stored_event is not None
+    assert stored_event.market_ids == event.market_ids
+
+
+async def test_complete_catalog_save_advances_unchanged_rows_without_upsert(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    catalog = CatalogRepository(database_path, writer)
+    event = Event(
+        id="event-1",
+        title="Event",
+        status=MarketStatus.ACTIVE,
+        market_ids=("market-1",),
+        sync_generation="sync-1",
+        sync_generation_complete=True,
+        updated_at=10,
+    )
+    market = Market(
+        id="market-1",
+        event_id=event.id,
+        condition_id="condition-1",
+        question="Question?",
+        status=MarketStatus.ACTIVE,
+        active=True,
+        accepting_orders=True,
+        enable_orderbook=True,
+        sync_generation="sync-1",
+        sync_generation_complete=True,
+        updated_at=10,
+    )
+    token = Token(
+        id="token-1",
+        market_id=market.id,
+        outcome="YES",
+        position=0,
+        sync_generation="sync-1",
+        sync_generation_complete=True,
+        updated_at=10,
+    )
+    try:
+        await catalog.save_catalog(events=(event,), markets=(market,), tokens=(token,))
+
+        await catalog.save_complete_catalog(
+            generation="sync-2",
+            updated_at=20,
+            events=(),
+            markets=(),
+            tokens=(),
+        )
+        stored = await catalog.load_catalog()
+    finally:
+        await writer.close()
+
+    assert stored.events == (
+        replace(event, sync_generation="sync-2", updated_at=20),
+    )
+    assert stored.markets == (
+        replace(market, sync_generation="sync-2", updated_at=20),
+    )
+    assert stored.tokens == (
+        replace(token, sync_generation="sync-2", updated_at=20),
+    )
 
 
 async def test_system_and_signal_repositories_use_writer_and_short_reads(

@@ -41,6 +41,10 @@ class SignalRevisionConflict(RuntimeError):
     """The caller's revision was superseded before its transaction committed."""
 
 
+class SubscriptionGenerationChanged(ValueError):
+    """A strategy decision references subscription evidence that is no longer current."""
+
+
 @dataclass(frozen=True, slots=True)
 class SignalNotification:
     signal_id: str
@@ -115,6 +119,8 @@ class SignalManager:
 
         async with self._apply_lock:
             self._validate_external_state(decision)
+            if not isinstance(decision, OpportunityPresent) and expected_revision is None:
+                return None
             observed_at = self._clock()
             if type(observed_at) is not int or observed_at < 0:
                 raise ValueError("clock must return a non-negative integer")
@@ -345,9 +351,13 @@ class SignalManager:
         for book in decision.evidence:
             generation = _generation_value(self._subscription_generation, book.token_id)
             if self._subscription_generation is not None and generation is None:
-                raise ValueError(f"subscription generation is unavailable for {book.token_id!r}")
+                raise SubscriptionGenerationChanged(
+                    f"subscription generation is unavailable for {book.token_id!r}"
+                )
             if generation is not None and generation != book.subscription_generation:
-                raise ValueError(f"stale subscription generation for {book.token_id!r}")
+                raise SubscriptionGenerationChanged(
+                    f"stale subscription generation for {book.token_id!r}"
+                )
         if self._relation_id is not None:
             state = _state_value(self._relation_state, self._relation_id)
             if state is not None and not _relation_approved(state):

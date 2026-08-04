@@ -110,6 +110,8 @@ class OrderBookCache:
                 for book in materialized
             ):
                 raise ValueError("snapshot generation does not match resync")
+            for book in materialized:
+                _validate_top_of_book(book)
             market_by_token = {
                 token_id: book.market_id for token_id, book in by_token.items()
             }
@@ -122,6 +124,32 @@ class OrderBookCache:
         self._state = CacheState.VALID
         self._invalid_reason = None
         return self.view()
+
+    def apply_book(self, book: OrderBook) -> bool:
+        """Reconcile one complete stream book against the REST baseline."""
+        if not isinstance(book, OrderBook):
+            raise TypeError("book must be an OrderBook")
+        if book.subscription_generation < self._generation:
+            return False
+        if book.subscription_generation > self._generation:
+            self._fail_closed("unexpected future generation")
+        if self._state is not CacheState.VALID:
+            return False
+        current = self._books.get(book.token_id)
+        if current is None:
+            self._fail_closed("book token is outside the active snapshot")
+        if book.market_id != current.market_id:
+            self._fail_closed("book market identity does not match snapshot")
+        if book.exchange_timestamp < current.exchange_timestamp:
+            return False
+        try:
+            _validate_top_of_book(book)
+        except ValueError as error:
+            self._fail_closed(str(error))
+        if book == current:
+            return False
+        self._books = {**self._books, book.token_id: book}
+        return True
 
     def apply_delta(
         self,
@@ -165,12 +193,15 @@ class OrderBookCache:
             grouped.setdefault(delta.token_id, []).append(delta)
 
         candidates = dict(self._books)
+        applied = False
         for token_id, token_deltas in grouped.items():
+            before = self._books[token_id]
+            if exchange_timestamp < before.exchange_timestamp:
+                continue
             hashes = {delta.book_hash for delta in token_deltas}
             if len(hashes) != 1:
                 self._fail_closed("conflicting opaque hashes in one token batch")
             claimed_hash = hashes.pop()
-            before = self._books[token_id]
             try:
                 bids = {level.price: level.size for level in before.bids}
                 asks = {level.price: level.size for level in before.asks}
@@ -200,6 +231,7 @@ class OrderBookCache:
                     exchange_timestamp=exchange_timestamp,
                     received_timestamp=received_timestamp,
                 )
+                _validate_top_of_book(candidate)
             except (TypeError, ValueError) as error:
                 message = str(error)
                 if "decimal" in message:
@@ -213,10 +245,12 @@ class OrderBookCache:
                 if type(verified) is not bool or not verified:
                     self._fail_closed("book hash mismatch")
             candidates[token_id] = candidate
+            applied = True
 
-        self._books = candidates
+        if applied:
+            self._books = candidates
         self._last_sequence = sequence
-        return True
+        return applied
 
     def invalidate(self, *, generation: int, reason: str) -> bool:
         if type(generation) is not int or generation < 0:
@@ -263,6 +297,11 @@ def _token_ids(values: Sequence[str]) -> tuple[str, ...]:
     if len(materialized) != len(set(materialized)):
         raise ValueError("token_ids must not contain duplicates")
     return tuple(sorted(materialized, key=_utf8))
+
+
+def _validate_top_of_book(book: OrderBook) -> None:
+    if book.bids and book.asks and book.bids[0].price >= book.asks[0].price:
+        raise ValueError("best bid must be below best ask")
 
 
 def _utf8(value: str) -> bytes:

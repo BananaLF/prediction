@@ -28,6 +28,8 @@ class PolymarketConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     market_change_queue_capacity: int
+    watch_market_limit: int
+    market_stream_queue_capacity: int
 
 
 @dataclass(frozen=True)
@@ -127,9 +129,21 @@ def _polymarket_config(raw: dict[str, Any]) -> PolymarketConfig:
 
 
 def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
-    _require_keys(raw, {"market_change_queue_capacity"}, "runtime")
+    _require_keys(
+        raw,
+        {
+            "market_change_queue_capacity",
+            "watch_market_limit",
+            "market_stream_queue_capacity",
+        },
+        "runtime",
+    )
     return RuntimeConfig(
-        market_change_queue_capacity=_integer(raw, "market_change_queue_capacity", "runtime")
+        market_change_queue_capacity=_integer(raw, "market_change_queue_capacity", "runtime"),
+        watch_market_limit=_integer(raw, "watch_market_limit", "runtime"),
+        market_stream_queue_capacity=_integer(
+            raw, "market_stream_queue_capacity", "runtime"
+        ),
     )
 
 

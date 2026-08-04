@@ -75,6 +75,14 @@ class _Gateway:
         self.block_next: asyncio.Event | None = None
         self.subscriptions: list[_Subscription] = []
 
+    def hydrate_market_identities(
+        self,
+        markets: tuple[Market, ...],
+        tokens: tuple[Token, ...],
+        market_ids: tuple[str, ...],
+    ) -> None:
+        return None
+
     async def recover_market_session(self, token_ids: tuple[str, ...]):
         self.generation += 1
         generation = self.generation

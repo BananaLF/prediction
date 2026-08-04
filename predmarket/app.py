@@ -22,6 +22,7 @@ from predmarket.domain.signal import (
 from predmarket.notification.notifier import Notifier, macos_desktop_notification
 from predmarket.persistence.integrity import check_database_startup
 from predmarket.persistence.repositories import (
+    CatalogSnapshot,
     CatalogRepository,
     RelationRepository,
     SignalRepository,
@@ -75,14 +76,26 @@ class Supervisor:
 
     async def run(self) -> int:
         """Start the pipeline and return non-zero on an unexpected task exit."""
+        runtime_started_at = time.monotonic()
         _LOGGER.info("runtime_starting")
         writer: DatabaseWriter | None = None
         gateway: Any | None = None
         watch: Any | None = None
         tasks: tuple[asyncio.Task[Any], ...] = ()
         try:
+            _LOGGER.info("runtime_build_started")
             writer, gateway, notifier, sync, watch = await self._build_runtime()
+            _LOGGER.info(
+                "runtime_built elapsed_ms=%d",
+                int((time.monotonic() - runtime_started_at) * 1_000),
+            )
+            watch_started_at = time.monotonic()
+            _LOGGER.info("component_starting component=watch_bootstrap")
             await watch.start()
+            _LOGGER.info(
+                "component_started component=watch_bootstrap elapsed_ms=%d",
+                int((time.monotonic() - watch_started_at) * 1_000),
+            )
             watch_task = asyncio.create_task(watch.run(), name="WatchTask")
             _LOGGER.info("component_started component=watch_task")
             sync_task = asyncio.create_task(
@@ -189,7 +202,11 @@ class Supervisor:
             # This is the one and only Polymarket integration boundary.
             from predmarket.polymarket.gateway import PolymarketGateway
 
-            gateway = PolymarketGateway()
+            gateway = PolymarketGateway(
+                market_stream_queue_capacity=(
+                    self._config.runtime.market_stream_queue_capacity
+                )
+            )
         _LOGGER.info("component_initialized component=gateway")
         if self._sync_task_factory is None:
             from predmarket.catalog.sync import SyncMarketTask
@@ -223,6 +240,12 @@ class Supervisor:
                 changes=changes,
                 strategy_engine=self._strategy_engine or StrategyEngine(),
                 signal_manager=router,
+                clock_ms=self._clock_ms,
+                market_limit=self._config.runtime.watch_market_limit,
+                market_metadata_refresh_interval_seconds=max(
+                    1,
+                    self._config.polymarket.fee_schedule_max_age_seconds // 2,
+                ),
                 context_source=_ApplicationContextSource(
                     config=self._config,
                     catalog=catalog,
@@ -255,7 +278,17 @@ class Supervisor:
     async def _sync_forever(self, sync: Any, notifier: Notifier) -> None:
         is_initial = True
         while True:
+            cycle_started_at = time.monotonic()
+            _LOGGER.info("sync_cycle_started initial=%s", str(is_initial).lower())
             result = await sync.run_once()
+            _LOGGER.info(
+                "sync_cycle_completed initial=%s complete=%s "
+                "sync_generation=%s elapsed_ms=%d",
+                str(is_initial).lower(),
+                str(bool(getattr(result, "complete", False))).lower(),
+                getattr(result, "sync_generation", None),
+                int((time.monotonic() - cycle_started_at) * 1_000),
+            )
             await _notify_skipped_markets(notifier, result)
             if getattr(result, "complete", True) is False:
                 await notifier.notify(
@@ -271,7 +304,9 @@ class Supervisor:
                     },
                 )
             is_initial = False
-            await self._sleep(self._config.polymarket.sync_interval_seconds)
+            interval = self._config.polymarket.sync_interval_seconds
+            _LOGGER.info("sync_cycle_sleeping interval_seconds=%s", interval)
+            await self._sleep(interval)
 
     async def _record_overflow(
         self, system_events: SystemEventRepository, overflow: MarketChangeOverflow
@@ -338,26 +373,104 @@ class _ApplicationContextSource:
         self._relations = relations
         self._signals = signals
         self._clock_ms = clock_ms
+        self._token_by_id: dict[str, Token] | None = None
+        self._markets: dict[str, Market] = {}
+        self._event_by_id: dict[str, Event] = {}
+        self._tokens_by_market: dict[str, tuple[Token, ...]] = {}
+
+    def use_catalog_snapshot(self, snapshot: CatalogSnapshot) -> None:
+        """Atomically replace the catalog indexes used by strategy evaluation."""
+        if not isinstance(snapshot, CatalogSnapshot):
+            raise TypeError("snapshot must be a CatalogSnapshot")
+        started_at = time.monotonic()
+        token_by_id = {token.id: token for token in snapshot.tokens}
+        markets = {market.id: market for market in snapshot.markets}
+        event_by_id = {event.id: event for event in snapshot.events}
+        grouped_tokens: dict[str, list[Token]] = {}
+        for token in snapshot.tokens:
+            grouped_tokens.setdefault(token.market_id, []).append(token)
+        tokens_by_market = {
+            market_id: tuple(tokens)
+            for market_id, tokens in grouped_tokens.items()
+        }
+        self._markets = markets
+        self._event_by_id = event_by_id
+        self._tokens_by_market = tokens_by_market
+        self._token_by_id = token_by_id
+        _LOGGER.info(
+            "strategy_catalog_snapshot_prepared events=%d markets=%d tokens=%d "
+            "elapsed_ms=%d",
+            len(snapshot.events),
+            len(snapshot.markets),
+            len(snapshot.tokens),
+            int((time.monotonic() - started_at) * 1_000),
+        )
 
     async def contexts_for(
         self, changed_token_id: str, orderbooks: tuple[Any, ...]
     ) -> Sequence[Any]:
+        return (await self.contexts_for_batch((changed_token_id,), orderbooks)).get(
+            changed_token_id,
+            (),
+        )
+
+    async def contexts_for_batch(
+        self,
+        changed_token_ids: Sequence[str],
+        orderbooks: tuple[Any, ...],
+    ) -> dict[str, tuple[Any, ...]]:
         from predmarket.watch.task import EvaluationTarget
 
-        snapshot = await self._catalog.load_catalog()
-        token_by_id = {token.id: token for token in snapshot.tokens}
+        if self._token_by_id is None:
+            self.use_catalog_snapshot(await self._catalog.load_catalog())
+        token_by_id = self._token_by_id
+        assert token_by_id is not None
+        books = {book.token_id: book for book in orderbooks}
+        approved_relations = await self._relations.list_approved()
+        pending_targets = {
+            token_id: self._context_specs_for(
+                token_id,
+                books,
+                approved_relations,
+            )
+            for token_id in changed_token_ids
+        }
+        open_revisions = await self._signals.find_open_revisions(
+            tuple(
+                opportunity_key
+                for targets in pending_targets.values()
+                for _, opportunity_key in targets
+            )
+        )
+        return {
+            token_id: tuple(
+                EvaluationTarget(
+                    context,
+                    opportunity_key,
+                    open_revisions.get(opportunity_key),
+                )
+                for context, opportunity_key in targets
+            )
+            for token_id, targets in pending_targets.items()
+        }
+
+    def _context_specs_for(
+        self,
+        changed_token_id: str,
+        books: dict[str, Any],
+        approved_relations: Sequence[Relation],
+    ) -> tuple[tuple[StrategyContext, str], ...]:
+        token_by_id = self._token_by_id
+        assert token_by_id is not None
         changed = token_by_id.get(changed_token_id)
         if changed is None:
             return ()
-        markets = {market.id: market for market in snapshot.markets}
+        markets = self._markets
         market = markets.get(changed.market_id)
         if market is None:
             return ()
-        event_by_id = {event.id: event for event in snapshot.events}
-        books = {book.token_id: book for book in orderbooks}
-        tokens_by_market: dict[str, list[Token]] = {}
-        for token in snapshot.tokens:
-            tokens_by_market.setdefault(token.market_id, []).append(token)
+        event_by_id = self._event_by_id
+        tokens_by_market = self._tokens_by_market
         targets: list[tuple[StrategyContext, str]] = []
         local_tokens = tuple(tokens_by_market.get(market.id, ()))
         local_books = tuple(book for token in local_tokens if (book := books.get(token.id)) is not None)
@@ -393,7 +506,7 @@ class _ApplicationContextSource:
                     f"{StrategyType.NEG_RISK_COMPLETE_SET.value}:{event.id}",
                 )
             )
-        for relation in await self._relations.list_approved():
+        for relation in approved_relations:
             if market.id not in {relation.market_a_id, relation.market_b_id}:
                 continue
             relation_markets = tuple(
@@ -419,10 +532,7 @@ class _ApplicationContextSource:
                     f"{StrategyType.LOGICAL_IMPLICATION.value}:{relation.id}",
                 )
             )
-        return tuple(
-            await self._target(context, opportunity_key)
-            for context, opportunity_key in targets
-        )
+        return tuple(targets)
 
     def _context(
         self,
@@ -452,16 +562,6 @@ class _ApplicationContextSource:
             fee_schedule_max_age_seconds=self._config.polymarket.fee_schedule_max_age_seconds,
             supported_neg_risk_types=("STANDARD", "STANDARD_REDEEM"),
         )
-
-    async def _target(self, context: StrategyContext, opportunity_key: str) -> Any:
-        from predmarket.watch.task import EvaluationTarget
-
-        signal_id = await self._signals.find_open_signal_id(opportunity_key)
-        expected_revision = (
-            None if signal_id is None else await self._signals.get_latest_revision(signal_id)
-        )
-        return EvaluationTarget(context, opportunity_key, expected_revision)
-
 
 class _SubscriptionGenerationSource:
     """Read the current, complete WatchTask generation at transaction time."""

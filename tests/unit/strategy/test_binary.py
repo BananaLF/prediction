@@ -29,6 +29,7 @@ def _binary_context(
     no_time=1_000,
     fees=None,
     evaluated_at=1_000,
+    orderbook_observed_at=None,
     configuration=None,
     size="10",
     minimum="1",
@@ -65,6 +66,7 @@ def _binary_context(
         orderbooks=books,
         fees=fees,
         evaluated_at=evaluated_at,
+        orderbook_observed_at=orderbook_observed_at,
         configuration=configuration,
     )
 
@@ -87,6 +89,30 @@ def test_binary_underpriced_uses_full_depth_and_exact_economics(
     assert decision.calculation.unhedged_notional == Decimal("4.00")
     assert [leg.action for leg in decision.legs] == [Action.BUY, Action.BUY, Action.MERGE]
     assert [book.token_id for book in decision.evidence] == ["no", "yes"]
+
+
+def test_binary_underpriced_uses_authoritative_positions_for_arbitrary_labels(
+    context_factory, market_factory, token_factory, book_factory
+) -> None:
+    # Binary complete sets are identified by SDK positions, not display labels.
+    context = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+    )
+    context = replace(
+        context,
+        tokens=tuple(
+            replace(token, outcome=("Up" if token.position == 0 else "Down"))
+            for token in context.tokens
+        ),
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, OpportunityPresent)
+    assert [leg.token_id for leg in decision.legs[:2]] == ["yes", "no"]
 
 
 def test_binary_evidence_details_encode_decimal_without_exponents(
@@ -208,6 +234,26 @@ def test_binary_fails_closed_for_stale_or_skewed_books(
 
     assert isinstance(decision, NotEvaluable)
     assert decision.reason_code is reason
+
+
+def test_binary_uses_subscription_observation_for_unchanged_books(
+    context_factory, market_factory, token_factory, book_factory
+) -> None:
+    # A resting book remains current while its lossless subscription is alive.
+    context = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+        yes_time=1_000,
+        no_time=1_500,
+        evaluated_at=10_000,
+        orderbook_observed_at=10_000,
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, OpportunityPresent)
 
 
 def test_binary_uses_exchange_time_for_freshness_and_enforces_causality(

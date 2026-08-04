@@ -266,6 +266,40 @@ async def test_not_evaluable_closes_without_economic_or_orderbook_evidence(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_closing_decisions_without_open_signal_skip_database_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer, _catalog_repo, _signals, manager = await _open_manager(tmp_path)
+    execute_calls = 0
+    original_execute = writer.execute
+
+    async def counted_execute(command):
+        nonlocal execute_calls
+        execute_calls += 1
+        return await original_execute(command)
+
+    monkeypatch.setattr(writer, "execute", counted_execute)
+    try:
+        absent = OpportunityAbsent(
+            reason_code=DecisionReason.PROFIT_BELOW_THRESHOLD,
+            calculation=_present().calculation,
+            legs=_present().legs,
+            evidence=_present().evidence,
+        )
+        not_evaluable = NotEvaluable(
+            reason_code=DecisionReason.ORDERBOOK_INVALID,
+            context={"detail": "missing depth"},
+        )
+
+        assert await manager.apply(absent, "never-opened-absent", None) is None
+        assert await manager.apply(not_evaluable, "never-opened-invalid", None) is None
+        assert execute_calls == 0
+    finally:
+        await writer.close()
+
+
+@pytest.mark.asyncio
 async def test_signal_manager_rejects_stale_decision_without_duplicate_revision(tmp_path: Path) -> None:
     writer, _catalog_repo, signals, manager = await _open_manager(tmp_path)
     try:

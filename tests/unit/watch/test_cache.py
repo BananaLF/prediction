@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
 
 import pytest
@@ -19,6 +19,7 @@ def _book(
     *,
     generation: int = 1,
     book_hash: str | None = None,
+    exchange_timestamp: int = 100,
 ) -> OrderBook:
     return OrderBook(
         market_id="market-1",
@@ -33,7 +34,7 @@ def _book(
         ),
         subscription_generation=generation,
         book_hash=book_hash or f"hash-{token_id}-{generation}",
-        exchange_timestamp=100,
+        exchange_timestamp=exchange_timestamp,
         received_timestamp=101,
         tick_size=Decimal("0.01"),
         minimum_order_size=Decimal("1"),
@@ -80,6 +81,21 @@ def test_snapshot_requires_exact_resync_token_set() -> None:
     assert cache.view() == ()
 
 
+def test_crossed_snapshot_invalidates_cache() -> None:
+    cache = OrderBookCache()
+    cache.begin_resync(generation=1, token_ids=("token-a", "token-b"))
+    crossed = replace(
+        _book("token-a"),
+        bids=(OrderBookLevel(Decimal("0.49"), Decimal("1")),),
+    )
+
+    with pytest.raises(CacheInvalidatedError, match="best bid must be below best ask"):
+        cache.apply_snapshot((crossed, _book("token-b")))
+
+    assert cache.state is CacheState.INVALID
+    assert cache.view() == ()
+
+
 def test_delta_uses_canonical_decimal_strings_and_updates_sorted_levels() -> None:
     # Catches binary floats or unsorted/zero levels entering strategy evidence.
     cache = _valid_cache()
@@ -119,6 +135,73 @@ def test_delta_uses_canonical_decimal_strings_and_updates_sorted_levels() -> Non
     assert book.book_hash == "post-a"
     assert book.exchange_timestamp == 102
     assert book.received_timestamp == 103
+
+
+def test_delta_that_crosses_top_of_book_invalidates_cache() -> None:
+    cache = _valid_cache()
+
+    with pytest.raises(CacheInvalidatedError, match="best bid must be below best ask"):
+        cache.apply_delta(
+            (OrderBookDelta("token-a", "BUY", "0.49", "1", "crossed"),),
+            generation=1,
+            sequence=1,
+            exchange_timestamp=102,
+            received_timestamp=103,
+        )
+
+    assert cache.state is CacheState.INVALID
+    assert cache.invalid_reason == "best bid must be below best ask"
+    assert cache.view() == ()
+
+
+def test_full_stream_book_replaces_rest_baseline_when_not_older() -> None:
+    # Catches a normal initial WebSocket snapshot being treated as corruption.
+    cache = _valid_cache()
+    stream_book = _book(
+        "token-a",
+        book_hash="stream-hash",
+        exchange_timestamp=110,
+    )
+
+    applied = cache.apply_book(stream_book)
+
+    assert applied is True
+    assert cache.get("token-a") == stream_book
+    assert cache.state is CacheState.VALID
+
+
+def test_crossed_full_stream_book_invalidates_cache() -> None:
+    cache = _valid_cache()
+    crossed = replace(
+        _book("token-a", exchange_timestamp=110),
+        bids=(OrderBookLevel(Decimal("0.49"), Decimal("1")),),
+    )
+
+    with pytest.raises(CacheInvalidatedError, match="best bid must be below best ask"):
+        cache.apply_book(crossed)
+
+    assert cache.state is CacheState.INVALID
+    assert cache.view() == ()
+
+
+def test_stale_full_book_and_delta_do_not_overwrite_rest_baseline() -> None:
+    # Catches events buffered during REST recovery rolling the baseline backward.
+    cache = _valid_cache()
+    before = cache.get("token-a")
+
+    assert cache.apply_book(
+        _book("token-a", book_hash="stale-book", exchange_timestamp=99)
+    ) is False
+    assert cache.apply_delta(
+        (OrderBookDelta("token-a", "BUY", "0.41", "9", "stale-delta"),),
+        generation=1,
+        sequence=1,
+        exchange_timestamp=99,
+        received_timestamp=110,
+    ) is False
+
+    assert cache.get("token-a") == before
+    assert cache.state is CacheState.VALID
 
 
 @pytest.mark.parametrize(

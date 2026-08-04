@@ -237,6 +237,7 @@ class StrategyContext:
     events: tuple[Event, ...] = ()
     fee_schedule_max_age_seconds: int | None = None
     supported_neg_risk_types: tuple[str, ...] = ()
+    orderbook_observed_at: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.strategy_type, StrategyType):
@@ -260,6 +261,11 @@ class StrategyContext:
                 raise ValueError("fee schedule values must be FeeSchedule instances")
         if type(self.evaluated_at) is not int or self.evaluated_at < 0:
             raise ValueError("evaluated_at must be a non-negative integer")
+        if self.orderbook_observed_at is not None and (
+            type(self.orderbook_observed_at) is not int
+            or self.orderbook_observed_at < 0
+        ):
+            raise ValueError("orderbook_observed_at must be non-negative or None")
         if not isinstance(self.configuration, StrategyConfig):
             raise ValueError("configuration must be a StrategyConfig")
         if self.fee_schedule_max_age_seconds is not None and (

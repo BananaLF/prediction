@@ -197,19 +197,40 @@ def validate_inputs(
             DecisionReason.ORDERBOOK_INVALID,
             "orderbook_timestamp_causality_invalid",
         )
-    if any(
-        context.evaluated_at - book.exchange_timestamp
-        > context.configuration.maximum_book_age_ms
-        for book in books
-    ):
-        return not_evaluable(context, DecisionReason.ORDERBOOK_STALE, "orderbook_stale")
-    exchange_times = [book.exchange_timestamp for book in books]
-    if max(exchange_times) - min(exchange_times) > context.configuration.maximum_leg_skew_ms:
-        return not_evaluable(
-            context,
-            DecisionReason.LEG_SKEW_EXCEEDED,
-            "leg_exchange_timestamp_skew",
-        )
+    observed_at = context.orderbook_observed_at
+    if observed_at is not None:
+        if observed_at > context.evaluated_at:
+            return not_evaluable(
+                context,
+                DecisionReason.ORDERBOOK_INVALID,
+                "orderbook_observation_from_future",
+            )
+        if (
+            context.evaluated_at - observed_at
+            > context.configuration.maximum_book_age_ms
+        ):
+            return not_evaluable(
+                context,
+                DecisionReason.ORDERBOOK_STALE,
+                "orderbook_subscription_stale",
+            )
+    else:
+        if any(
+            context.evaluated_at - book.exchange_timestamp
+            > context.configuration.maximum_book_age_ms
+            for book in books
+        ):
+            return not_evaluable(context, DecisionReason.ORDERBOOK_STALE, "orderbook_stale")
+        exchange_times = [book.exchange_timestamp for book in books]
+        if (
+            max(exchange_times) - min(exchange_times)
+            > context.configuration.maximum_leg_skew_ms
+        ):
+            return not_evaluable(
+                context,
+                DecisionReason.LEG_SKEW_EXCEEDED,
+                "leg_exchange_timestamp_skew",
+            )
     for book, action in zip(books, actions):
         execution_levels = book.asks if action is Action.BUY else book.bids
         if not execution_levels:
