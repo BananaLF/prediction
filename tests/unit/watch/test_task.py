@@ -812,6 +812,8 @@ class FakeSignals:
         self.applied: list[tuple[Any, str, int | None]] = []
         self.observed_at: list[int] = []
         self.closed: list[tuple[tuple[str, ...], NotEvaluable]] = []
+        self.close_observed_at: list[int] = []
+        self.unwatchable: list[tuple[tuple[str, ...], int]] = []
         self.close_entered = asyncio.Event()
         self.close_gate: asyncio.Event | None = None
 
@@ -835,9 +837,18 @@ class FakeSignals:
         observed_at: int,
     ) -> None:
         self.closed.append((token_ids, decision))
+        self.close_observed_at.append(observed_at)
         self.close_entered.set()
         if self.close_gate is not None:
             await self.close_gate.wait()
+
+    async def close_unwatchable_for_active_tokens(
+        self,
+        active_token_ids: tuple[str, ...],
+        *,
+        observed_at: int,
+    ) -> None:
+        self.unwatchable.append((active_token_ids, observed_at))
 
 
 class NoPersistSignals(FakeSignals):
@@ -938,7 +949,7 @@ async def test_run_subscribes_all_initial_watchable_tokens_and_evaluates_after_r
     # Catches startup analyzing before the complete REST recovery baseline exists.
     gateway = FakeGateway()
     gateway.recovery_gate = asyncio.Event()
-    watch, _, _, _, strategy, _ = _watch(gateway=gateway)
+    watch, _, _, _, strategy, signals = _watch(gateway=gateway)
 
     task = asyncio.create_task(watch.run())
     for _ in range(20):
@@ -949,6 +960,7 @@ async def test_run_subscribes_all_initial_watchable_tokens_and_evaluates_after_r
     assert gateway.requests == [("token-1", "token-2")]
     assert gateway.hydrated_market_ids == [("market-1",)]
     assert strategy.calls == []
+    assert signals.unwatchable == []
     assert watch.cache.state is CacheState.INVALID
     gateway.recovery_gate.set()
     try:
@@ -962,6 +974,43 @@ async def test_run_subscribes_all_initial_watchable_tokens_and_evaluates_after_r
     finally:
         await _cancel(task)
     assert gateway.subscriptions[0].closed is True
+
+
+async def test_start_reconciles_unwatchable_signals_at_recovery_market_time() -> None:
+    signals = FakeSignals()
+    watch, _, _, _, _, _ = _watch(
+        signals=signals,
+        clock_ms=lambda: 9_000,
+    )
+
+    await watch.start()
+
+    assert signals.unwatchable == [(('token-1', 'token-2'), 100)]
+    await watch.close()
+
+
+async def test_recovery_failure_before_market_watermark_skips_signal_mutation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    signals = FakeSignals()
+    watch, _, _, _, _, _ = _watch(
+        gateway=NonRetryableRecoveryGateway(),
+        signals=signals,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="predmarket.watch.task"):
+        with pytest.raises(MarketRecoveryInvalidatedError, match="sdk_version_changed"):
+            await watch.start()
+
+    assert signals.unwatchable == []
+    assert signals.closed == []
+    assert any(
+        record.getMessage().startswith("watch_signal_mutation_skipped ")
+        and "detail=startup_reconciliation" in record.getMessage()
+        and "generation=0" in record.getMessage()
+        and "market_time=None" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize("host_wall_time", [900, 3_000])
@@ -1762,8 +1811,8 @@ async def test_start_adopts_gateway_pruned_recovery_scope() -> None:
         "token-1",
         "token-2",
     }
-    assert signals.closed[0][0] == ("token-3", "token-4")
-    assert signals.closed[0][1].reason_code is DecisionReason.ORDERBOOK_INVALID
+    assert signals.closed == []
+    assert signals.unwatchable == [(('token-1', 'token-2'), 100)]
     await watch.close()
 
 
@@ -2608,6 +2657,46 @@ async def test_sdk_invalidation_closes_before_rest_recovery_and_never_evaluates_
 
     assert watch.cache.state is CacheState.VALID
     assert len(strategy.calls) > before
+    await watch.close()
+
+
+async def test_disconnect_closes_at_old_generation_watermark_and_new_generation_restarts_time() -> None:
+    class GenerationTimestampGateway(FakeGateway):
+        async def recover_market_session(self, token_ids: tuple[str, ...]):
+            session = await super().recover_market_session(token_ids)
+            exchange_timestamp = 5_000 if session.subscription_generation == 1 else 2_000
+            session.order_books = tuple(
+                replace(book, exchange_timestamp=exchange_timestamp)
+                for book in session.order_books
+            )
+            return session
+
+    strategy = FakeStrategy()
+    signals = FakeSignals()
+    watch, _, _, _, _, _ = _watch(
+        gateway=GenerationTimestampGateway(),
+        strategy=strategy,
+        signals=signals,
+        context_source=MarketTimeContextSource(),
+        clock_ms=lambda: 99_000,
+    )
+    await watch.start()
+    strategy.calls.clear()
+    signals.observed_at.clear()
+
+    await watch.handle_stream_message(
+        MarketStreamInvalidated(
+            reason="connection_lost",
+            token_ids=("token-1", "token-2"),
+            received_timestamp=120,
+            subscription_generation=1,
+            mapping_version="mapping-v1",
+        )
+    )
+
+    assert signals.close_observed_at[-1] == 5_000
+    assert {context.evaluated_at for context in strategy.calls} == {2_000}
+    assert signals.observed_at == [2_000, 2_000]
     await watch.close()
 
 

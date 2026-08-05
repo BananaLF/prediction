@@ -319,16 +319,27 @@ class WatchTask:
             self._active_token_ids = token_ids
             self._active_market_ids = market_ids
             self._hydrate_gateway(snapshot, market_ids)
-            recover_open_signals = getattr(
-                self._signal_manager, "close_unwatchable_for_active_tokens", None
-            )
-            if recover_open_signals is not None:
-                result = recover_open_signals(token_ids, observed_at=self._now())
-                if inspect.isawaitable(result):
-                    await result
             if token_ids:
-                await self._recover(token_ids)
+                try:
+                    await self._recover(token_ids, reconcile_unwatchable=True)
+                except BaseException:
+                    generation = self._cache.generation
+                    market_time = self._market_clock.read(generation=generation)
+                    if market_time is None:
+                        await self._reconcile_unwatchable_signals(
+                            token_ids,
+                            generation=generation,
+                            market_time=None,
+                            detail="startup_reconciliation",
+                        )
+                    raise
             else:
+                await self._reconcile_unwatchable_signals(
+                    token_ids,
+                    generation=self._cache.generation,
+                    market_time=None,
+                    detail="startup_reconciliation",
+                )
                 self._log_subscription_success()
             self._started = True
 
@@ -563,10 +574,15 @@ class WatchTask:
                     if token_id not in active_token_id_set
                 )
                 if control_change:
+                    close_generation = self._cache.generation
                     await self._close_signals(
                         confirmed_closed,
                         reason,
                         detail="market_control",
+                        generation=close_generation,
+                        market_time=self._market_clock.read(
+                            generation=close_generation
+                        ),
                     )
                 self._catalog_change_generation_coalesced_count += 1
                 self._catalog_change_generation_coalesced_total += 1
@@ -654,10 +670,15 @@ class WatchTask:
                 )
             if control_change and new_token_ids == self._active_token_ids:
                 if explicitly_closed:
+                    close_generation = self._cache.generation
                     await self._close_signals(
                         explicitly_closed,
                         reason,
                         detail="market_control",
+                        generation=close_generation,
+                        market_time=self._market_clock.read(
+                            generation=close_generation
+                        ),
                     )
                     self._catalog_control_without_rotation_count += 1
                     count = self._catalog_control_without_rotation_count
@@ -1361,6 +1382,8 @@ class WatchTask:
         close_reason: DecisionReason,
     ) -> None:
         old_token_ids = self._active_token_ids
+        old_generation = self._cache.generation
+        old_market_time = self._market_clock.read(generation=old_generation)
         self._discard_pending_evaluations(reason="subscription_rotated")
         await self._close_current_subscription()
         if self._cache.state is CacheState.VALID:
@@ -1374,6 +1397,8 @@ class WatchTask:
                 explicitly_closed,
                 close_reason,
                 detail="market_control",
+                generation=old_generation,
+                market_time=old_market_time,
             )
         invalidated = tuple(
             token_id for token_id in old_token_ids if token_id not in explicit_set
@@ -1383,6 +1408,8 @@ class WatchTask:
                 invalidated,
                 DecisionReason.ORDERBOOK_INVALID,
                 detail="subscription_rotated",
+                generation=old_generation,
+                market_time=old_market_time,
             )
         self._active_token_ids = new_token_ids
         self._active_market_ids = new_market_ids
@@ -1398,6 +1425,10 @@ class WatchTask:
         detail: str,
     ) -> None:
         token_ids = self._active_token_ids
+        invalidated_generation = self._cache.generation
+        invalidated_market_time = self._market_clock.read(
+            generation=invalidated_generation
+        )
         _LOGGER.warning(
             "watch_subscription_invalidated reason_code=%s detail=%s "
             "generation=%d tokens=%d",
@@ -1414,17 +1445,31 @@ class WatchTask:
             )
         await self._close_current_subscription()
         if token_ids:
-            await self._close_signals(token_ids, reason, detail=detail)
+            await self._close_signals(
+                token_ids,
+                reason,
+                detail=detail,
+                generation=invalidated_generation,
+                market_time=invalidated_market_time,
+            )
             await self._recover(token_ids)
 
-    async def _recover(self, token_ids: tuple[str, ...]) -> None:
+    async def _recover(
+        self,
+        token_ids: tuple[str, ...],
+        *,
+        reconcile_unwatchable: bool = False,
+    ) -> None:
         attempt = 1
         retry_delay = self._recovery_retry_initial_seconds
         requested_token_ids = token_ids
         excluded_market_ids: set[str] = set()
         while not self._closed and not self._stop_event.is_set():
             try:
-                pruned = await self._recover_once(requested_token_ids)
+                pruned = await self._recover_once(
+                    requested_token_ids,
+                    reconcile_unwatchable=reconcile_unwatchable,
+                )
                 if pruned is None:
                     return
                 requested_token_ids = await self._prepare_recovery_refill(
@@ -1639,6 +1684,8 @@ class WatchTask:
     async def _recover_once(
         self,
         token_ids: tuple[str, ...],
+        *,
+        reconcile_unwatchable: bool,
     ) -> _RecoveryScopePruned | None:
         if self._closed or self._stop_event.is_set():
             return
@@ -1712,6 +1759,8 @@ class WatchTask:
                     removed_token_ids,
                     DecisionReason.ORDERBOOK_INVALID,
                     detail="recovery_missing_order_books",
+                    generation=generation,
+                    market_time=None,
                 )
                 await _close_owned(session.subscription)
                 session = None
@@ -1749,6 +1798,13 @@ class WatchTask:
                 market_time,
                 len(books),
             )
+            if reconcile_unwatchable:
+                await self._reconcile_unwatchable_signals(
+                    effective_token_ids,
+                    generation=generation,
+                    market_time=market_time,
+                    detail="startup_reconciliation",
+                )
         except BaseException as error:
             if isinstance(error, (MarketRecoveryInvalidatedError, CacheInvalidatedError)):
                 reason = (
@@ -1840,22 +1896,73 @@ class WatchTask:
         reason: DecisionReason,
         *,
         detail: str,
+        generation: int,
+        market_time: int | None,
     ) -> None:
         normalized = tuple(sorted(set(token_ids), key=_utf8))
         if not normalized:
+            return
+        if market_time is None:
+            _LOGGER.warning(
+                "watch_signal_mutation_skipped operation=close_for_tokens "
+                "generation=%d reason_code=%s detail=%s tokens=%d "
+                "market_time=None",
+                generation,
+                reason.value,
+                detail,
+                len(normalized),
+            )
             return
         decision = NotEvaluable(
             reason_code=reason,
             context={
                 "token_ids": normalized,
-                "subscription_generation": self._cache.generation,
+                "subscription_generation": generation,
                 "detail": detail,
             },
         )
         await self._signal_manager.close_for_tokens(
             normalized,
             decision,
-            observed_at=self._now(),
+            observed_at=market_time,
+        )
+
+    async def _reconcile_unwatchable_signals(
+        self,
+        active_token_ids: tuple[str, ...],
+        *,
+        generation: int,
+        market_time: int | None,
+        detail: str,
+    ) -> None:
+        if market_time is None:
+            _LOGGER.warning(
+                "watch_signal_mutation_skipped "
+                "operation=close_unwatchable_for_active_tokens "
+                "generation=%d detail=%s active_tokens=%d market_time=None",
+                generation,
+                detail,
+                len(active_token_ids),
+            )
+            return
+        close_unwatchable = getattr(
+            self._signal_manager,
+            "close_unwatchable_for_active_tokens",
+            None,
+        )
+        if close_unwatchable is None:
+            return
+        started_at = time.monotonic()
+        result = close_unwatchable(active_token_ids, observed_at=market_time)
+        if inspect.isawaitable(result):
+            await result
+        _LOGGER.info(
+            "watch_signal_reconciliation_completed generation=%d "
+            "market_time=%d active_tokens=%d elapsed_ms=%d",
+            generation,
+            market_time,
+            len(active_token_ids),
+            int((time.monotonic() - started_at) * 1_000),
         )
 
     async def _evaluate_tokens(

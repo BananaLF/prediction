@@ -311,9 +311,10 @@ def _persisted_open_signal() -> tuple[Event, Market, Token, OpportunityPresent]:
     "change_type",
     (MarketChangeType.MARKET_DEACTIVATED, MarketChangeType.EVENT_SETTLED),
 )
-async def test_queued_control_change_closes_persisted_signal_after_empty_restart(
+async def test_queued_control_change_without_market_watermark_skips_persisted_signal_mutation(
     tmp_path: Path,
     change_type: MarketChangeType,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     database_path = tmp_path / "signals.sqlite3"
     writer = DatabaseWriter(database_path)
@@ -382,9 +383,15 @@ async def test_queued_control_change_closes_persisted_signal_after_empty_restart
         running = asyncio.create_task(watch.run())
         try:
             await asyncio.wait_for(changes.join(), timeout=0.1)
-            assert (
-                await signals.find_open_signal_id("BINARY_UNDERPRICED:market-1")
-                is None
+            assert await signals.find_open_signal_id(
+                "BINARY_UNDERPRICED:market-1"
+            ) == "persisted-signal"
+            assert any(
+                record.getMessage().startswith("watch_signal_mutation_skipped ")
+                and "operation=close_for_tokens" in record.getMessage()
+                and "generation=0" in record.getMessage()
+                and "market_time=None" in record.getMessage()
+                for record in caplog.records
             )
         finally:
             await watch.close()
@@ -394,10 +401,11 @@ async def test_queued_control_change_closes_persisted_signal_after_empty_restart
 
 
 @pytest.mark.asyncio
-async def test_start_recovers_open_signal_when_catalog_commit_was_not_queued(
+async def test_start_without_market_watermark_skips_unwatchable_signal_mutation(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A crash after catalog save but before queue publication is reconciled at start."""
+    """A restart cannot invent a business timestamp when no market is watchable."""
 
     database_path = tmp_path / "signals.sqlite3"
     writer = DatabaseWriter(database_path)
@@ -446,7 +454,16 @@ async def test_start_recovers_open_signal_when_catalog_commit_was_not_queued(
         await watch.start()
 
         assert watch.active_token_ids == ()
-        assert await signals.find_open_signal_id("BINARY_UNDERPRICED:market-1") is None
+        assert await signals.find_open_signal_id(
+            "BINARY_UNDERPRICED:market-1"
+        ) == "persisted-signal"
+        assert any(
+            record.getMessage().startswith("watch_signal_mutation_skipped ")
+            and "operation=close_unwatchable_for_active_tokens" in record.getMessage()
+            and "generation=0" in record.getMessage()
+            and "market_time=None" in record.getMessage()
+            for record in caplog.records
+        )
     finally:
         await writer.close()
 
