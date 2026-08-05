@@ -865,6 +865,32 @@ class NoPersistSignals(FakeSignals):
         return None
 
 
+class BlockingApplySignals(FakeSignals):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_apply = False
+        self.apply_entered = asyncio.Event()
+        self.apply_gate = asyncio.Event()
+
+    async def apply(
+        self,
+        decision: Any,
+        opportunity_key: str,
+        expected_revision: int | None,
+        *,
+        observed_at: int,
+    ) -> str:
+        if self.block_apply:
+            self.apply_entered.set()
+            await self.apply_gate.wait()
+        return await super().apply(
+            decision,
+            opportunity_key,
+            expected_revision,
+            observed_at=observed_at,
+        )
+
+
 class GenerationChangingSignals(FakeSignals):
     def __init__(self) -> None:
         super().__init__()
@@ -1370,6 +1396,54 @@ async def test_same_generation_cache_revision_change_fences_stale_evaluation() -
     await evaluation
 
     assert len(signals.applied) == applied_before
+    await watch.close()
+
+
+async def test_signal_apply_is_atomic_with_final_cache_revision_check() -> None:
+    signals = BlockingApplySignals()
+    watch, _, _, _, _, _ = _watch(signals=signals)
+    await watch.start()
+    signals.block_apply = True
+
+    evaluation = asyncio.create_task(
+        watch._evaluate_tokens(("token-1",))  # noqa: SLF001
+    )
+    await asyncio.wait_for(signals.apply_entered.wait(), timeout=1)
+    stream_update = asyncio.create_task(
+        watch._handle_stream_message(  # noqa: SLF001
+            MarketStreamEvent(
+                event_type="price_change",
+                market_id="market-1",
+                payload={
+                    "timestamp": 101,
+                    "price_changes": [
+                        {
+                            "token_id": "token-1",
+                            "side": "BUY",
+                            "price": "0.41",
+                            "size": "9",
+                            "hash": "newer-during-signal-apply",
+                        }
+                    ],
+                },
+                received_timestamp=102,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            ),
+            defer_evaluation=True,
+        )
+    )
+    try:
+        await asyncio.sleep(0)
+        assert not stream_update.done()
+    finally:
+        signals.block_apply = False
+        signals.apply_gate.set()
+        await asyncio.gather(evaluation, stream_update)
+
+    current = watch.cache.get("token-1")
+    assert current is not None
+    assert current.book_hash == "newer-during-signal-apply"
     await watch.close()
 
 

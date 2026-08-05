@@ -1034,7 +1034,10 @@ class WatchTask:
                     if defer_evaluation:
                         self._queue_evaluation((book.token_id,))
                     else:
-                        await self._evaluate_tokens((book.token_id,))
+                        await self._evaluate_tokens(
+                            (book.token_id,),
+                            operation_lock_held=True,
+                        )
                 return
             if message.event_type == "tick_size_change":
                 await self._invalidate_close_recover(
@@ -1204,7 +1207,10 @@ class WatchTask:
             queue_seconds=queue_seconds,
         )
         if not defer_evaluation:
-            await self._evaluate_tokens(changed)
+            await self._evaluate_tokens(
+                changed,
+                operation_lock_held=True,
+            )
 
     def _record_price_change_progress(
         self,
@@ -1840,7 +1846,11 @@ class WatchTask:
             return
         evaluation_started_at = time.monotonic()
         _LOGGER.info("watch_evaluation_started tokens=%d", len(token_ids))
-        await self._evaluate_tokens(token_ids, force_log=True)
+        await self._evaluate_tokens(
+            token_ids,
+            force_log=True,
+            operation_lock_held=True,
+        )
         _LOGGER.info(
             "watch_evaluation_completed tokens=%d elapsed_ms=%d",
             len(token_ids),
@@ -1970,6 +1980,7 @@ class WatchTask:
         token_ids: Sequence[str],
         *,
         force_log: bool = False,
+        operation_lock_held: bool = False,
     ) -> None:
         if self._closed or self._cache.state is not CacheState.VALID:
             return
@@ -2131,12 +2142,27 @@ class WatchTask:
                         self._log_evaluation_aborted(generation, "before_signal_apply")
                         return
                     signal_apply_started_at = time.monotonic()
-                    signal_id = await self._signal_manager.apply(
-                        decision,
-                        target.opportunity_key,
-                        target.expected_revision,
-                        observed_at=market_time,
-                    )
+                    if operation_lock_held:
+                        signal_id = await self._signal_manager.apply(
+                            decision,
+                            target.opportunity_key,
+                            target.expected_revision,
+                            observed_at=market_time,
+                        )
+                    else:
+                        async with self._operation_lock:
+                            if not self._evaluation_is_current(generation, revision):
+                                self._log_evaluation_aborted(
+                                    generation,
+                                    "signal_apply_lock_acquired",
+                                )
+                                return
+                            signal_id = await self._signal_manager.apply(
+                                decision,
+                                target.opportunity_key,
+                                target.expected_revision,
+                                observed_at=market_time,
+                            )
                     signal_apply_elapsed += time.monotonic() - signal_apply_started_at
                 except SubscriptionGenerationChanged as error:
                     self._log_evaluation_aborted(
