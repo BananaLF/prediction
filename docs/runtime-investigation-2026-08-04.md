@@ -902,3 +902,13 @@
 - 无信号直接原因：166 条摘要包含 `ABSENT.PROFIT_BELOW_THRESHOLD`，少量批次同时包含缺少执行深度；本轮最优实际收益率为 `-0.01192459`，仍低于要求的 `0.00750000`，差约 1.94 个百分点。最新候选和 market id 持续变化，说明不是停留在旧快照。
 - 数据库证据：`arbitrage_signals=2`、`signal_revisions=4`、最大 `observed_at=1785828290572`，两条信号均为启动前已有的 `CLOSED`；`PRAGMA quick_check=ok`。本检查点没有把历史信号误计为本轮信号。
 - 结论：同步、订阅、评估和 SQLite 持久化链路当前均无故障证据；尚未产生新信号的原因是市场条件未达到收益阈值。保持进程运行并继续按半小时检查日志与数据库，直到观察到本轮新 revision 和对应 `signal_transition`。
+
+## ISSUE-104：WebSocket close 日志缺少入口帧缓冲的回压现场
+
+- 状态：诊断盲区已补齐并通过 RED/GREEN；新进程正在等待真实高流量断线复验，尚未把默认帧缓冲认定为根因。
+- 真实现象：04:17 启动的进程在 05:00:14–05:06:24 之间连续出现 16 次连接丢失，其中 4 次服务端明确返回 `1013 slow consumer: send buffer full`，其余主要是 1006 和不完整 WebSocket 帧。每次 fail-closed 恢复约 0.7–1.8 秒完成，runtime 未退出，数据库保持启动前 4 条 revision。
+- 已排除范围：断线前 Gateway handoff queue 约为 1/4096，SDK handle queue 为 0/65536，handle/manager drop 均为 0，Watch 单条行情缓存处理约 0.16–0.20ms；这些已有日志无法解释服务端为何认为客户端消费慢。
+- 新发现：固定 SDK 调用 `websockets.connect()` 时没有传入 `max_queue`，因此使用 websockets 15.0.1 默认的 16-frame 高水位。该队列位于 SDK handle queue 和 Gateway handoff queue 之前，超过高水位会暂停 transport reading；旧 close 日志没有记录其大小和 paused 状态，无法验证是否在断线现场触发回压。
+- 修复：`market_stream_connection_lost` 新增 `websocket_frame_queue_size/high/low/paused`，直接从发生 close 的 socket assembler 读取；对象形状不可用时输出 `unavailable`，不影响 SDK 原始回调和恢复语义。当前只增加证据，不修改私有 SDK 或缓冲参数。
+- RED/GREEN：close-path 测试先要求输出模拟的 `size=3/high=16/low=4/paused=True`，旧实现稳定失败；最小实现后通过，`tests/unit/polymarket/test_gateway.py` 全量 80 个测试通过，compileall 和 `git diff --check` 通过。项目环境没有安装 `ruff`，未将该项计为已验证。
+- 重启验证：旧进程收到一次 `Ctrl-C` 后正常以退出码 0 停止；新代码于 05:07:27 启动，05:07:40 输出 `component_started` 和 `runtime_started`，后台完整同步随后异步开始，Watch 持续消费和评估。等待下一次真实 close 读取新增字段后，再决定是否需要调整入口帧缓冲。

@@ -1333,6 +1333,12 @@ async def test_market_stream_connection_lost_logs_reader_exception_and_heartbeat
         close_code=1006,
         close_reason="",
         recv_exc=ConnectionResetError(54, "Connection reset by peer"),
+        recv_messages=SimpleNamespace(
+            frames=(object(), object(), object()),
+            high=16,
+            low=4,
+            paused=True,
+        ),
         latency=0.125,
         transport=SimpleNamespace(is_closing=lambda: True),
         protocol=SimpleNamespace(parser_exc=EOFError("stream ended")),
@@ -1349,6 +1355,10 @@ async def test_market_stream_connection_lost_logs_reader_exception_and_heartbeat
     assert "parser_exception_type=EOFError" in caplog.text
     assert "heartbeat_age_seconds=10.000" in caplog.text
     assert "websocket_latency_seconds=0.125" in caplog.text
+    assert "websocket_frame_queue_size=3" in caplog.text
+    assert "websocket_frame_queue_high=16" in caplog.text
+    assert "websocket_frame_queue_low=4" in caplog.text
+    assert "websocket_frame_queue_paused=True" in caplog.text
     assert "transport_closing=True" in caplog.text
     await subscription.close()
 

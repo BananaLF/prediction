@@ -1552,6 +1552,23 @@ class PolymarketGateway:
                     if isinstance(latency, int | float)
                     else "unavailable"
                 )
+                recv_messages = getattr(socket, "recv_messages", None)
+                frame_queue = getattr(recv_messages, "frames", None)
+                try:
+                    frame_queue_size = (
+                        len(frame_queue)
+                        if frame_queue is not None
+                        else "unavailable"
+                    )
+                except TypeError:
+                    frame_queue_size = "unavailable"
+                frame_queue_high = getattr(
+                    recv_messages, "high", "unavailable"
+                )
+                frame_queue_low = getattr(recv_messages, "low", "unavailable")
+                frame_queue_paused = getattr(
+                    recv_messages, "paused", "unavailable"
+                )
                 transport = getattr(socket, "transport", None)
                 is_closing = getattr(transport, "is_closing", None)
                 transport_closing = is_closing() if callable(is_closing) else "unavailable"
@@ -1560,6 +1577,9 @@ class PolymarketGateway:
                     "socket_state=%s reader_exception_type=%s reader_exception=%r "
                     "parser_exception_type=%s parser_exception=%r "
                     "heartbeat_age_seconds=%s websocket_latency_seconds=%s "
+                    "websocket_frame_queue_size=%s "
+                    "websocket_frame_queue_high=%s websocket_frame_queue_low=%s "
+                    "websocket_frame_queue_paused=%s "
                     "transport_closing=%s",
                     code,
                     reason,
@@ -1570,6 +1590,10 @@ class PolymarketGateway:
                     str(parser_error) if parser_error is not None else "",
                     heartbeat_age,
                     websocket_latency,
+                    frame_queue_size,
+                    frame_queue_high,
+                    frame_queue_low,
+                    frame_queue_paused,
                     transport_closing,
                 )
             finally:
