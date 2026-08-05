@@ -11,13 +11,20 @@ from typing import Any
 import pytest
 
 from predmarket.catalog.changes import MarketChange, MarketChangeType
+from predmarket.config import StrategyConfig
 from predmarket.domain.fees import FeeModel, FeeSchedule
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
-from predmarket.domain.signal import DecisionReason, NotEvaluable
+from predmarket.domain.signal import (
+    DecisionReason,
+    NotEvaluable,
+    StrategyContext,
+    StrategyType,
+)
 from predmarket.persistence.repositories import CatalogSnapshot
 from predmarket.polymarket.gateway import (
     MarketRecoveryInvalidatedError,
+    MarketRecoveryTransientError,
     MarketStreamEvent,
     MarketStreamInvalidated,
 )
@@ -87,8 +94,14 @@ def _catalog(*, second_market: bool = False, first_active: bool = True) -> Catal
 
 
 def _book(token_id: str, generation: int, *, market_id: str | None = None) -> OrderBook:
+    inferred_market_id = {
+        "token-3": "market-2",
+        "token-4": "market-2",
+        "token-5": "market-3",
+        "token-6": "market-3",
+    }.get(token_id, "market-1")
     return OrderBook(
-        market_id=market_id or ("market-2" if token_id in {"token-3", "token-4"} else "market-1"),
+        market_id=market_id or inferred_market_id,
         token_id=token_id,
         bids=(OrderBookLevel(Decimal("0.40"), Decimal("3")),),
         asks=(OrderBookLevel(Decimal("0.50"), Decimal("4")),),
@@ -123,6 +136,19 @@ class FakeSubscription:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class CloseOnReadCancellationSubscription(FakeSubscription):
+    """Mirror the production subscription's close-on-cancel read contract."""
+
+    async def __anext__(self):
+        if self.closed:
+            raise StopAsyncIteration
+        try:
+            return await super().__anext__()
+        except asyncio.CancelledError:
+            await self.close()
+            raise
 
 
 class FailOnceCloseSubscription(FakeSubscription):
@@ -296,6 +322,53 @@ class TransientRecoveryGateway(FakeGateway):
         return await super().recover_market_session(token_ids)
 
 
+class TransientRequestRecoveryGateway(FakeGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recovery_calls = 0
+
+    async def recover_market_session(self, token_ids: tuple[str, ...]):
+        self.recovery_calls += 1
+        if self.recovery_calls == 1:
+            raise MarketRecoveryTransientError(
+                "request_rejected",
+                status=502,
+                retry_after=0.001,
+            )
+        return await super().recover_market_session(token_ids)
+
+
+class InvalidSnapshotOnceGateway(FakeGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recovery_calls = 0
+
+    async def recover_market_session(self, token_ids: tuple[str, ...]):
+        self.recovery_calls += 1
+        if self.recovery_calls != 1:
+            return await super().recover_market_session(token_ids)
+        self.generations += 1
+        generation = self.generations
+        normalized = tuple(token_ids)
+        self.requests.append(normalized)
+        subscription = self.subscription_factory(generation)
+        self.subscriptions.append(subscription)
+        books = tuple(_book(token_id, generation) for token_id in normalized)
+        books = (
+            replace(
+                books[0],
+                bids=(OrderBookLevel(Decimal("0.60"), Decimal("3")),),
+                asks=(OrderBookLevel(Decimal("0.50"), Decimal("4")),),
+            ),
+            *books[1:],
+        )
+        return SimpleNamespace(
+            order_books=books,
+            subscription=subscription,
+            subscription_generation=generation,
+        )
+
+
 class NonRetryableRecoveryGateway(FakeGateway):
     async def recover_market_session(self, token_ids: tuple[str, ...]):
         raise MarketRecoveryInvalidatedError("sdk_version_changed")
@@ -330,11 +403,52 @@ class PruningRecoveryGateway(FakeGateway):
         )
 
 
+class PrunesOneMarketOnceGateway(FakeGateway):
+    async def recover_market_session(self, token_ids: tuple[str, ...]):
+        if self.requests:
+            return await super().recover_market_session(token_ids)
+        self.generations += 1
+        generation = self.generations
+        normalized = tuple(token_ids)
+        effective = tuple(
+            token_id for token_id in normalized if token_id not in {"token-3", "token-4"}
+        )
+        self.requests.append(normalized)
+        subscription = self.subscription_factory(generation)
+        self.subscriptions.append(subscription)
+        return SimpleNamespace(
+            token_ids=effective,
+            order_books=tuple(_book(token_id, generation) for token_id in effective),
+            subscription=subscription,
+            subscription_generation=generation,
+        )
+
+
+class PrunesAllMarketsGateway(FakeGateway):
+    async def recover_market_session(self, token_ids: tuple[str, ...]):
+        if not token_ids:
+            raise AssertionError("empty recovery scope must not reach the gateway")
+        self.generations += 1
+        generation = self.generations
+        normalized = tuple(token_ids)
+        self.requests.append(normalized)
+        subscription = self.subscription_factory(generation)
+        self.subscriptions.append(subscription)
+        return SimpleNamespace(
+            token_ids=(),
+            order_books=(),
+            subscription=subscription,
+            subscription_generation=generation,
+        )
+
+
 class FakeCatalog:
     def __init__(self, snapshot: CatalogSnapshot) -> None:
         self.snapshot = snapshot
+        self.load_calls = 0
 
     async def load_catalog(self) -> CatalogSnapshot:
+        self.load_calls += 1
         return self.snapshot
 
 
@@ -373,6 +487,45 @@ class StartupRefreshingGateway(FakeGateway):
             ),
             mapping_version="startup-refresh-test",
         )
+
+
+class BlockingRecoveryRefillGateway(StartupRefreshingGateway):
+    def __init__(self, snapshot: CatalogSnapshot) -> None:
+        super().__init__(snapshot)
+        self.refill_refresh_started = asyncio.Event()
+        self.release_refill_refresh = asyncio.Event()
+
+    async def recover_market_session(self, token_ids: tuple[str, ...]):
+        if self.requests:
+            return await super().recover_market_session(token_ids)
+        self.generations += 1
+        generation = self.generations
+        normalized = tuple(token_ids)
+        effective = tuple(
+            token_id
+            for token_id in normalized
+            if token_id not in {"token-3", "token-4"}
+        )
+        self.requests.append(normalized)
+        subscription = self.subscription_factory(generation)
+        self.subscriptions.append(subscription)
+        return SimpleNamespace(
+            token_ids=effective,
+            order_books=tuple(_book(token_id, generation) for token_id in effective),
+            subscription=subscription,
+            subscription_generation=generation,
+        )
+
+    async def refresh_market(self, market_id: str) -> MarketSnapshot:
+        if market_id == "market-3":
+            self.refill_refresh_started.set()
+            await self.release_refill_refresh.wait()
+        return await super().refresh_market(market_id)
+
+
+class FailingStartupRefreshingGateway(FakeGateway):
+    async def refresh_market(self, market_id: str) -> MarketSnapshot:
+        raise RuntimeError("upstream response " + "x" * 2_000)
 
 
 class StartupPersistingCatalog(FakeCatalog):
@@ -553,6 +706,40 @@ class FakeStrategy:
         )
 
 
+class CausalityDiagnosticStrategy(FakeStrategy):
+    def evaluate(self, context: Any) -> NotEvaluable:
+        self.calls.append(context)
+        skew_ms = 150 if context.changed_token_id == "token-1" else 240
+        return NotEvaluable(
+            DecisionReason.ORDERBOOK_INVALID,
+            {
+                "changed_token_id": context.changed_token_id,
+                "detail": "orderbook_timestamp_causality_invalid",
+                "token_id": context.changed_token_id,
+                "exchange_timestamp": 1_000 + skew_ms,
+                "received_timestamp": 1_000,
+                "exchange_clock_skew_ms": skew_ms,
+                "maximum_exchange_clock_skew_ms": 100,
+            },
+        )
+
+
+class AdvancingClockStrategy(FakeStrategy):
+    def __init__(self, clock: list[int]) -> None:
+        super().__init__()
+        self._clock = clock
+        self.advance_to: int | None = None
+
+    def evaluate(self, context: Any) -> NotEvaluable:
+        self.calls.append(context)
+        if self.advance_to is not None:
+            self._clock[0] = self.advance_to
+        return NotEvaluable(
+            DecisionReason.INPUT_METADATA_MISSING,
+            {"changed_token_id": context.changed_token_id},
+        )
+
+
 class BlockingStreamStrategy(FakeStrategy):
     def __init__(self) -> None:
         super().__init__()
@@ -653,6 +840,9 @@ def _watch(
     strategy: FakeStrategy | None = None,
     signals: FakeSignals | None = None,
     context_source: FakeContextSource | None = None,
+    clock_ms: Any | None = None,
+    market_limit: int = 100,
+    minimum_end_horizon_seconds: int = 1_800,
 ) -> tuple[WatchTask, FakeGateway, FakeCatalog, FakeChanges, FakeStrategy, FakeSignals]:
     gateway = gateway or FakeGateway()
     catalog = catalog or FakeCatalog(_catalog())
@@ -668,6 +858,9 @@ def _watch(
             strategy_engine=strategy,
             signal_manager=signals,
             context_source=context_source,
+            clock_ms=clock_ms,
+            market_limit=market_limit,
+            minimum_end_horizon_seconds=minimum_end_horizon_seconds,
         ),
         gateway,
         catalog,
@@ -756,6 +949,27 @@ async def test_evaluation_summary_logs_stage_timings(
     await watch.close()
 
 
+async def test_evaluation_summary_logs_largest_exchange_clock_skew(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    watch, _, _, _, _, _ = _watch(strategy=CausalityDiagnosticStrategy())
+
+    with caplog.at_level(logging.INFO, logger="predmarket.watch.task"):
+        await watch.start()
+
+    summary = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("watch_evaluation_summary ")
+    )
+    assert "exchange_clock_skew_ms=240" in summary
+    assert "exchange_clock_skew_limit_ms=100" in summary
+    assert "exchange_clock_skew_token_id=token-2" in summary
+    assert "exchange_timestamp=1240" in summary
+    assert "received_timestamp=1000" in summary
+    await watch.close()
+
+
 async def test_evaluation_summary_rate_limits_ordinary_live_batches(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -809,6 +1023,69 @@ async def test_evaluation_prefers_batch_context_materialization() -> None:
     await watch.start()
 
     assert context_source.batch_calls == [("token-1", "token-2")]
+    await watch.close()
+
+
+async def test_evaluation_rejects_book_that_becomes_stale_while_strategy_runs() -> None:
+    clock = [100]
+    configuration = StrategyConfig(
+        bankroll=Decimal("1000"),
+        minimum_return_rate=Decimal("0.0075"),
+        maximum_risk_rate=Decimal("1"),
+        maximum_unhedged_notional=Decimal("1000"),
+        safety_buffer_rate=Decimal("0"),
+        conversion_cost=Decimal("0"),
+        maximum_book_age_ms=1_000,
+        maximum_exchange_clock_skew_ms=100,
+        maximum_leg_skew_ms=250,
+    )
+
+    class ContextSource(FakeContextSource):
+        def contexts_for(
+            self,
+            changed_token_id: str,
+            orderbooks: tuple[OrderBook, ...],
+        ) -> tuple[EvaluationTarget, ...]:
+            return (
+                EvaluationTarget(
+                    context=StrategyContext(
+                        strategy_type=StrategyType.BINARY_UNDERPRICED,
+                        changed_token_id=changed_token_id,
+                        markets=(_market("market-1"),),
+                        tokens=(
+                            _token("token-1", "market-1", 0),
+                            _token("token-2", "market-1", 1),
+                        ),
+                        approved_implication_relation=None,
+                        orderbooks=orderbooks,
+                        fee_schedules={},
+                        evaluated_at=1,
+                        configuration=configuration,
+                    ),
+                    opportunity_key=f"opportunity:{changed_token_id}",
+                    expected_revision=None,
+                ),
+            )
+
+    strategy = AdvancingClockStrategy(clock)
+    signals = FakeSignals()
+    watch, _, _, _, _, _ = _watch(
+        strategy=strategy,
+        signals=signals,
+        context_source=ContextSource(),
+        clock_ms=lambda: clock[0],
+    )
+    await watch.start()
+    strategy.calls.clear()
+    signals.applied.clear()
+    clock[0] = 100
+    watch._last_orderbook_observed_at_ms = 100  # noqa: SLF001
+    strategy.advance_to = 1_101
+
+    await watch._evaluate_tokens(("token-1",))  # noqa: SLF001
+
+    assert strategy.calls[0].evaluated_at == 100
+    assert signals.applied[0][0].reason_code is DecisionReason.ORDERBOOK_STALE
     await watch.close()
 
 
@@ -1094,6 +1371,27 @@ async def test_start_refreshes_selected_market_metadata_before_context_and_recov
     await watch.close()
 
 
+async def test_start_bounds_partial_refresh_failure_samples(caplog) -> None:
+    catalog = StartupPersistingCatalog(_catalog())
+    watch, _, _, _, _, _ = _watch(
+        gateway=FailingStartupRefreshingGateway(),
+        catalog=catalog,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="predmarket.watch.task"):
+        await watch.start()
+
+    message = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("watch_catalog_refresh_partial_failure")
+    )
+    assert "market-1:RuntimeError:upstream response" in message
+    assert "x" * 129 not in message
+    assert len(message) < 500
+    await watch.close()
+
+
 async def test_run_refreshes_active_market_metadata_periodically() -> None:
     original = _catalog()
     gateway = StartupRefreshingGateway(original)
@@ -1118,6 +1416,7 @@ async def test_run_refreshes_active_market_metadata_periodically() -> None:
         assert gateway.refreshed_market_ids == ["market-1", "market-1"]
         assert catalog.saved_market_ids == [("market-1",), ("market-1",)]
         assert context_source.snapshots[-1] == catalog.snapshot
+        assert catalog.load_calls == 1
     finally:
         await watch.close()
         await task
@@ -1154,6 +1453,59 @@ async def test_market_update_refreshes_context_catalog_before_scope_shortcut() -
     await watch.close()
 
 
+async def test_same_sync_generation_prepares_catalog_once_and_keeps_controls() -> None:
+    context_source = CatalogAwareContextSource()
+    catalog = FakeCatalog(_catalog())
+    signals = FakeSignals()
+    watch, _, _, _, _, _ = _watch(
+        catalog=catalog,
+        context_source=context_source,
+        signals=signals,
+    )
+    await watch.start()
+    baseline_load_calls = catalog.load_calls
+    baseline_closures = len(signals.closed)
+
+    await watch.handle_market_change(
+        MarketChange(
+            change_id="sync-generation:MARKET_UPDATED:market-1",
+            change_type=MarketChangeType.MARKET_UPDATED,
+            event_id="event-1",
+            market_id="market-1",
+            token_ids=("token-1", "token-2"),
+            occurred_at=200,
+        )
+    )
+    await watch.handle_market_change(
+        MarketChange(
+            change_id="sync-generation:MARKET_DEACTIVATED:market-2",
+            change_type=MarketChangeType.MARKET_DEACTIVATED,
+            event_id="event-1",
+            market_id="market-2",
+            token_ids=("token-3", "token-4"),
+            occurred_at=200,
+            critical=True,
+        )
+    )
+    await watch.handle_market_change(
+        MarketChange(
+            change_id="sync-generation:MARKET_DEACTIVATED:market-1",
+            change_type=MarketChangeType.MARKET_DEACTIVATED,
+            event_id="event-1",
+            market_id="market-1",
+            token_ids=("token-1", "token-2"),
+            occurred_at=200,
+            critical=True,
+        )
+    )
+
+    assert catalog.load_calls == baseline_load_calls + 1
+    assert context_source.snapshots == [catalog.snapshot, catalog.snapshot]
+    assert signals.closed[baseline_closures][0] == ("token-3", "token-4")
+    assert len(signals.closed) == baseline_closures + 1
+    await watch.close()
+
+
 async def test_start_adopts_gateway_pruned_recovery_scope() -> None:
     gateway = PruningRecoveryGateway()
     signals = FakeSignals()
@@ -1177,6 +1529,111 @@ async def test_start_adopts_gateway_pruned_recovery_scope() -> None:
     }
     assert signals.closed[0][0] == ("token-3", "token-4")
     assert signals.closed[0][1].reason_code is DecisionReason.ORDERBOOK_INVALID
+    await watch.close()
+
+
+async def test_start_refills_market_removed_from_recovery_scope(caplog) -> None:
+    markets = tuple(_market(f"market-{index}") for index in range(1, 4))
+    tokens = tuple(
+        _token(f"token-{(index - 1) * 2 + position + 1}", market.id, position)
+        for index, market in enumerate(markets, start=1)
+        for position in (0, 1)
+    )
+    snapshot = CatalogSnapshot(
+        events=(_event(tuple(market.id for market in markets)),),
+        markets=markets,
+        tokens=tokens,
+    )
+    gateway = PrunesOneMarketOnceGateway()
+    catalog = FakeCatalog(snapshot)
+    watch, _, _, _, _, _ = _watch(
+        gateway=gateway,
+        catalog=catalog,
+        market_limit=2,
+    )
+
+    with caplog.at_level(logging.INFO, logger="predmarket.watch.task"):
+        await watch.start()
+
+    assert gateway.requests == [
+        ("token-1", "token-2", "token-3", "token-4"),
+        ("token-1", "token-2", "token-5", "token-6"),
+    ]
+    assert gateway.subscriptions[0].closed is True
+    assert watch.active_token_ids == (
+        "token-1",
+        "token-2",
+        "token-5",
+        "token-6",
+    )
+    assert tuple(book.token_id for book in watch.cache.view()) == watch.active_token_ids
+    assert catalog.load_calls == 1
+    assert any(
+        record.getMessage().startswith("watch_recovery_refill_prepared")
+        for record in caplog.records
+    )
+    await watch.close()
+
+
+async def test_recovery_refill_does_not_overwrite_newer_catalog_context() -> None:
+    markets = tuple(_market(f"market-{index}") for index in range(1, 4))
+    tokens = tuple(
+        _token(f"token-{(index - 1) * 2 + position + 1}", market.id, position)
+        for index, market in enumerate(markets, start=1)
+        for position in (0, 1)
+    )
+    snapshot = CatalogSnapshot(
+        events=(_event(tuple(market.id for market in markets)),),
+        markets=markets,
+        tokens=tokens,
+    )
+    gateway = BlockingRecoveryRefillGateway(snapshot)
+    catalog = StartupPersistingCatalog(snapshot)
+    context_source = CatalogAwareContextSource()
+    watch, _, _, _, _, _ = _watch(
+        gateway=gateway,
+        catalog=catalog,
+        context_source=context_source,
+        market_limit=2,
+    )
+    start_task = asyncio.create_task(watch.start())
+    try:
+        await asyncio.wait_for(gateway.refill_refresh_started.wait(), timeout=1)
+        current = context_source.snapshots[-1]
+        newer = replace(
+            current,
+            events=(replace(current.events[0], title="Newer catalog"),),
+        )
+        await watch._prepare_context_catalog(newer)
+        gateway.release_refill_refresh.set()
+        await asyncio.wait_for(start_task, timeout=1)
+
+        assert context_source.snapshots[-1].events[0].title == "Newer catalog"
+    finally:
+        gateway.release_refill_refresh.set()
+        await asyncio.gather(start_task, return_exceptions=True)
+        await watch.close()
+
+
+async def test_start_stops_recovery_when_pruning_leaves_no_watchable_market(
+    caplog,
+) -> None:
+    gateway = PrunesAllMarketsGateway()
+    watch, _, _, _, _, _ = _watch(
+        gateway=gateway,
+        catalog=FakeCatalog(_catalog()),
+    )
+
+    with caplog.at_level(logging.INFO, logger="predmarket.watch.task"):
+        await watch.start()
+
+    assert gateway.requests == [("token-1", "token-2")]
+    assert gateway.subscriptions[0].closed is True
+    assert watch.active_token_ids == ()
+    assert any(
+        record.getMessage().startswith("watch_recovery_refill_unavailable")
+        for record in caplog.records
+    )
     await watch.close()
 
 
@@ -1204,6 +1661,26 @@ def test_watchable_subscription_selects_complete_unexpired_markets_with_limit() 
 
     assert market_ids == ("market-b",)
     assert token_ids == ("token-market-b-0", "token-market-b-1")
+
+
+def test_watchable_subscription_excludes_markets_inside_minimum_end_horizon() -> None:
+    near = replace(_market("market-near"), end_at=1_801_000)
+    far = replace(_market("market-far"), end_at=1_801_001)
+    tokens = tuple(
+        _token(f"token-{market.id}-{position}", market.id, position)
+        for market in (near, far)
+        for position in (0, 1)
+    )
+
+    token_ids, market_ids = _watchable_subscription(
+        CatalogSnapshot(events=(), markets=(near, far), tokens=tokens),
+        now_ms=1_000,
+        market_limit=2,
+        minimum_end_horizon_ms=1_800_000,
+    )
+
+    assert market_ids == ("market-far",)
+    assert token_ids == ("token-market-far-0", "token-market-far-1")
 
 
 def test_watchable_subscription_rejects_market_with_incomplete_token_generation() -> None:
@@ -1253,8 +1730,40 @@ async def test_start_and_close_allow_an_empty_catalog_without_recovery() -> None
     assert running.done() is True
 
 
-async def test_acquired_change_is_acknowledged_once_when_reader_cleanup_is_cancelled() -> None:
-    # Catches cancellation between successful queue get and pending-reader cleanup.
+async def test_unchanged_market_update_keeps_pending_subscription_open() -> None:
+    gateway = FakeGateway()
+    gateway.subscription_factory = CloseOnReadCancellationSubscription
+    changes = FakeChanges()
+    watch, _, _, _, _, _ = _watch(gateway=gateway, changes=changes)
+    running = asyncio.create_task(watch.run())
+    try:
+        async with asyncio.timeout(1):
+            while not gateway.subscriptions or not gateway.subscriptions[0].reader_tasks:
+                await asyncio.sleep(0)
+        first = gateway.subscriptions[0]
+
+        await changes.items.put(
+            MarketChange(
+                change_id="unchanged-market-update",
+                change_type=MarketChangeType.MARKET_UPDATED,
+                event_id="event-1",
+                market_id="market-1",
+                token_ids=("token-1", "token-2"),
+                occurred_at=200,
+            )
+        )
+        await asyncio.wait_for(changes.join(), timeout=1)
+        await asyncio.sleep(0)
+
+        assert first.closed is False
+        assert gateway.requests == [("token-1", "token-2")]
+    finally:
+        await watch.close()
+        await running
+
+
+async def test_acquired_change_is_acknowledged_once_during_reader_cleanup() -> None:
+    # Catches terminal reader cleanup acknowledging an already handled change twice.
     gateway = FakeGateway()
     gateway.subscription_factory = CancellationDelayedSubscription
     changes = FakeChanges()
@@ -1276,11 +1785,13 @@ async def test_acquired_change_is_acknowledged_once_when_reader_cleanup_is_cance
             occurred_at=200,
         )
     )
-    await subscription.read_cancelled.wait()
+    await asyncio.wait_for(changes.join(), timeout=1)
 
     running.cancel()
+    await subscription.read_cancelled.wait()
+    running.cancel()
     await asyncio.sleep(0)
-    assert changes.done == 0
+    assert changes.done == 1
 
     subscription.release_reader.set()
     with pytest.raises(asyncio.CancelledError):
@@ -1592,6 +2103,50 @@ async def test_transient_recovery_invalidation_retries_without_exiting_watch(
     await watch.close()
 
 
+async def test_transient_recovery_request_retries_without_exiting_watch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gateway = TransientRequestRecoveryGateway()
+    watch, _, _, _, _, _ = _watch(gateway=gateway)
+    watch._recovery_retry_initial_seconds = 0.001
+
+    with caplog.at_level(logging.INFO, logger="predmarket.watch.task"):
+        await watch.start()
+
+    assert gateway.recovery_calls == 2
+    assert watch.cache.state is CacheState.VALID
+    assert any(
+        record.getMessage().startswith("watch_recovery_retry_scheduled ")
+        and "reason=request_rejected" in record.getMessage()
+        and "status=502" in record.getMessage()
+        for record in caplog.records
+    )
+    await watch.close()
+
+
+async def test_invalid_recovery_snapshot_closes_subscription_and_retries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gateway = InvalidSnapshotOnceGateway()
+    watch, _, _, _, _, _ = _watch(gateway=gateway)
+    watch._recovery_retry_initial_seconds = 0.001
+
+    with caplog.at_level(logging.INFO, logger="predmarket.watch.task"):
+        await watch.start()
+
+    assert gateway.recovery_calls == 2
+    assert gateway.subscriptions[0].closed is True
+    assert gateway.subscriptions[1].closed is False
+    assert watch.cache.state is CacheState.VALID
+    assert any(
+        record.getMessage().startswith("watch_recovery_retry_scheduled ")
+        and "reason=cache_snapshot_invalid:best bid must be below best ask"
+        in record.getMessage()
+        for record in caplog.records
+    )
+    await watch.close()
+
+
 async def test_non_retryable_recovery_invalidation_exits_immediately() -> None:
     watch, _, _, _, _, _ = _watch(gateway=NonRetryableRecoveryGateway())
 
@@ -1640,6 +2195,32 @@ async def test_deactivated_market_unsubscribes_and_closes_with_market_reason() -
         and decision.reason_code is DecisionReason.MARKET_CLOSED
         for token_ids, decision in signals.closed
     )
+    await watch.close()
+
+
+async def test_stale_deactivation_does_not_close_active_catalog_tokens() -> None:
+    """A stale sync control must not override the committed catalog state."""
+    watch, gateway, _, _, _, signals = _watch()
+    await watch.start()
+    original_subscription = gateway.subscriptions[0]
+    baseline_closures = len(signals.closed)
+
+    await watch.handle_market_change(
+        MarketChange(
+            change_id="stale-sync:MARKET_DEACTIVATED:market-1",
+            change_type=MarketChangeType.MARKET_DEACTIVATED,
+            event_id="event-1",
+            market_id="market-1",
+            token_ids=("token-1", "token-2"),
+            occurred_at=202,
+            critical=True,
+        )
+    )
+
+    assert gateway.requests == [("token-1", "token-2")]
+    assert original_subscription.closed is False
+    assert len(signals.closed) == baseline_closures
+    assert watch.active_token_ids == ("token-1", "token-2")
     await watch.close()
 
 
@@ -2372,6 +2953,91 @@ async def test_price_change_uses_local_arrival_sequence_and_evaluates_changed_to
     assert "parse_ms_per_message=" in caplog.text
     assert "cache_ms_per_message=" in caplog.text
     assert "book_levels_per_message=" in caplog.text
+    await watch.close()
+
+
+async def test_crossed_price_change_logs_bounded_server_and_cache_context(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    watch, _, _, _, _, _ = _watch()
+    await watch.start()
+
+    with caplog.at_level(logging.WARNING, logger="predmarket.watch.task"):
+        await watch.handle_stream_message(
+            MarketStreamEvent(
+                event_type="price_change",
+                market_id="market-1",
+                payload={
+                    "timestamp": 110,
+                    "price_changes": [
+                        {
+                            "token_id": "token-1",
+                            "side": "BUY",
+                            "price": "0.55",
+                            "size": "9",
+                            "hash": "crossed-hash",
+                            "best_bid": "0.55",
+                            "best_ask": "0.50",
+                        }
+                    ],
+                },
+                received_timestamp=111,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+
+    assert "watch_price_change_invalid" in caplog.text
+    assert "market_id=market-1 generation=1" in caplog.text
+    assert "exchange_timestamp=110 received_timestamp=111" in caplog.text
+    assert "token_id=token-1 side=BUY price=0.55 size=9" in caplog.text
+    assert "server_best_bid=0.55 server_best_ask=0.50" in caplog.text
+    assert "cache_best_bid=0.40 cache_best_ask=0.50" in caplog.text
+    await watch.close()
+
+
+async def test_price_change_reconciles_stale_top_with_server_best_prices() -> None:
+    watch, gateway, _, _, _, _ = _watch()
+    await watch.start()
+    baseline = replace(
+        _book("token-1", 1),
+        asks=(
+            OrderBookLevel(Decimal("0.41"), Decimal("2")),
+            OrderBookLevel(Decimal("0.50"), Decimal("4")),
+        ),
+        exchange_timestamp=105,
+    )
+    assert watch.cache.apply_book(baseline) is True
+
+    await watch.handle_stream_message(
+        MarketStreamEvent(
+            event_type="price_change",
+            market_id="market-1",
+            payload={
+                "timestamp": 110,
+                "price_changes": [
+                    {
+                        "token_id": "token-1",
+                        "side": "BUY",
+                        "price": "0.41",
+                        "size": "9",
+                        "hash": "post-hash",
+                        "best_bid": "0.41",
+                        "best_ask": "0.5",
+                    }
+                ],
+            },
+            received_timestamp=111,
+            subscription_generation=1,
+            mapping_version="mapping-v1",
+        )
+    )
+
+    book = watch.cache.get("token-1")
+    assert book is not None
+    assert book.bids[0].price == Decimal("0.41")
+    assert book.asks[0].price == Decimal("0.50")
+    assert len(gateway.requests) == 1
     await watch.close()
 
 

@@ -256,10 +256,13 @@ def test_binary_uses_subscription_observation_for_unchanged_books(
     assert isinstance(decision, OpportunityPresent)
 
 
-def test_binary_uses_exchange_time_for_freshness_and_enforces_causality(
-    context_factory, market_factory, token_factory, book_factory
+def test_binary_uses_exchange_time_for_freshness_and_bounded_clock_skew(
+    context_factory,
+    market_factory,
+    token_factory,
+    book_factory,
 ) -> None:
-    # Catches a freshly received but old snapshot, or exchange time after receipt.
+    # Catches a freshly received old snapshot while tolerating bounded clock skew.
     base = _binary_context(
         context_factory,
         market_factory,
@@ -274,21 +277,38 @@ def test_binary_uses_exchange_time_for_freshness_and_enforces_causality(
             for book in base.orderbooks
         ),
     )
-    impossible_time = replace(
+    tolerated_clock_skew = replace(
         base,
         orderbooks=tuple(
             replace(book, exchange_timestamp=1_100, received_timestamp=1_000)
             for book in base.orderbooks
         ),
     )
+    excessive_clock_skew = replace(
+        base,
+        orderbooks=tuple(
+            replace(book, exchange_timestamp=1_101, received_timestamp=1_000)
+            for book in base.orderbooks
+        ),
+    )
 
     old_decision = evaluate_binary(old_exchange)
-    impossible_decision = evaluate_binary(impossible_time)
+    tolerated_decision = evaluate_binary(tolerated_clock_skew)
+    excessive_decision = evaluate_binary(excessive_clock_skew)
 
     assert isinstance(old_decision, NotEvaluable)
     assert old_decision.reason_code is DecisionReason.ORDERBOOK_STALE
-    assert isinstance(impossible_decision, NotEvaluable)
-    assert impossible_decision.reason_code is DecisionReason.ORDERBOOK_INVALID
+    assert isinstance(tolerated_decision, OpportunityPresent)
+    assert isinstance(excessive_decision, NotEvaluable)
+    assert excessive_decision.reason_code is DecisionReason.ORDERBOOK_INVALID
+    assert excessive_decision.context["detail"] == (
+        "orderbook_timestamp_causality_invalid"
+    )
+    assert excessive_decision.context["token_id"] == "yes"
+    assert excessive_decision.context["exchange_timestamp"] == 1_101
+    assert excessive_decision.context["received_timestamp"] == 1_000
+    assert excessive_decision.context["exchange_clock_skew_ms"] == 101
+    assert excessive_decision.context["maximum_exchange_clock_skew_ms"] == 100
 
 
 def test_binary_fails_closed_for_unknown_or_stale_fee(
@@ -504,6 +524,7 @@ def test_positive_but_insufficient_bankroll_returns_auditable_absent(
         {"bankroll": Decimal("NaN")},
         {"conversion_cost": Decimal("-1")},
         {"maximum_book_age_ms": -1},
+        {"maximum_exchange_clock_skew_ms": -1},
         {"maximum_leg_skew_ms": -1},
         {"maximum_risk_rate": Decimal("-0.1")},
         {"safety_buffer_rate": Decimal("1.1")},

@@ -34,6 +34,11 @@ from predmarket.persistence.writer import DatabaseWriter
 
 
 _LOGGER = logging.getLogger(__name__)
+_LOAD_CATALOG_STATEMENTS = (
+    "SELECT * FROM events ORDER BY id",
+    "SELECT * FROM markets ORDER BY id",
+    "SELECT * FROM tokens ORDER BY id",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,7 +215,7 @@ class CatalogRepository:
                     UPDATE {table}
                     SET sync_generation = ?,
                         sync_generation_complete = 1,
-                        updated_at = ?
+                        updated_at = MAX(updated_at, ?)
                     """,
                     (generation, updated_at),
                 )
@@ -326,15 +331,9 @@ class CatalogRepository:
             await connection.execute("PRAGMA query_only = ON")
             await connection.execute("BEGIN")
             try:
-                event_cursor = await connection.execute(
-                    "SELECT * FROM events ORDER BY CAST(id AS BLOB)"
-                )
-                market_cursor = await connection.execute(
-                    "SELECT * FROM markets ORDER BY CAST(id AS BLOB)"
-                )
-                token_cursor = await connection.execute(
-                    "SELECT * FROM tokens ORDER BY CAST(id AS BLOB)"
-                )
+                event_cursor = await connection.execute(_LOAD_CATALOG_STATEMENTS[0])
+                market_cursor = await connection.execute(_LOAD_CATALOG_STATEMENTS[1])
+                token_cursor = await connection.execute(_LOAD_CATALOG_STATEMENTS[2])
                 event_rows = await event_cursor.fetchall()
                 market_rows = await market_cursor.fetchall()
                 token_rows = await token_cursor.fetchall()
@@ -1016,6 +1015,7 @@ ON CONFLICT(id) DO UPDATE SET
     resolved_at = excluded.resolved_at,
     source_updated_at = excluded.source_updated_at,
     updated_at = excluded.updated_at
+WHERE excluded.updated_at >= events.updated_at
 """
 
 _UPSERT_MARKET = """
@@ -1047,6 +1047,7 @@ ON CONFLICT(id) DO UPDATE SET
     resolved_at = excluded.resolved_at,
     source_updated_at = excluded.source_updated_at,
     updated_at = excluded.updated_at
+WHERE excluded.updated_at >= markets.updated_at
 """
 
 _UPSERT_TOKEN = """
@@ -1063,6 +1064,7 @@ ON CONFLICT(id) DO UPDATE SET
     sync_generation = excluded.sync_generation,
     sync_generation_complete = excluded.sync_generation_complete,
     updated_at = excluded.updated_at
+WHERE excluded.updated_at >= tokens.updated_at
 """
 
 def _event_values(event: Event) -> tuple[Any, ...]:

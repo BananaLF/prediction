@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 from predmarket.domain.fees import FeeCalculator, FeeSchedule
 from predmarket.domain.decimal import encode_decimal
@@ -99,14 +99,19 @@ def not_evaluable(
     context: StrategyContext,
     reason: DecisionReason,
     detail: str,
+    *,
+    diagnostics: Mapping[str, Any] | None = None,
 ) -> NotEvaluable:
+    decision_context: dict[str, Any] = {
+        "changed_token_id": context.changed_token_id,
+        "detail": detail,
+        "strategy_type": context.strategy_type.value,
+    }
+    if diagnostics is not None:
+        decision_context.update(diagnostics)
     return NotEvaluable(
         reason_code=reason,
-        context={
-            "changed_token_id": context.changed_token_id,
-            "detail": detail,
-            "strategy_type": context.strategy_type.value,
-        },
+        context=decision_context,
     )
 
 
@@ -191,11 +196,27 @@ def validate_inputs(
             DecisionReason.ORDERBOOK_INVALID,
             "orderbook_from_future",
         )
-    if any(book.exchange_timestamp > book.received_timestamp for book in books):
+    most_future_book = max(
+        books,
+        key=lambda book: book.exchange_timestamp - book.received_timestamp,
+    )
+    exchange_clock_skew_ms = (
+        most_future_book.exchange_timestamp - most_future_book.received_timestamp
+    )
+    if exchange_clock_skew_ms > context.configuration.maximum_exchange_clock_skew_ms:
         return not_evaluable(
             context,
             DecisionReason.ORDERBOOK_INVALID,
             "orderbook_timestamp_causality_invalid",
+            diagnostics={
+                "token_id": most_future_book.token_id,
+                "exchange_timestamp": most_future_book.exchange_timestamp,
+                "received_timestamp": most_future_book.received_timestamp,
+                "exchange_clock_skew_ms": exchange_clock_skew_ms,
+                "maximum_exchange_clock_skew_ms": (
+                    context.configuration.maximum_exchange_clock_skew_ms
+                ),
+            },
         )
     observed_at = context.orderbook_observed_at
     if observed_at is not None:
@@ -289,6 +310,10 @@ def validate_configuration(context: StrategyContext) -> NotEvaluable | None:
             )
     for name, value in (
         ("maximum_book_age_ms", config.maximum_book_age_ms),
+        (
+            "maximum_exchange_clock_skew_ms",
+            config.maximum_exchange_clock_skew_ms,
+        ),
         ("maximum_leg_skew_ms", config.maximum_leg_skew_ms),
     ):
         if type(value) is not int or value < 0:

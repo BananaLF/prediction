@@ -10,6 +10,7 @@ from typing import Any
 import aiosqlite
 import pytest
 
+import predmarket.persistence.repositories as repositories_module
 import predmarket.persistence.writer as writer_module
 from predmarket.catalog.relations import semantic_evidence_digest
 from predmarket.domain.fees import FeeModel, FeeSchedule
@@ -919,6 +920,128 @@ async def test_complete_catalog_save_advances_unchanged_rows_without_upsert(
     assert stored.tokens == (
         replace(token, sync_generation="sync-2", updated_at=20),
     )
+
+
+async def test_complete_catalog_save_does_not_overwrite_newer_watch_refresh(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    catalog = CatalogRepository(database_path, writer)
+    event = Event(
+        id="event-1",
+        title="Event",
+        status=MarketStatus.ACTIVE,
+        market_ids=("market-1",),
+        sync_generation="sync-1",
+        sync_generation_complete=True,
+        updated_at=10,
+    )
+    market = Market(
+        id="market-1",
+        event_id=event.id,
+        condition_id="condition-1",
+        question="Initial question?",
+        status=MarketStatus.ACTIVE,
+        active=True,
+        accepting_orders=True,
+        enable_orderbook=True,
+        sync_generation="sync-1",
+        sync_generation_complete=True,
+        tick_size=Decimal("0.01"),
+        updated_at=10,
+    )
+    token = Token(
+        id="token-1",
+        market_id=market.id,
+        outcome="YES",
+        position=0,
+        sync_generation="sync-1",
+        sync_generation_complete=True,
+        updated_at=10,
+    )
+    stale_sync_market = replace(
+        market,
+        question="Stale sync question?",
+        sync_generation="sync-2",
+        tick_size=Decimal("0.005"),
+        updated_at=20,
+    )
+    stale_sync_token = replace(
+        token,
+        sync_generation="sync-2",
+        fee_schedule=FeeSchedule(
+            model=FeeModel.FLAT,
+            enabled=True,
+            source="sync",
+            parameters={"rate": Decimal("0.02")},
+            updated_at=20,
+        ),
+        fee_updated_at=20,
+        updated_at=20,
+    )
+    refreshed_market = replace(
+        stale_sync_market,
+        question="Fresh watch question?",
+        sync_generation="sync-1",
+        tick_size=Decimal("0.001"),
+        updated_at=30,
+    )
+    refreshed_token = replace(
+        stale_sync_token,
+        sync_generation="sync-1",
+        fee_schedule=FeeSchedule(
+            model=FeeModel.FLAT,
+            enabled=True,
+            source="watch",
+            parameters={"rate": Decimal("0.01")},
+            updated_at=30,
+        ),
+        fee_updated_at=30,
+        updated_at=30,
+    )
+    try:
+        await catalog.save_catalog(events=(event,), markets=(market,), tokens=(token,))
+        await catalog.save_catalog(
+            events=(),
+            markets=(refreshed_market,),
+            tokens=(refreshed_token,),
+        )
+
+        await catalog.save_complete_catalog(
+            generation="sync-2",
+            updated_at=20,
+            events=(),
+            markets=(stale_sync_market,),
+            tokens=(stale_sync_token,),
+        )
+        stored = await catalog.load_catalog()
+    finally:
+        await writer.close()
+
+    assert stored.events == (
+        replace(event, sync_generation="sync-2", updated_at=20),
+    )
+    assert stored.markets == (
+        replace(refreshed_market, sync_generation="sync-2"),
+    )
+    assert stored.tokens == (
+        replace(refreshed_token, sync_generation="sync-2"),
+    )
+
+
+async def test_catalog_load_order_uses_existing_primary_key_indexes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    initialize_database(database_path)
+
+    async with aiosqlite.connect(database_path) as connection:
+        for statement in repositories_module._LOAD_CATALOG_STATEMENTS:
+            cursor = await connection.execute(f"EXPLAIN QUERY PLAN {statement}")
+            details = tuple(str(row[3]) for row in await cursor.fetchall())
+            assert not any("USE TEMP B-TREE FOR ORDER BY" in item for item in details)
 
 
 async def test_system_and_signal_repositories_use_writer_and_short_reads(

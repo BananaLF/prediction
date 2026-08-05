@@ -30,6 +30,8 @@ class OrderBookDelta:
     price: str
     size: str
     book_hash: str
+    best_bid: str | None = None
+    best_ask: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.token_id, str) or not self.token_id:
@@ -217,6 +219,43 @@ class OrderBookCache:
                         levels.pop(price, None)
                     else:
                         levels[price] = size
+                authoritative_tops = {
+                    (delta.best_bid, delta.best_ask) for delta in token_deltas
+                }
+                if len(authoritative_tops) != 1:
+                    raise ValueError(
+                        "conflicting authoritative tops in one token batch"
+                    )
+                best_bid_text, best_ask_text = authoritative_tops.pop()
+                if (best_bid_text is None) != (best_ask_text is None):
+                    raise ValueError(
+                        "authoritative best bid and ask must be provided together"
+                    )
+                if best_bid_text is not None and best_ask_text is not None:
+                    best_bid = parse_decimal(best_bid_text)
+                    best_ask = parse_decimal(best_ask_text)
+                    if not Decimal("0") <= best_bid < best_ask <= Decimal("1"):
+                        raise ValueError(
+                            "authoritative best bid must be below best ask in [0, 1]"
+                        )
+                    bids = {
+                        price: size for price, size in bids.items() if price <= best_bid
+                    }
+                    asks = {
+                        price: size for price, size in asks.items() if price >= best_ask
+                    }
+                    if best_bid == 0:
+                        bids.clear()
+                    elif best_bid not in bids:
+                        raise ValueError(
+                            "authoritative best bid is missing from local levels"
+                        )
+                    if best_ask == 1:
+                        asks.clear()
+                    elif best_ask not in asks:
+                        raise ValueError(
+                            "authoritative best ask is missing from local levels"
+                        )
                 candidate = replace(
                     before,
                     bids=tuple(

@@ -526,3 +526,347 @@
 - 三次 1006 均自动完成 fail-closed 恢复，runtime 没有退出；底层原因已收敛到 WebSocket 字节流 EOF/截断，不是程序回到 `app.py` 后才断线。
 - 未降低收益阈值时，监听、评估和持久化链路确实产生 2 个 signal；进一步核验后确认二者来自交叉盘口，现已增加 fail-closed 防护，不能将其宣称为真实可交易机会。
 - 达到“监听到信号并定位问题”的终止条件后于 15:25 人工停止实例；数据库保留完整 signal/revision/leg 证据。真实市场何时再次出现合法套利不可控，本轮未等待或制造新的合法信号。
+
+## ISSUE-062：未变化的目录通知会取消并关闭 live subscription
+
+- 状态：已修复，并通过聚焦、相关组件及全量回归。
+- review 现象：`WatchTask.run()` 收到目录 change 时，只要长期 stream reader 仍 pending 就先取消该 reader。真实 `MarketSubscription.__anext__()` 在读取被取消时会调用 `close()`，因此普通 `MARKET_UPDATED` 即使没有改变 token scope，也会关闭当前 WebSocket。
+- 后续影响：`handle_market_change()` 因 scope 未变化直接返回，但 `self._subscription` 仍指向已关闭对象；stream reader 再次迭代时得到 `StopAsyncIteration`，合成为 `sdk_handle_ended` 并触发不必要的 fail-closed recovery。
+- 缺失覆盖：现有 `FakeSubscription` 在读取取消时不会关闭自身，未模拟真实 Gateway 生命周期语义。
+- RED 证据：新增 close-on-cancel 订阅后，`test_unchanged_market_update_keeps_pending_subscription_open` 在旧实现稳定失败，订阅被关闭并出现 `watch_subscription_invalidated reason=sdk_handle_ended`。
+- 修复：目录 change 到达时不再取消仍 pending 的长期 stream reader；实际换代仍由 `_rotate_to()` 关闭旧订阅。stream reader 若收到旧订阅的 `StopAsyncIteration` 会忽略该旧终态，只有当前订阅结束才按该订阅自己的 generation 合成失效事件，避免旧 reader 污染新 generation。
+- GREEN 证据：新增测试及目录增加、停用、reader 清理等 4 个聚焦测试通过；Watch/Cache/Gateway 相关测试 161 个通过；全量测试 585 个通过、1 个跳过。
+
+## ISSUE-063：交叉 REST baseline 直接中止 Watch 启动
+
+- 状态：已修复，并通过聚焦、相关组件及全量回归。
+- review 现象：恢复阶段 `OrderBookCache.apply_snapshot()` 对 `best_bid >= best_ask` 正确 fail-closed 并抛出 `CacheInvalidatedError`，`_recover_once()` 也会关闭该 recovery session；但 `_recover()` 只重试 `MarketRecoveryInvalidatedError`，导致缓存错误越过恢复循环并使 `app.py` 的 runtime startup 失败。
+- 设计不一致：ISSUE-059 已规定不可信 snapshot/stream book/delta 应丢弃 generation 并重新获取 REST baseline；启动路径尚未落实 snapshot 的自动重试。
+- RED 证据：新增“首个 baseline 交叉、第二个 baseline 有效”的测试后，旧实现从 `watch.start()` 直接抛出 `CacheInvalidatedError`，只发起一次 recovery。
+- 修复：`_recover()` 把 `CacheInvalidatedError` 归类为当前 baseline 的可重试失效，记录 `cache_snapshot_invalid:<detail>`，复用既有指数退避及 stop interrupt；`_recover_once()` 仍关闭失败 session。不可重试的 Gateway recovery 与其他异常仍立即上抛。
+- GREEN 证据：新增测试确认发生两次 recovery、第一代订阅关闭、第二代 cache 有效；4 个恢复聚焦测试、161 个相关测试及全量 585 个测试均通过（另有 1 个既有跳过）。
+
+## ISSUE-064：WAL 数据库的直接只读诊断无法打开
+
+- 状态：已解决；无生产代码修改。
+- 现象：对 `./data/predmarket-v1.sqlite3` 直接使用 SQLite `mode=ro` 得到 `unable to open database file`，文件本身存在且应用此前可正常使用。
+- 原因：WAL 模式的普通只读连接仍可能需要访问或建立共享内存/sidecar 状态；当前诊断环境不满足该要求。
+- 处理：只读诊断命令改为 URI `mode=ro&immutable=1`。随后 `PRAGMA integrity_check` 返回 `ok`，schema 可读取。应用仍使用原数据库配置，不采用 immutable 连接。
+
+## ISSUE-065：基线诊断查询假定了不存在的 signal revision 字段
+
+- 状态：已解决；无生产代码修改。
+- 现象：首次联合基线查询使用 `signal_revisions.created_at`，SQLite 报 `no such column: created_at`，导致该语句未返回任何计数。
+- 原因：真实 schema 的修订时间字段为 `observed_at`；事件类型字段为 `event_type`，不是诊断查询假定的 transition/created 字段。
+- 处理：先通过 `PRAGMA table_info` 核对真实 schema，再以 `MAX(observed_at)` 重新查询。运行前基线为：events 22,307（latest 1785823906886）、markets 157,201（1785828220262）、tokens 314,402（1785828220262）、orderbook_snapshots 8（1785828289959）、arbitrage_signals 2（1785828290572）、signal_revisions 4（1785828290572）；两个既有 signal 均为 CLOSED，不作为本轮新信号证据。
+
+## ISSUE-066：旧 Watch 测试依赖目录通知取消 stream reader
+
+- 状态：测试已调整，并通过相关组件及全量回归。
+- 现象：ISSUE-062 的新行为测试转绿后，`test_acquired_change_is_acknowledged_once_when_reader_cleanup_is_cancelled` 不再结束；测试在投递 `MARKET_UPDATED` 后永久等待 `read_cancelled`。
+- 原因：该测试把“任何目录 change 都取消 pending stream reader”当成触发条件，而这正是 ISSUE-062 要删除的错误实现细节；业务契约实际是队列 change 只能 acknowledgement 一次，即使 runtime 退出时 reader 清理遭遇重复取消。
+- 调整：目录 change 处理并确认后显式取消 runtime，在终态 reader 清理期间再次取消，继续断言 change 只确认一次且延迟 reader 完整 drain。未削弱停止清理和队列 ownership 覆盖。
+- 验证：Watch/Cache/Gateway 相关测试 161 个通过；全量测试 585 个通过、1 个跳过。
+
+## 本轮 review 修复自动验证（人工启动前）
+
+- 两个新增回归测试均先在旧实现失败，最小修复后转绿。
+- `.venv/bin/pytest -q tests/unit/watch/test_task.py tests/unit/watch/test_cache.py tests/unit/polymarket/test_gateway.py`：161 passed。
+- `.venv/bin/pytest -q`：585 passed，1 skipped；Python 3.14 下 pytest-asyncio 输出既有弃用警告，不影响测试结果，也不对应本轮生产运行故障。
+- `.venv/bin/python -m predmarket --help` 正常；仓库未配置 Ruff、Mypy 等额外静态检查命令。
+- `git diff --check` 通过。
+
+## ISSUE-067：人工诊断 SQL 使用了错误的表名和时间字段
+
+- 状态：已纠正；无生产代码修改。
+- 现象：运行期间首次查询使用不存在的 `signals` 表，随后盘口快照查询又使用不存在的 `orderbook_snapshots.received_at`，SQLite 分别返回 `no such table` 和 `no such column`。
+- 原因：真实 schema 使用 `arbitrage_signals`，盘口接收时间字段为 `received_timestamp`；诊断命令没有先核对 schema。
+- 处理：通过 `.tables`、`sqlite_master` 和 `PRAGMA table_info` 核对后重新查询。当前本轮启动后仍是 2 个旧的 CLOSED signal、4 个旧 revision；markets/tokens 的 `updated_at` 已前进，证明启动刷新已写库，但尚无本轮新增 signal。
+
+## ISSUE-068：真实行情反复形成交叉盘口并触发恢复风暴
+
+- 状态：根因已修复，自动验证通过，待真实运行复验。
+- 现象：本轮人工启动成功并稳定消费约 600–1,300 条行情/秒，但 `price_change_invalid:best bid must be below best ask` 每数秒出现一次，订阅 generation 在约 5 分钟内由 2 增长到 40 以上。fail-closed 正确阻止不可信盘口进入策略，但频繁 REST 恢复显著降低有效监听时间。
+- 已排除：Gateway/Watch 队列没有 drop，SDK handle 队列接近 0，映射和 cache 单消息耗时约 0.02ms/0.17ms，因此不是本地消费落后导致的丢包。
+- 诊断增强：失败日志增加 market/generation、交易所与接收时间、最多 8 条变更的 token/side/price/size、服务端与本地顶档；每个值限制为 128 字符。新增测试先证明旧日志缺少现场，再验证有界字段。
+- 直接证据：多个真实市场均显示服务端更新后顶档有效，但本地保留了已失效的对手盘顶档。例如市场 `3309179` 的 BUY 变更为 `0.7`，服务端顶档为 `0.7/0.71`，本地应用前为 `0.69/0.7`；同批另一 token 的 SELL 变更为 `0.3`，服务端为 `0.29/0.3`，本地为 `0.3/0.31`。应用单侧档位后，本地旧 ask `0.7` 或旧 bid `0.3` 未被移除，才形成 locked book。另两个市场出现相同模式，排除 side 解释颠倒和服务端自相矛盾。
+- 根因：SDK `price_change` 的 `best_bid`/`best_ask` 表示该增量应用后的权威顶档；Watch 映射保留了字段，但构造 `OrderBookDelta` 时将其丢弃。缓存只能修改事件明确列出的档位，无法移除未在变更列表中出现、但服务端已确认失效的旧对手盘顶档。
+- 修复：`OrderBookDelta` 保留可选权威顶档；缓存应用显式档位后，用同一 token 批次一致的服务端顶档裁剪本地陈旧的更优档位。权威顶档必须成对、规范、满足 `0 <= bid < ask <= 1`，且非空哨兵对应的档位必须已经存在于本地，不能凭空构造 size；任何冲突或缺口仍 fail-closed。
+- RED/GREEN：缓存层和 Watch 映射层各增加一个真实形态回归测试。旧实现分别因 `OrderBookDelta` 不接受顶档及 Watch 继续触发恢复而失败；修复后与原交叉盘 fail-closed 测试共同通过。Watch/Cache/Gateway 联合回归为 164 passed。
+
+## ISSUE-069：合法 `new_market.game_start_time` 被固定 SDK 误判为畸形
+
+- 状态：兼容修复已完成，相关 Gateway 回归通过。
+- 现象：真实运行持续收到 `game_start_time='2026-08-05 12:00:00+00'` 等 ISO-8601 值；固定 SDK `0.3.0b1` 的 `NewMarketPayload` 却只接受 epoch-ms，Gateway 因而把合法上游广播记录为 malformed 并每 100 条输出一次 WARNING。
+- 影响：现有隔离逻辑保证该全局控制事件不会增加 manager/handle drop，也不会使当前盘口 generation 失效；但错误告警产生噪声，并让 SDK 无法按自身模型消费本来合法的事件。
+- 修复：仅在 SDK callback 边界复制 `new_market` 字典，把带时区的合法 ISO-8601 `game_start_time` 转成 epoch-ms 字符串后再交给固定 SDK；不修改其他事件、不原地改写输入。无法解析或缺少时区的值仍按原有有界告警隔离。
+- RED/GREEN：新增真实格式测试，旧实现输出 malformed WARNING 且不转发；修复后 SDK 收到 `1786197600000`、drop 保持 0、lifecycle 健康。合法 ISO、真正非法值限频和正常 `new_market` 三个聚焦测试通过，整个 Gateway 文件 77 个测试通过。
+
+## ISSUE-070：启动定向刷新返回 `active=true, closed=true` 的矛盾市场
+
+- 状态：已由目录映射/筛选逻辑安全剔除，无新增生产修改。
+- 现象：人工启动的 50-market 定向刷新中发现 3 个上游市场同时返回 `active=true` 与 `closed=true`。
+- 处理证据：刷新后重新加载目录时，这些市场没有进入 watchable scope；Gateway identity、恢复 token 集合和 REST baseline 保持一致，runtime 正常进入监听。该状态属于上游生命周期竞态，不应通过放宽本地 active 条件接纳。
+
+## ISSUE-071：复验基线 SQL 再次使用错误的信号状态列
+
+- 状态：已纠正；无生产代码修改。
+- 现象：本轮启动前明细查询使用 `arbitrage_signals.lifecycle_state`，SQLite 返回 `no such column: lifecycle_state`；前面的各表计数和水位查询已正常返回。
+- 原因：真实 schema 的状态列是 `status`。通过 `PRAGMA table_info(arbitrage_signals)` 复核后改用该列；两个历史 signal 均为 `CLOSED`，最新水位仍为 `1785828290572`，不计入本轮信号。
+
+## ISSUE-072：启动刷新失败日志输出完整上游响应
+
+- 状态：已修复并通过聚焦回归，待下一次真实启动复验。
+- 现象：本轮启动有 3 个上游矛盾市场刷新失败，`watch_catalog_refresh_partial_failure` 把异常携带的完整 API response 原样写入 WARNING，造成单条日志过大并掩盖后续启动信息。
+- 根因：失败样本直接格式化 `error`，没有复用 Watch 已有的有界日志值处理。
+- RED/GREEN：新增 2,000 字符异常回归测试，旧实现稳定输出超长日志；修复后每个异常文本压缩空白并限制为 128 字符，同时保留 market id 和异常类型。启动刷新成功路径联合测试 2 个通过。
+
+## ISSUE-073：运行中信号水位 SQL 使用不存在的 `_ms` 字段
+
+- 状态：已纠正；无生产代码修改。
+- 现象：运行中首次水位查询使用 `arbitrage_signals.updated_at_ms` 和 `signal_revisions.created_at_ms`，SQLite 报 `no such column: updated_at_ms`，整组查询没有结果。
+- 原因：诊断命令未复用此前已核对的 schema；真实字段分别是 `updated_at` 和 `observed_at`。
+- 处理：再次读取两张表的建表语句，后续查询固定使用真实字段，并把诊断错误本身纳入记录。
+
+## ISSUE-074：`price_change` 的零档位与权威顶档自相矛盾
+
+- 状态：已由 fail-closed 恢复安全处理；无生产代码修改，继续真实运行观察。
+- 现象：真实运行在市场 `3312884` 收到成对更新：token A 的 BUY `price=0.19 size=0` 同时声明 `best_bid=0.19 best_ask=0.23`；token B 的 SELL `price=0.81 size=0` 同时声明 `best_bid=0.77 best_ask=0.81`。缓存按零 size 删除档位后，无法在本地档位中找到服务端仍声明的顶档，触发 `authoritative best ... is missing from local levels`。
+- 判断：官方 WebSocket 类型把 `size` 定义为价格变更携带的档位数量，同时 `best_bid`/`best_ask` 表示该事件的顶档；同一事件把某档位数量置零又把它声明为顶档，无法构造可信且带有可成交数量的订单簿。凭空补一个未知 size 会制造虚假执行深度和套利信号，忽略零 size 又可能保留已撤销流动性。
+- 处理：保留严格校验，丢弃该 generation 并重新取得完整 REST baseline。恢复在约 1.7 秒内完成，后续 generation 持续消费行情、cache 为 `VALID`、策略继续评估；因此这是上游不一致的安全降级，不放宽缓存不变量。
+
+## ISSUE-075：完整同步后的逐条目录通知反复重载全量 catalog
+
+- 状态：已修复并通过 RED/GREEN 回归，待新进程真实复验。
+- 现象：完整同步持久化 24,454 events、169,973 markets、339,946 tokens 后，将 141,653 个原始变化合并为 6,816 条队列通知。Watcher 每处理一条通知都重新从 SQLite 物化完整 catalog、扫描监听范围，并同步重建约 34 万 token 的策略索引；单条通知的 catalog 路径真实耗时约 7–9 秒。期间 SDK 消费队列增长到约 10%–50%，策略大量返回 `orderbook_subscription_stale`，有效监听被周期性阻断。
+- 根因：同步任务先原子持久化最终 generation，再发布该 generation 的逐市场通知；第一条通知加载到的已经是最终快照，但 `WatchTask.handle_market_change()` 没有识别 `change_id` 中的 generation，仍对同代后续通知重复执行完整快照工作。
+- 修复：每个结构化 sync generation 只在首条通知加载、筛选、准备 context 并按最终快照旋转订阅；同代后续通知合并为轻量确认。`MARKET_DEACTIVATED` 和 `EVENT_SETTLED` 仍逐条执行显式信号关闭，不能被合并丢失。只有首条处理完整成功后才记录 generation，异常路径不会屏蔽后续重试。
+- 日志：新增 `watch_catalog_change_generation_started/completed/coalesced`，记录 generation、首条耗时、有效监听规模，并在第 1 条和每 1,000 条合并通知输出进度。
+- RED/GREEN：回归测试连续发送同一 generation 的普通更新和停用控制；旧实现执行两次 catalog load 而失败，修复后只加载一次，同时仍关闭停用 token 的信号。与目录更新、订阅换代聚焦测试共 3 个通过。
+
+## ISSUE-076：恢复时裁掉缺失订单簿后，监听池不会补位
+
+- 状态：已修复并通过 RED/GREEN 与全量回归，待新进程真实复验。
+- 真实现象：完整同步后数据库有 135,276 个 watchable market，初始监听池为 50 markets/100 tokens；多次 WebSocket 1006 恢复时，Gateway 会安全剔除 REST 不再返回订单簿的 market，但 Watch 随后直接采用缩小后的 scope。监听池先后降到 32、28、25、23 markets；机器休眠/网络恢复后的下一次 recovery 又从 23 markets/46 tokens 裁到 7 markets/14 tokens。
+- 根因：`_recover_once()` 把 recovery session 的有效 token 直接写回 `_active_token_ids` 和 `_active_market_ids`；周期 market metadata refresh 只刷新这组剩余 market，不会从最新 catalog 重新选择候选，也不会补足 `market_limit`。因此被裁 market 永久从运行期 scope 消失，至少要等下一次完整同步产生目录通知才可能恢复。
+- 排除项：09:48 后用同一 SQLite catalog 和 SDK REST 接口重新探测，按当前筛选规则仍可取得 50 markets/100 tokens 且 100 个订单簿全部返回；因此池缩小不是候选耗尽。
+- 运行影响：行情处理和恢复仍然健康，但有效监听覆盖持续下降，最终只剩 7 个 market，显著降低发现合法信号的概率。
+- 修复：恢复裁剪后关闭临时 recovery subscription，不再安装缩小后的 baseline；把已确认缺失的 market 排除于本次选择，基于最新 catalog 重新选择并刷新候选，补足到 `market_limit=50` 后重新恢复并原子换代。若 catalog 暂时没有替补候选，才明确记录 `watch_recovery_refill_unavailable` 并采用实际有效范围，避免无限重试。
+- RED/GREEN：新增“一次 recovery 裁掉 1 个 market、随后从 catalog 补入替代 market”的测试；旧实现只调用一次 recovery 并永久降至 1 个 market，修复后关闭第一代临时订阅，以 2 个 market 的完整新 scope 再恢复。三项改动的聚焦测试 13 个通过，Watch/Cache/Gateway/Strategy/Config/Domain 联合回归 218 个通过，全量回归 593 个通过、1 个跳过。
+- 追加真实证据：修复前旧实例虽然一度恢复到 50 markets/100 tokens，但后续 market resolved 换代又把范围从 49 裁到 42、再从 41 裁到 34，进一步验证“恢复成功但覆盖永久缩小”的生产影响。
+
+## ISSUE-077：严格的跨机器时间戳因果校验误拒绝正常行情
+
+- 状态：已按确认参数修复并通过 RED/GREEN 与全量回归，待新进程真实复验。
+- 真实现象：有效 `price_change` 到达后，策略反复输出 `NOT_EVALUABLE.ORDERBOOK_INVALID.orderbook_timestamp_causality_invalid`；同批订单簿并没有过期、跨代或队列 drop。
+- 首次诊断失败：原始 SDK 采样脚本错误地把 SDK 的 timezone-aware `datetime` 当成整数时间戳计算，得到类型错误；修正为显式转换 epoch-ms 后重新采样。
+- 采样证据：14 条原始事件的 `exchange_timestamp - received_timestamp` 范围为 -987,872ms 到 +28ms；其中 2 条正常实时事件分别领先本机接收时间 28ms 和 14ms。CLOB HTTP `Date` 与本机时钟在秒级一致，符合分布式系统中很小的跨机器时钟偏差，而非未来数据。
+- 扩大采样：等待设计确认期间，另对 100 个 token 连续采样 30 秒，共收到 2,912 条带时间戳事件（100 条初始 book、2,812 条 price change），偏差范围 -207,268ms 到 -455ms，p95=-457ms，本轮没有正偏差。该结果说明偏差会随时钟/网络路径变化，不能用某一次全为负值的样本替代有界容差；已观测正偏差上限仍为 28ms，建议的 100ms 约为其 3.5 倍且远小于 1,000ms book-age 上限。
+- 根因：策略当前要求 `exchange_timestamp <= received_timestamp`，没有任何容差；交易所时钟仅领先本机十几毫秒就会把本来新鲜、同代的订单簿判为因果无效。
+- 修复：新增严格加载并校验的 `strategy.maximum_exchange_clock_skew_ms=100`；只有 `exchange_timestamp - received_timestamp > 100ms` 才返回 `orderbook_timestamp_causality_invalid`。原始时间戳、book age、leg skew 和 generation 校验均保持不变。
+- RED/GREEN：新增边界测试，旧实现会拒绝 +100ms；修复后 +100ms 可评估、+101ms 仍 fail-closed，并覆盖负配置拒绝启动。
+
+## ISSUE-078：最早结束优先会把监听池集中到即将结束的市场
+
+- 状态：已按确认参数修复并通过 RED/GREEN 与全量回归，待新进程真实复验。
+- 真实现象：`_watchable_subscription()` 将 `end_at` 最早的 market 排在最前。01:29 左右选中的前 50 个 market 都接近 01:30 结束，随后大量 REST book 缺失、market resolved 和 `execution_depth_missing`，与 ISSUE-076 共同导致 scope 快速萎缩。
+- 诊断失误：首次 Python 只读探针因 SQL 字符串引用错误返回 `None`，随后访问 `row[0]` 抛出 `TypeError`；改为先单独核对 SQL 行数和真实 row，再运行批量 SDK 探针。
+- 对照证据：09:48 的 SDK REST 探针中，现有规则的前 50 个 market 距结束仅约 200–500 秒，48/50 market 的两个 token 都有双边深度；排除未来 5 分钟内结束的 market 后仍为 48/50；要求至少 30 分钟后结束时为 50/50，100 个 book 均具双边深度。
+- 判断：不能仅凭一次样本断言 30 分钟以后必然更有套利价值，但现有排序会让整个监听池同时进入结束/结算竞态，并在短窗口内集中失效，和持续监听目标冲突。
+- 修复：新增严格加载并校验的 `runtime.watch_minimum_end_horizon_seconds=1800`，首次选择、目录换代和恢复补位统一排除 `end_at <= now + 30min` 的市场；候选仍按 `end_at` 排序，不改变其余优先级。
+- RED/GREEN：新增精确边界测试，恰好位于 horizon 的 market 被排除、更晚结束的 market 保留；同时覆盖 Watch 构造参数校验和配置传递。
+
+## 三项确认参数的自动验证
+
+- 用户确认恢复池目标 50 markets、最大交易所时钟领先 100ms、最小监听 horizon 30 分钟。
+- 聚焦 RED 阶段共 12 个失败，分别对应缺失配置、容差、horizon 与恢复补位行为；实现后聚焦测试 13 个通过。
+- `.venv/bin/pytest -q tests/unit/watch/test_task.py tests/unit/watch/test_cache.py tests/unit/polymarket/test_gateway.py tests/unit/strategy tests/unit/test_config.py tests/unit/domain/test_models.py`：218 passed。
+- `.venv/bin/pytest -q`：593 passed，1 skipped；仅有 Python 3.14 下 pytest-asyncio 的既有弃用警告。
+
+## ISSUE-079：人工启动命令缺少 `run` 子命令
+
+- 状态：已纠正；无生产代码修改。
+- 现象：首次执行 `.venv/bin/python -m predmarket` 仅输出 CLI usage，并以 code 2 退出，没有进入 runtime。
+- 原因：模块入口要求显式 command；真实运行入口是 `.venv/bin/python -m predmarket run`。
+- 处理：改用正确命令后，所有组件完成初始化并输出 INFO；Watch 启动恢复得到 50 markets/100 tokens，随后输出 `runtime_started`。
+
+## ISSUE-080：信号明细诊断 SQL 使用了错误的市场列名
+
+- 状态：已纠正；无生产代码修改。
+- 现象：运行基线计数已成功返回，但明细查询使用 `arbitrage_signals.market_ids`，SQLite 报 `no such column: market_ids`。
+- 原因：真实列名是 `market_ids_json`。
+- 处理：通过 `PRAGMA table_info(arbitrage_signals)` 复核 schema；本轮运行基线仍为 2 个历史 CLOSED signal、4 个 revision、8 个 orderbook snapshot，最新 signal/revision 水位均为 `1785828290572`。
+
+## ISSUE-081：周期 metadata 刷新重复物化完整 catalog，造成监听盲区
+
+- 状态：根因修复、Watch 回归及真实 150 秒周期复验均通过。
+- 现象：完整同步后 catalog 已增长到 26,961 events、179,975 markets、359,950 tokens。每次 150 秒周期刷新耗时约 15–23 秒；12:12:42 的一次循环耗时 21,221ms，其中刷新路径 9,494ms。策略上下文查询同时阻塞 5,301ms 和 5,912ms，订单簿 observation age 达 5,350ms/6,121ms，返回 `orderbook_subscription_stale`。WebSocket 流仍持续进入，SDK/Watch queue 无 drop，排除网络断流和消费能力不足。
+- 根因：周期任务先调用 `load_catalog()` 全量读取，再由 `_refresh_markets()` 保存 50 个市场后再次调用 `load_catalog()`；一次循环重复从 SQLite 读取并物化约 36 万 token。独立 SQLite 连接避免了 writer actor 串行化，但大量数据库读取、对象物化和 CPU/I/O 竞争仍阻塞策略的数据库上下文查询。
+- 修复：Watch 保留最近一次已提交给策略 context 的 catalog 快照；周期刷新直接复用该内存快照。定向刷新保存成功后，只把返回的 market/token 合并到快照，不再全量回读数据库。快照 revision 与 context lock 防止并发目录更新时旧周期结果覆盖新快照；若 revision 已前进则明确记录并跳过旧 context。
+- RED/GREEN：周期刷新测试新增“启动及至少一次周期刷新总共只允许一次 `load_catalog()`”断言；旧实现实际调用 4 次并失败，修复后通过。Watch/Cache 相关回归 91 个通过；项目虚拟环境未安装 Ruff，后续以全量 pytest、编译检查和 `git diff --check` 补足验证。
+- 真实复验：重启后首次周期刷新输出 `snapshot_source=memory context_prepared=True`，50 个市场刷新 919ms、整个周期 1,073ms，较修复前 21,221ms 降低约 95%。刷新前后策略 context/总评估耗时保持约 1–2ms/5–27ms，订单簿 observation age 为 6–40ms，没有再次出现 `orderbook_subscription_stale`；SDK/Watch 队列继续保持 0 drop。
+
+## ISSUE-082：断线恢复遇到瞬时 502 会终止整个 runtime
+
+- 状态：已完成针对性修复和聚焦回归，待真实运行复验。
+- 真实现象：generation 3 的 WebSocket 长时间没有新增事件，最终在 SDK close callback 边界记录 `close_code=1006`、空 reason、parser `EOFError: unexpected end of stream`，Watch 正确使该 generation 失效并进入恢复。同期独立 SDK 探针订阅相同市场 30.4 秒收到 658 条事件，证明市场仍有实时行情，旧连接已异常静默。
+- 致命路径：generation 4 已成功建立新订阅，但恢复 REST `/books` 被 Cloudflare 以 HTTP 502 拒绝。Gateway 关闭临时订阅后原样抛出 `RequestRejectedError`；`WatchTask._recover()` 只重试 stream/cache invalidation，因此异常冒泡到 `app.run()`，输出 `runtime_startup_failed` 后停止全部组件。
+- 修复：Gateway 将 SDK transport/timeout、HTTP 408/425/429 和 5xx 明确规范化为 `MarketRecoveryTransientError`，保留 HTTP status 与服务端 `Retry-After`；Watch 恢复循环复用可中断的指数退避，并在日志中输出 attempt、token 数、reason、status 和实际等待时间。普通 4xx、映射错误及 SDK 生命周期契约错误仍立即失败，避免掩盖配置或程序错误。
+- RED/GREEN：新增 Gateway 502 分类与订阅关闭测试、Watch 首次 502 后恢复成功测试，以及 HTTP 400 不分类测试。旧实现因缺少瞬时恢复异常类型而在收集阶段失败；实现后 5 个恢复聚焦测试通过。
+
+## ISSUE-083：恢复裁剪为空且无候选补位时仍调用 Gateway
+
+- 状态：已完成边界修复和聚焦回归，待真实场景复验。
+- 审查发现：若 recovery 将本轮全部 market 裁掉，同时 catalog 没有其他 watchable market，补位函数会返回空 token tuple；恢复循环随后仍调用 `recover_market_session(())`。真实 Gateway 要求非空订阅范围，因此本可安全降级为零监听市场的情况会变成运行时异常。
+- 修复：补位结果为空时清空 Watch 的 active scope，记录 `watch_recovery_stopped reason=no_watchable_markets` 后结束本轮恢复，不再把空范围传入 Gateway。已失效 cache 保持 fail-closed，恢复裁剪阶段也已关闭相关 signal 与临时 subscription。
+- RED/GREEN：新增“唯一市场被全部裁掉、无候选补位”测试；旧实现第二次以空 tuple 调用 Gateway 并失败，修复后仅有首次非空 recovery、临时 subscription 正常关闭、active scope 为空。与恢复裁剪及正常补位测试共 3 个通过。
+
+## ISSUE-084：异步全量同步会覆盖更新的 Watch 定向刷新
+
+- 状态：已完成并发覆盖修复和聚焦回归，待新进程真实复验。
+- 审查发现：全量同步在持久化前基于较早加载的 catalog 计算 upsert；与此同时 Watch 会周期性刷新当前 50 个市场并写入更新的 tick、fee 等元数据。完整同步原先先把全表 `updated_at` 无条件改成同步开始时间，再写入较早准备的实体，因此会把 Watch 在同步过程中取得的更新数据覆盖成旧值，直到下一轮周期刷新才恢复。
+- 修复：catalog upsert 统一采用 `updated_at` 的 last-write-wins 保护；完整 generation 推进仍更新所有实体的 generation/complete 标记，但 `updated_at` 只允许单调增加。这样较新的 Watch 刷新内容会保留，较旧或未变化的行仍原子推进到完整 generation。
+- RED/GREEN：新增“Watch 在同步准备后写入更新 market/token，随后完整同步提交旧实体”的仓储测试；旧实现稳定把 question、tick 和 fee 覆盖为旧值，修复后保留更新值，同时 event 和未变化实体仍正确推进 generation。相关 3 个仓储测试通过。
+
+## ISSUE-085：被数据库拒绝的旧同步通知仍会关闭活跃订阅
+
+- 状态：已完成通知层竞态修复和聚焦回归，待新进程真实复验。
+- 审查发现：ISSUE-084 的时间戳保护能阻止旧同步实体覆盖较新的 Watch 刷新，但同步任务会在持久化前生成 `MARKET_DEACTIVATED`/`EVENT_SETTLED` 通知。即使旧实体最终未写入，这些通知仍会发布；Watch 原先无条件把通知内 token 当作已关闭，导致已提交 catalog 中仍活跃的订阅被关闭并以相同 token 重建，同时错误关闭相关 signal。
+- 修复：Watch 加载已提交 catalog 后，以最终订阅范围作为控制通知的权威状态。仍在 active scope 中的 token 不再被旧控制通知关闭；范围未变化时跳过无意义的 subscription rotation，并输出 `watch_catalog_control_ignored_stale`。同一 sync generation 的合并通知也只关闭已不在当前 active scope 的 token。
+- RED/GREEN：新增“旧停用通知指向 catalog 中仍活跃的市场”回归；旧实现产生第二次相同 recovery 并关闭原 subscription，修复后保持原 generation、signal 和 active scope。另覆盖同 generation 合并通知、真实市场停用和订阅外市场停用，共 4 个测试通过。
+
+## ISSUE-086：运行时构建失败会泄漏已启动的组件
+
+- 状态：已完成资源所有权修复和应用管线回归。
+- 审查发现：`Supervisor.run()` 只有在 `_build_runtime()` 完整返回后才能取得 writer、gateway 和 watch。若 writer 已启动、gateway 已创建，但后续 sync/watch 构造失败，tuple 赋值不会发生，外层 `finally` 无法关闭这些局部资源，数据库 worker 和网络组件会泄漏。
+- 修复：`_build_runtime()` 使用异步资源栈登记每个已成功取得所有权的组件；构建失败时按 watch、gateway、writer 的逆序自动关闭，完整构建成功后才把清理职责移交给 `run()`，正常关闭路径保持不变。
+- RED/GREEN：新增“Watch 构造抛错后 writer 与 gateway 均只关闭一次”回归；旧实现两者关闭次数均为 0，修复后均为 1。应用管线文件 17 个测试通过。
+
+## ISSUE-087：全量 catalog 读取强制临时排序，阻塞监听上下文
+
+- 状态：根因修复并通过查询计划回归，待新进程真实同步复验。
+- 真实现象：异步全量同步在 `catalog_load` 阶段读取约 18 万 markets、27 万 tokens 时耗时 7,530ms；同一时段 Watch 的一次策略上下文查询耗时 5,186ms，盘口 observation age 达 5,224ms，因 `ORDERBOOK_STALE` 安全跳过评估。WebSocket pump/consumer 队列没有 drop，排除行情断流和本地消费积压。
+- 查询计划证据：`SELECT * FROM events/markets/tokens ORDER BY CAST(id AS BLOB)` 均显示全表扫描并 `USE TEMP B-TREE FOR ORDER BY`；同表 `ORDER BY id` 则直接扫描现有 `sqlite_autoindex_*_1` 主键索引。
+- 根因：`CAST(id AS BLOB)` 禁用了三张表已有的 TEXT 主键索引，使每次完整目录读取都额外复制并排序数十万行。SQLite 默认 BINARY collation 对 TEXT 按底层字节比较，与代码要求的 UTF-8 字节序一致，因此这里的显式 CAST 没有语义收益。
+- 修复：完整 catalog 的三条读取 SQL 改为 `ORDER BY id`，保留确定性顺序并复用主键索引；读取事务和后台对象物化流程不变。
+- RED/GREEN：新增三张表 `EXPLAIN QUERY PLAN` 回归，旧实现因没有可检查的统一 SQL 常量且查询计划包含临时 B-tree 而失败；修复后所有语句均不再出现 `USE TEMP B-TREE FOR ORDER BY`。ISSUE-084 的并发仓储测试同时增强为显式验证较新 Watch 内容被保留、完整 sync generation 仍单调推进。
+
+## ISSUE-088：启动恢复补位重复读取完整 catalog
+
+- 状态：根因修复，RED/GREEN 与新进程真实启动复验均通过。
+- 真实现象：最新进程首次恢复从 50 markets 裁掉 2 个无订单簿市场后，`watch_recovery_refill_prepared` 耗时 7,082ms；日志时间线显示其中约 6.5 秒发生在补位开始日志之前，网络刷新 2 个替补市场实际只用 168ms。
+- 根因：Watch 启动已读取、定向刷新并提交约 18 万 markets/36 万 tokens 的 `_catalog_snapshot`，但 `_prepare_recovery_refill()` 仍无条件再次从 SQLite 读取和物化同一份完整目录。
+- 修复：恢复补位优先复用 Watch 已提交的内存快照；仅在防御性空快照场景回退数据库。新增 `watch_recovery_refill_catalog_selected` INFO 和最终 `snapshot_source` 字段，直接记录快照来源、规模和选择前耗时。
+- RED/GREEN：启动补位测试新增整个 `watch.start()` 只允许一次 `load_catalog()` 的断言；旧实现实际调用 2 次而失败，修复后与“全部裁空且无候选”边界测试共同通过。候选刷新、context revision、Gateway identity 和恢复换代流程保持不变。
+- 真实复验：同样从 50 markets 裁掉 2 个市场并补入 2 个候选时，日志明确输出 `snapshot_source=memory`，完整补位耗时由 7,082ms 降至 1,090ms，Watch bootstrap 由 19,845ms 降至 13,756ms；最终仍恢复为 50 markets/100 tokens。
+
+## ISSUE-089：恢复补位可能覆盖并发更新后的 catalog snapshot
+
+- 状态：根因修复并通过并发回归测试。
+- 审查发现：恢复补位会先读取内存 catalog，再等待替补市场的网络刷新；这段等待期间周期 metadata 刷新可能提交更新的 snapshot。旧补位路径随后无条件把基于旧 snapshot 合并出的结果提交给策略 context，导致较新的 catalog 更新被回退。
+- 修复：恢复补位捕获 snapshot revision，并通过 `_prepare_context_catalog(..., expected_revision=...)` 做 compare-and-swap 提交；若 revision 已前进，则输出 `watch_recovery_refill_retry reason=snapshot_advanced`，从最新内存 snapshot 重新计算候选和刷新结果，避免旧快照覆盖新快照。
+- RED/GREEN：新增阻塞式 Gateway 并发测试，在补位网络请求暂停期间主动提交更新 catalog；旧实现最终 context 中 market question 回退为旧值，修复后检测 revision 冲突并重算，保留较新值。该测试及正常补位、周期刷新关联测试共 3 个通过。
+
+## ISSUE-090：SDK 终止标记位于预取事件之后时恢复可能误判成功
+
+- 状态：根因修复并通过确定性 RED/GREEN 回归。
+- 审查发现：MarketSubscription 的事件泵会预取并排队行情；SDK iterator 结束或事件映射失败时，旧实现把 invalid reason 追加到队尾。若 REST recovery baseline 同时完成，恢复屏障最多消费少量队首事件后即可返回，尚未读到队尾终止标记，因此已经失效的 generation 可能被误装为恢复成功。
+- 修复：事件泵发现 SDK 正常外结束、异常结束或非法 SDK 事件时，立即写入专用于 recovery barrier 的终止状态，同时仍把 invalid reason 放在 handoff 队尾。恢复路径无需等到消费队尾即可 fail-closed；普通实时消费者则仍按序交付终止前已成功映射的事件，再收到失效通知。显式正常关闭仍不会被误报为断线。
+- RED/GREEN：新增“3 个事件已预取、SDK 终止标记排在其后、baseline 同时完成”的确定性测试；旧实现直接返回 baseline 而失败，修复后以 `sdk_handle_ended` 拒绝恢复。首次修复因过早屏蔽终止前有效事件导致 gateway 文件 12 个回归失败，按上述双通道语义调整后该文件 80 个测试全部通过。
+
+## ISSUE-091：新信号数据库基线查询使用了错误时间字段
+
+- 状态：已修正诊断查询，无生产代码改动。
+- 现象：首次核对 `./data/predmarket-v1.sqlite3` 是否产生新 signal revision 时，查询使用了不存在的 `signal_revisions.created_at`，SQLite 返回 `no such column: created_at`，导致该次基线检查中断。
+- 根因：`arbitrage_signals` 的变更时间字段是 `updated_at`，但 `signal_revisions` 的观测时间字段是 `observed_at`；诊断 SQL 错误地假设两张表使用相同字段名。
+- 修正：通过 `.schema signal_revisions` 核对真实 schema，后续基线固定使用 `SELECT count(*), MAX(observed_at) FROM signal_revisions`，并同时读取 `arbitrage_signals.updated_at`。修正后基线为 signals=2、revisions=4，均为本次启动前已有的 CLOSED 历史信号，因此不能作为本轮新信号验收依据。
+
+## ISSUE-092：最终人工复验再次误用不存在的 `signals` 表
+
+- 状态：已纠正诊断命令，无生产代码改动。
+- 现象：最终长时间复验第一次查询信号水位时再次执行了 `SELECT ... FROM signals`，SQLite 返回 `no such table: signals`。
+- 原因：诊断命令没有复用 ISSUE-067/091 已核对的 schema，属于人工验证流程错误；真实表名是 `arbitrage_signals`。
+- 修正：先通过 `.tables` 和 `sqlite_master` 重新确认真实 schema，后续固定查询 `arbitrage_signals.updated_at` 与 `signal_revisions.observed_at`。本轮启动基线仍为 2 个历史 CLOSED signal、4 个 revision，最新水位均为 `1785828290572`。
+
+## ISSUE-093：高流量期间 WebSocket 由服务端以 slow consumer 关闭
+
+- 状态：断线现场已确认，fail-closed 自动恢复持续有效；未用放宽订单簿校验或扩大业务队列掩盖网络故障。
+- 现象：13:54 后行情速率从数百升至约 1,100 events/s，连接多次以 1006 断开；其中四次收到服务端 close code `1013` 和 reason `slow consumer: send buffer full`。其余 1006 在 WebSocket parser 边界记录到 `EOFError`，包括 `stream ends after 94 bytes, expected 599 bytes` 等明确的传输帧截断。
+- SDK 边界证据：close 日志同时记录 socket state、reader/parser exception、heartbeat age、WebSocket latency 和 transport closing；1013 有一次伴随 `BrokenPipeError`，1006 则反复出现不完整帧。这证明原来的 `connection_lost` 是结果，真正关闭信息必须在 SDK 收到 close/reader 终态的位置采集。
+- 已排除：SDK handle queue 容量为 65,536，观测占用通常为 0、无 handle/manager drop；Gateway 映射约 0.02ms/event、handoff wait 约 0.001ms/event；Watch `price_change` 处理约 0.17–0.21ms/message。断线前后这些队列均未积压，因此不是本项目 handoff queue 或 Watch consumer 塞满。
+- 关联负载：恢复后的 100-token 全量策略评估通常约 0.8–1.0 秒；高流量与后台同步竞争时，个别合并批次放大到约 5 秒。策略计算通过 `asyncio.to_thread` 逐目标执行，事件泵仍持续排空且队列保持接近 0，说明它会增加 CPU 竞争但不足以解释传输层截断。
+- 处理结果：每次断线立即使当前 cache generation 失效、关闭对应信号并重新获取 100-token REST baseline；真实多次恢复约 0.8–1.4 秒完成，runtime 没有退出。结合 ISSUE-053 的直连也曾复现 1006，当前证据不支持把 SOCKS 代理认定为唯一根因；应用层修复目标是完整记录现场并安全恢复，而不是猜测性修改固定 SDK 的私有 WebSocket 参数。
+
+## ISSUE-094：最终复验确认启动不再等待完整同步
+
+- 状态：核心启动行为和第二轮同步换代均已通过真实运行验证；继续等待本轮新增信号作为最终验收。
+- 启动证据：进程于 13:37:36 输出 `runtime_starting`；数据库、writer、repositories、notifier、queue、gateway、sync task、watch task 均逐项输出 `component_initialized`。Watch 于 13:37:49 完成 50 markets/100 tokens 恢复并输出 `component_started` 与 `runtime_started`，启动约 12.7 秒。
+- 并行证据：首次 `sync_started` 位于 `runtime_started` 之后，完整同步耗时 560,774ms；该期间 Watch 持续收到、缓存并评估行情，证明启动路径不再同步等待 `run_once`。
+- 周期证据：第二轮完整同步耗时 711,211ms，Watch 同期继续消费行情。同步提交后只处理该 sync generation 的首条目录通知，其余同代通知被合并；订阅换代及缺失盘口补位后恢复到 50 markets/100 tokens、generation 27，runtime 继续运行。
+
+## ISSUE-095：上游 `price_change` 把已删除档位同时声明为权威顶档
+
+- 状态：已由现有 fail-closed 恢复路径安全处理；不能在缺少数量时伪造盘口档位。
+- 真实证据：15:36:03 的 market `3329164` 收到 BUY `price=0.51 size=0`，同一消息却声明 `best_bid=0.51 best_ask=0.53`；缓存按协议删除 0.51 后的真实顶档为 0.50。15:37:00 的 market `3329165` 又出现 BUY `0.48 size=0` 但声明 best bid 0.48，以及互补 token 的 SELL `0.52 size=0` 但声明 best ask 0.52。
+- 判断：官方协议规定 size 为 `0` 时删除该价格档；这些消息无法同时满足“删除档位”和“该档位仍是顶档”。只使用 `best_bid_ask` 的价格也无法恢复未知成交数量，若凭空补档会制造虚假深度和信号。
+- 处理：保留严格一致性校验，记录 market/token、delta、服务端顶档和缓存顶档后使 generation 失效；两次均在约 0.9–1.4 秒内用完整 REST baseline 恢复，未持久化污染信号。
+
+## ISSUE-096：高流量下过期评估批次仍消耗额外策略计算
+
+- 状态：已确认安全影响和性能边界；本 PR 不复制策略校验逻辑做猜测性快路径。
+- 真实证据：15:41:10 的 100-token 批次在 `contexts_for_batch` 阶段耗时 4,801ms；捕获的盘口在该阶段已超过 1,000ms freshness 上限，但之后 100 个目标仍逐个进入策略校验，额外耗时 1,891ms，整批 6,695ms，最终全部返回 `ORDERBOOK_STALE.orderbook_subscription_stale`。
+- 影响：不会产生基于旧盘口的信号，现有信号也仍能通过每个目标的 `NotEvaluable` 决策关闭；代价是 CPU 竞争和发现延迟。同期 SDK/应用队列无 drop，但服务端随后以 `1013 slow consumer` 关闭连接。
+- 暂不直接跳过原因：简单丢弃整批会绕过 SignalManager 的关闭语义；在 Watch 层复制策略的 freshness 判断又会形成两套安全规则。本轮先保留正确性优先行为，并通过分阶段耗时、observation age 和 close-frame 日志完整暴露瓶颈；批量生成并应用 stale 决策可作为独立性能改动评审。
+
+## ISSUE-097：信号收益率诊断查询读取了错误表
+
+- 状态：已纠正诊断命令，无生产代码改动。
+- 现象：历史信号明细查询尝试读取 `arbitrage_signals.return_rate`，SQLite 报该列不存在。
+- 原因：主表保存信号生命周期和当前 revision id，收益率位于 `signal_revisions.return_rate`。
+- 修正：通过 `.schema arbitrage_signals` 和 `.schema signal_revisions` 重新核对后，明细固定通过 revision 关联查询；当前两条历史信号均产生于本轮启动前且已经 CLOSED，不能用于本轮验收。
+
+## ISSUE-098：截断日志被误判为 settlement 长时间卡住
+
+- 状态：已纠正诊断结论，无生产代码改动。
+- 现象：一次短尾日志只显示同步进入 settlement 阶段，没有显示完成行，曾被误判为停留约 8 分钟。
+- 原因：读取的是截断输出而不是完整日志文件时间线。
+- 修正：从 `/tmp/predmarket-pr16-final-validation.log` 读取完整阶段日志后确认 settlement 实际耗时 33,454ms；第三轮同步总耗时 583,972ms，并于 15:08:46 正常输出 `sync_completed`。后续阶段判断统一以完整日志中的 started/completed 配对为准。
+
+## ISSUE-099：策略执行期间变旧的盘口仍沿用旧评估时间
+
+- 状态：根因已修复，确定性 RED/GREEN 与 WatchTask 全量回归通过；待最新进程真实负载复验。
+- 真实证据：17:05:59 的评估汇总显示 `observation_age_ms=5278`、`context_ms=2422`、`strategy_ms=2773`，但 2 个目标仍返回 `PROFIT_BELOW_THRESHOLD`，没有按 `maximum_book_age_ms=1000` 返回 `ORDERBOOK_STALE`。该批次没有持久化信号，但说明若计算结果为正收益，旧实现可能把执行期间已经陈旧的结果交给 SignalManager。
+- 根因：`StrategyContext.evaluated_at` 在 context materialization 期间创建，之后还会等待 open revision 查询和线程池策略执行；策略 freshness 校验使用这个固定时间，而不是策略真正开始或完成的时间。汇总日志使用完成时的当前时间，所以暴露出两者约 5 秒的差异。
+- 修复：Watch 在调用策略前刷新真实 `StrategyContext.evaluated_at` 并注入本批盘口 observation 时间；策略返回后、交给 SignalManager 前再次用当前时钟检查 freshness。若执行期间超过上限，强制改为 `ORDERBOOK_STALE`，从而关闭旧信号且绝不写入陈旧机会。评估汇总新增 `stale_after_evaluation` 计数，直接暴露这种保护是否触发。
+- RED/GREEN：新增可控时钟测试，让策略开始时盘口新鲜、执行期间跨过 1,000ms 上限；旧实现保留 context 的旧时间并把普通决策传给 SignalManager，测试失败；修复后策略收到实时评估时间，最终应用 `ORDERBOOK_STALE`。`tests/unit/watch/test_task.py` 78 个测试全部通过。
+
+## 最终长时间复验补充（修复 ISSUE-099 前）
+
+- 第五轮完整同步于 16:18:53 开始、16:27:29 完成，总耗时 515,939ms；处理 136,902 个市场、273,804 个 token，发布 305 条变化。同步期间 Watch 持续消费行情，目录换代约 9.7 秒后恢复到 generation 86、50 markets/100 tokens。
+- 16:14–16:27 高流量阶段多次出现 WebSocket 1006/1013；应用队列保持接近 0 且无 drop，每次均 fail-closed 并在约 0.8–2.1 秒恢复。恢复过程中一度裁剪到 88 tokens，随后补位重新达到 100 tokens。
+- 17:02 和 17:04 两次收到 `tick_size_changed`，均立即使 generation 失效，并分别在约 1.04 秒和 1.07 秒恢复到完整 100-token baseline；数据库信号水位保持 signals=2、revisions=4，未产生伪信号。
+- 旧进程运行至 17:10 后为加载 ISSUE-099 修复而主动停止；截至停止，数据库最大 signal/revision 时间戳仍为 `1785828290572`，没有满足最终验收的本轮新信号。
+
+## ISSUE-099 真实负载复验补充
+
+- 最新代码于 17:11 启动；17:18:49 的评估在 context 查询等待约 4.79 秒后明确输出 `stale_after_evaluation=4`，证明策略执行后 freshness 二次校验在真实同步竞争下生效，没有把过期结果交给 SignalManager。
+- 本轮完整同步于 17:50:07 开始、18:03:14 完成，总耗时 787,079ms；Watch 在同步期间持续消费行情，同步提交后恢复到 generation 17、50 markets/100 tokens，未退出 runtime。
+- 17:51–17:53 高流量阶段服务端三次以 `1013 slow consumer: send buffer full` 关闭连接，另有 1006 截断帧；Gateway/Watch 队列均接近 0 且无 drop，每次自动恢复约 0.8–2 秒，结论与 ISSUE-093 一致。
+
+## ISSUE-100：最终信号明细查询错误地按不存在的 revision id 关联
+
+- 状态：已纠正诊断命令，无生产代码改动。
+- 现象：查询最新 signal 明细时使用 `signal_revisions.id = arbitrage_signals.current_revision_id`，SQLite 返回 `no such column: r.id`。
+- 原因：`signal_revisions` 使用 `(signal_id, revision)` 复合主键，主表保存的版本字段是 `latest_revision`，两张表都没有上述单列 id/current_revision_id。
+- 修正：固定使用 `r.signal_id = a.id AND r.revision = a.latest_revision` 关联。修正后仍只有两条启动前已有的 CLOSED signal，最大 signal/revision 水位均为 `1785828290572`。
+
+## ISSUE-101：本机时钟慢约 2.3 秒导致实时盘口持续被因果校验拒绝
+
+- 状态：根因已确认；诊断日志和回归已完成，等待操作系统同步时钟后继续最终信号验收。
+- 真实现象：最新代码启动评估中 10/100 个目标返回 `orderbook_timestamp_causality_invalid`；后续实时批次持续全部返回该原因。新增日志显示交易所时间领先本机接收时间 1,675–2,187ms，远超已确认的 100ms 上限，并给出对应 token、exchange/received timestamp。
+- SDK/映射证据：SDK 事件的 `timestamp` 被原样映射为 `exchange_timestamp`；`received_timestamp` 在 Gateway 收到事件时调用本机 `_system_clock_ms()` 生成，未发现单位换算或字段映射错误。
+- 独立时钟证据：`sntp -t 5 time.apple.com` 返回 `+2.286002 +/- 0.047490`，表示本机约慢 2.286 秒；同期 `clob.polymarket.com` HTTP `Date` 也比本机时间约快 2 秒，与行情日志偏差一致。
+- 判断：100ms 校验正在正确 fail-closed。把阈值直接放宽到 3 秒会掩盖主机时钟配置错误，并允许真实的上游未来时间戳通过，因此不作为代码修复。
+- 代码改动：`NotEvaluable` 为该原因携带最大偏差、阈值、token 及两端时间戳；Watch 评估汇总输出本批最大偏差，保持聚合和限频，不改变策略判定。
+- RED/GREEN：新增 strategy 决策上下文字段测试和 Watch 最大偏差汇总测试；旧实现分别因字段缺失和日志缺失失败，实现后 strategy + Watch 共 161 个测试通过。
+- 操作步骤：启用 macOS 自动日期与时间，或以管理员权限同步受信任 NTP；同步后重新执行 `sntp -t 5 time.apple.com`，偏差需回到 100ms 以内，再重启 runtime 以重建全部 REST baseline 的本机接收时间。

@@ -28,6 +28,7 @@ from predmarket.persistence.repositories import CatalogSnapshot
 from predmarket.polymarket.gateway import (
     MarketRecoveryInvalidatedError,
     MarketRecoverySession,
+    MarketRecoveryTransientError,
     MarketSnapshot,
     MarketStreamEvent,
     MarketStreamInvalidated,
@@ -63,6 +64,13 @@ class _RecoveryCleanupResult:
 @dataclass(frozen=True, slots=True)
 class _SubscriptionCloseResult:
     error: Exception | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryScopePruned:
+    effective_token_ids: tuple[str, ...]
+    effective_market_ids: tuple[str, ...]
+    removed_token_ids: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -165,6 +173,7 @@ class WatchTask:
         cache: OrderBookCache | None = None,
         clock_ms: Callable[[], int] | None = None,
         market_limit: int = 100,
+        minimum_end_horizon_seconds: int = 1_800,
         market_metadata_refresh_interval_seconds: int = 150,
     ) -> None:
         for value, name in (
@@ -179,6 +188,13 @@ class WatchTask:
                 raise TypeError(f"{name} is required")
         if type(market_limit) is not int or market_limit < 1:
             raise ValueError("market_limit must be a positive integer")
+        if (
+            type(minimum_end_horizon_seconds) is not int
+            or minimum_end_horizon_seconds < 0
+        ):
+            raise ValueError(
+                "minimum_end_horizon_seconds must be a non-negative integer"
+            )
         if (
             type(market_metadata_refresh_interval_seconds) is not int
             or market_metadata_refresh_interval_seconds < 1
@@ -195,6 +211,7 @@ class WatchTask:
         self._cache = cache or OrderBookCache()
         self._clock_ms = clock_ms or _system_clock_ms
         self._market_limit = market_limit
+        self._minimum_end_horizon_ms = minimum_end_horizon_seconds * 1_000
         self._market_metadata_refresh_interval_seconds = (
             market_metadata_refresh_interval_seconds
         )
@@ -239,6 +256,12 @@ class WatchTask:
         self._evaluation_batch_count = 0
         self._evaluation_coalesced_count = 0
         self._catalog_control_without_rotation_count = 0
+        self._last_catalog_change_generation: str | None = None
+        self._catalog_change_generation_coalesced_count = 0
+        self._catalog_change_generation_coalesced_total = 0
+        self._catalog_snapshot: CatalogSnapshot | None = None
+        self._catalog_snapshot_revision = 0
+        self._catalog_context_lock = asyncio.Lock()
         self._last_evaluation_summary_at = float("-inf")
         self._recovery_retry_initial_seconds = _RECOVERY_RETRY_INITIAL_SECONDS
         self._recovery_retry_max_seconds = _RECOVERY_RETRY_MAX_SECONDS
@@ -274,6 +297,7 @@ class WatchTask:
                 snapshot,
                 now_ms=self._now(),
                 market_limit=self._market_limit,
+                minimum_end_horizon_ms=self._minimum_end_horizon_ms,
             )
             _LOGGER.info(
                 "watch_subscription_prepared markets=%d tokens=%d market_limit=%d "
@@ -364,9 +388,6 @@ class WatchTask:
                         readers_to_drain = tuple(
                             task for task in pending if task in transient_tasks
                         )
-                    elif change is not _NO_CHANGE and stream_task in pending:
-                        assert stream_task is not None
-                        readers_to_drain = (stream_task,)
                     try:
                         await _cancel_and_drain(readers_to_drain)
                     finally:
@@ -423,11 +444,13 @@ class WatchTask:
             try:
                 message = await anext(subscription)
             except StopAsyncIteration:
+                if subscription is not self._subscription:
+                    continue
                 message = MarketStreamInvalidated(
                     reason="sdk_handle_ended",
                     token_ids=self._active_token_ids,
                     received_timestamp=0,
-                    subscription_generation=self._cache.generation,
+                    subscription_generation=subscription.subscription_generation,
                     mapping_version="watch-synthetic-v1",
                 )
             handler_started_at = time.perf_counter()
@@ -511,11 +534,61 @@ class WatchTask:
             if self._closed:
                 return
             self._prepare_current_subscription_close_retry()
+            generation = _catalog_change_generation(change)
+            control_change = change.change_type in {
+                MarketChangeType.MARKET_DEACTIVATED,
+                MarketChangeType.EVENT_SETTLED,
+            }
+            reason = (
+                DecisionReason.EVENT_SETTLED
+                if change.change_type is MarketChangeType.EVENT_SETTLED
+                else DecisionReason.MARKET_CLOSED
+            )
+            if (
+                generation is not None
+                and generation == self._last_catalog_change_generation
+            ):
+                active_token_id_set = frozenset(self._active_token_ids)
+                confirmed_closed = tuple(
+                    token_id
+                    for token_id in change.token_ids
+                    if token_id not in active_token_id_set
+                )
+                if control_change:
+                    await self._close_signals(
+                        confirmed_closed,
+                        reason,
+                        detail="market_control",
+                    )
+                self._catalog_change_generation_coalesced_count += 1
+                self._catalog_change_generation_coalesced_total += 1
+                count = self._catalog_change_generation_coalesced_count
+                if count == 1 or count % 1_000 == 0:
+                    _LOGGER.info(
+                        "watch_catalog_change_generation_coalesced "
+                        "generation=%s generation_changes=%d total=%d "
+                        "change_type=%s control_applied=%s",
+                        _bounded_log_value(generation),
+                        count,
+                        self._catalog_change_generation_coalesced_total,
+                        change.change_type.value,
+                        control_change and bool(confirmed_closed),
+                    )
+                return
+            started_at = time.monotonic()
+            if generation is not None:
+                _LOGGER.info(
+                    "watch_catalog_change_generation_started generation=%s "
+                    "change_type=%s",
+                    _bounded_log_value(generation),
+                    change.change_type.value,
+                )
             snapshot = await self._catalog.load_catalog()
             new_token_ids, new_market_ids = _watchable_subscription(
                 snapshot,
                 now_ms=self._now(),
                 market_limit=self._market_limit,
+                minimum_end_horizon_ms=self._minimum_end_horizon_ms,
             )
             active_market_ids = frozenset(self._active_market_ids)
             added_market_ids = tuple(
@@ -540,56 +613,68 @@ class WatchTask:
                     snapshot,
                     now_ms=self._now(),
                     market_limit=self._market_limit,
+                    minimum_end_horizon_ms=self._minimum_end_horizon_ms,
                 )
             await self._prepare_context_catalog(snapshot)
             if (
                 new_token_ids == self._active_token_ids
                 and change.change_type is MarketChangeType.MARKET_UPDATED
             ):
+                self._complete_catalog_change_generation(
+                    generation,
+                    change=change,
+                    started_at=started_at,
+                )
                 return
+            new_token_id_set = frozenset(new_token_ids)
             removed = tuple(
                 token_id
                 for token_id in self._active_token_ids
-                if token_id not in frozenset(new_token_ids)
+                if token_id not in new_token_id_set
             )
             explicitly_closed = removed
-            if change.change_type in {
-                MarketChangeType.MARKET_DEACTIVATED,
-                MarketChangeType.EVENT_SETTLED,
-            }:
+            if control_change:
                 explicitly_closed = tuple(
-                    sorted(set(removed).union(change.token_ids), key=_utf8)
+                    sorted(
+                        set(removed).union(
+                            token_id
+                            for token_id in change.token_ids
+                            if token_id not in new_token_id_set
+                        ),
+                        key=_utf8,
+                    )
                 )
-            reason = (
-                DecisionReason.EVENT_SETTLED
-                if change.change_type is MarketChangeType.EVENT_SETTLED
-                else DecisionReason.MARKET_CLOSED
-            )
-            control_change = change.change_type in {
-                MarketChangeType.MARKET_DEACTIVATED,
-                MarketChangeType.EVENT_SETTLED,
-            }
-            if (
-                control_change
-                and new_token_ids == self._active_token_ids
-                and frozenset(change.token_ids).isdisjoint(self._active_token_ids)
-            ):
-                await self._close_signals(
-                    change.token_ids,
-                    reason,
-                    detail="market_control",
-                )
-                self._catalog_control_without_rotation_count += 1
-                count = self._catalog_control_without_rotation_count
-                if count == 1 or count % 100 == 0:
+            if control_change and new_token_ids == self._active_token_ids:
+                if explicitly_closed:
+                    await self._close_signals(
+                        explicitly_closed,
+                        reason,
+                        detail="market_control",
+                    )
+                    self._catalog_control_without_rotation_count += 1
+                    count = self._catalog_control_without_rotation_count
+                    if count == 1 or count % 100 == 0:
+                        _LOGGER.info(
+                            "watch_catalog_control_applied_without_rotation "
+                            "count=%d change_type=%s tokens=%d active_tokens=%d",
+                            count,
+                            change.change_type.value,
+                            len(explicitly_closed),
+                            len(self._active_token_ids),
+                        )
+                else:
                     _LOGGER.info(
-                        "watch_catalog_control_applied_without_rotation "
-                        "count=%d change_type=%s tokens=%d active_tokens=%d",
-                        count,
+                        "watch_catalog_control_ignored_stale change_type=%s "
+                        "tokens=%d active_tokens=%d",
                         change.change_type.value,
                         len(change.token_ids),
                         len(self._active_token_ids),
                     )
+                self._complete_catalog_change_generation(
+                    generation,
+                    change=change,
+                    started_at=started_at,
+                )
                 return
             self._hydrate_gateway(snapshot, new_market_ids)
             await self._rotate_to(
@@ -598,14 +683,59 @@ class WatchTask:
                 explicitly_closed=explicitly_closed,
                 close_reason=reason,
             )
+            self._complete_catalog_change_generation(
+                generation,
+                change=change,
+                started_at=started_at,
+            )
 
-    async def _prepare_context_catalog(self, snapshot: CatalogSnapshot) -> None:
-        prepare = getattr(self._context_source, "use_catalog_snapshot", None)
-        if prepare is None:
+    def _complete_catalog_change_generation(
+        self,
+        generation: str | None,
+        *,
+        change: MarketChange,
+        started_at: float,
+    ) -> None:
+        if generation is None:
             return
-        result = prepare(snapshot)
-        if inspect.isawaitable(result):
-            await result
+        self._last_catalog_change_generation = generation
+        self._catalog_change_generation_coalesced_count = 0
+        _LOGGER.info(
+            "watch_catalog_change_generation_completed generation=%s "
+            "change_type=%s active_markets=%d active_tokens=%d elapsed_ms=%d",
+            _bounded_log_value(generation),
+            change.change_type.value,
+            len(self._active_market_ids),
+            len(self._active_token_ids),
+            int((time.monotonic() - started_at) * 1_000),
+        )
+
+    async def _prepare_context_catalog(
+        self,
+        snapshot: CatalogSnapshot,
+        *,
+        expected_revision: int | None = None,
+    ) -> bool:
+        async with self._catalog_context_lock:
+            if (
+                expected_revision is not None
+                and expected_revision != self._catalog_snapshot_revision
+            ):
+                _LOGGER.info(
+                    "watch_catalog_context_prepare_skipped reason=snapshot_advanced "
+                    "expected_revision=%d actual_revision=%d",
+                    expected_revision,
+                    self._catalog_snapshot_revision,
+                )
+                return False
+            prepare = getattr(self._context_source, "use_catalog_snapshot", None)
+            if prepare is not None:
+                result = prepare(snapshot)
+                if inspect.isawaitable(result):
+                    await result
+            self._catalog_snapshot = snapshot
+            self._catalog_snapshot_revision += 1
+            return True
 
     async def _refresh_startup_markets(
         self,
@@ -615,6 +745,7 @@ class WatchTask:
             snapshot,
             now_ms=self._now(),
             market_limit=self._market_limit,
+            minimum_end_horizon_ms=self._minimum_end_horizon_ms,
         )
         return await self._refresh_markets(
             snapshot,
@@ -706,10 +837,11 @@ class WatchTask:
                     )
                 ),
             )
-            snapshot = await self._catalog.load_catalog()
+            snapshot = _merge_refreshed_catalog(snapshot, successes)
         if failures:
             samples = ";".join(
-                f"{market_id}:{type(error).__name__}:{error}"
+                f"{market_id}:{type(error).__name__}:"
+                f"{_bounded_log_value(error)}"
                 for market_id, error in failures[:3]
             )
             _LOGGER.warning(
@@ -944,6 +1076,11 @@ class WatchTask:
                 detail="price_changes_invalid",
             )
             return
+        diagnostic_context = _price_change_diagnostic_context(
+            raw_changes,
+            cache=self._cache,
+        )
+        exchange_timestamp: int | None = None
         parse_started_at = time.perf_counter()
         try:
             deltas = tuple(
@@ -953,6 +1090,8 @@ class WatchTask:
                     price=_required_string(change.get("price"), "price"),
                     size=_required_string(change.get("size"), "size"),
                     book_hash=_required_string(change.get("hash"), "hash"),
+                    best_bid=_optional_string(change.get("best_bid"), "best_bid"),
+                    best_ask=_optional_string(change.get("best_ask"), "best_ask"),
                 )
                 for change in raw_changes
                 if isinstance(change, Mapping)
@@ -973,6 +1112,16 @@ class WatchTask:
             )
             cache_seconds = time.perf_counter() - cache_started_at
         except (CacheInvalidatedError, TypeError, ValueError) as error:
+            _LOGGER.warning(
+                "watch_price_change_invalid market_id=%s generation=%d "
+                "exchange_timestamp=%s received_timestamp=%d error=%s %s",
+                message.market_id,
+                message.subscription_generation,
+                exchange_timestamp,
+                message.received_timestamp,
+                error,
+                diagnostic_context,
+            )
             await self._invalidate_close_recover(
                 DecisionReason.ORDERBOOK_INVALID,
                 detail=f"price_change_invalid:{error}",
@@ -1145,17 +1294,27 @@ class WatchTask:
                 return
             started_at = time.monotonic()
             market_ids = self._active_market_ids
-            snapshot = await self._catalog.load_catalog()
+            snapshot = self._catalog_snapshot
+            snapshot_source = "memory"
+            if snapshot is None:
+                snapshot_source = "database"
+                snapshot = await self._catalog.load_catalog()
+            snapshot_revision = self._catalog_snapshot_revision
             snapshot = await self._refresh_markets(
                 snapshot,
                 market_ids,
                 trigger="periodic",
             )
-            await self._prepare_context_catalog(snapshot)
+            context_prepared = await self._prepare_context_catalog(
+                snapshot,
+                expected_revision=snapshot_revision,
+            )
             _LOGGER.info(
                 "watch_market_metadata_refresh_cycle_completed markets=%d "
-                "elapsed_ms=%d",
+                "snapshot_source=%s context_prepared=%s elapsed_ms=%d",
                 len(market_ids),
+                snapshot_source,
+                context_prepared,
                 int((time.monotonic() - started_at) * 1_000),
             )
 
@@ -1227,27 +1386,74 @@ class WatchTask:
     async def _recover(self, token_ids: tuple[str, ...]) -> None:
         attempt = 1
         retry_delay = self._recovery_retry_initial_seconds
+        requested_token_ids = token_ids
+        excluded_market_ids: set[str] = set()
         while not self._closed and not self._stop_event.is_set():
             try:
-                await self._recover_once(token_ids)
-                return
-            except MarketRecoveryInvalidatedError as error:
-                if not error.retryable:
+                pruned = await self._recover_once(requested_token_ids)
+                if pruned is None:
+                    return
+                requested_token_ids = await self._prepare_recovery_refill(
+                    requested_token_ids,
+                    pruned,
+                    excluded_market_ids=excluded_market_ids,
+                )
+                if not requested_token_ids:
+                    self._active_token_ids = ()
+                    self._active_market_ids = ()
+                    _LOGGER.warning(
+                        "watch_recovery_stopped reason=no_watchable_markets "
+                        "excluded_markets=%d",
+                        len(excluded_market_ids),
+                    )
+                    return
+            except (
+                MarketRecoveryInvalidatedError,
+                MarketRecoveryTransientError,
+                CacheInvalidatedError,
+            ) as error:
+                if (
+                    isinstance(error, MarketRecoveryInvalidatedError)
+                    and not error.retryable
+                ):
                     raise
                 if self._closed or self._stop_event.is_set():
                     return
+                reason = (
+                    error.reason
+                    if isinstance(
+                        error,
+                        MarketRecoveryInvalidatedError | MarketRecoveryTransientError,
+                    )
+                    else f"cache_snapshot_invalid:{error}"
+                )
+                status = (
+                    error.status
+                    if isinstance(error, MarketRecoveryTransientError)
+                    else None
+                )
+                retry_after = (
+                    error.retry_after
+                    if isinstance(error, MarketRecoveryTransientError)
+                    else None
+                )
+                effective_retry_delay = min(
+                    max(retry_delay, retry_after or 0.0),
+                    self._recovery_retry_max_seconds,
+                )
                 _LOGGER.warning(
                     "watch_recovery_retry_scheduled attempt=%d tokens=%d "
-                    "reason=%s retry_in_seconds=%.3f",
+                    "reason=%s status=%s retry_in_seconds=%.3f",
                     attempt,
-                    len(token_ids),
-                    error.reason,
-                    retry_delay,
+                    len(requested_token_ids),
+                    reason,
+                    status if status is not None else "none",
+                    effective_retry_delay,
                 )
                 try:
                     await asyncio.wait_for(
                         self._stop_event.wait(),
-                        timeout=retry_delay,
+                        timeout=effective_retry_delay,
                     )
                 except TimeoutError:
                     pass
@@ -1259,7 +1465,147 @@ class WatchTask:
                     self._recovery_retry_max_seconds,
                 )
 
-    async def _recover_once(self, token_ids: tuple[str, ...]) -> None:
+    async def _prepare_recovery_refill(
+        self,
+        requested_token_ids: tuple[str, ...],
+        pruned: _RecoveryScopePruned,
+        *,
+        excluded_market_ids: set[str],
+    ) -> tuple[str, ...]:
+        snapshot_attempt = 1
+        while True:
+            token_ids = await self._prepare_recovery_refill_attempt(
+                requested_token_ids,
+                pruned,
+                excluded_market_ids=excluded_market_ids,
+                snapshot_attempt=snapshot_attempt,
+            )
+            if token_ids is not None:
+                return token_ids
+            snapshot_attempt += 1
+            _LOGGER.info(
+                "watch_recovery_refill_retry reason=snapshot_advanced attempt=%d",
+                snapshot_attempt,
+            )
+
+    async def _prepare_recovery_refill_attempt(
+        self,
+        requested_token_ids: tuple[str, ...],
+        pruned: _RecoveryScopePruned,
+        *,
+        excluded_market_ids: set[str],
+        snapshot_attempt: int,
+    ) -> tuple[str, ...] | None:
+        started_at = time.monotonic()
+        snapshot = self._catalog_snapshot
+        snapshot_revision = self._catalog_snapshot_revision
+        snapshot_source = "memory"
+        if snapshot is None:
+            snapshot_source = "database"
+            _LOGGER.info("watch_recovery_refill_catalog_load_started")
+            snapshot = await self._catalog.load_catalog()
+        _LOGGER.info(
+            "watch_recovery_refill_catalog_selected snapshot_source=%s "
+            "events=%d markets=%d tokens=%d elapsed_ms=%d",
+            snapshot_source,
+            len(snapshot.events),
+            len(snapshot.markets),
+            len(snapshot.tokens),
+            int((time.monotonic() - started_at) * 1_000),
+        )
+        market_id_by_token_id = {
+            token.id: token.market_id for token in snapshot.tokens
+        }
+        requested_market_ids = {
+            market_id_by_token_id[token_id]
+            for token_id in requested_token_ids
+            if token_id in market_id_by_token_id
+        }
+        removed_market_ids = {
+            market_id_by_token_id[token_id]
+            for token_id in pruned.removed_token_ids
+            if token_id in market_id_by_token_id
+        }
+        removed_market_ids.update(
+            requested_market_ids.difference(pruned.effective_market_ids)
+        )
+        excluded_market_ids.update(removed_market_ids)
+        _LOGGER.info(
+            "watch_recovery_refill_started target_markets=%d active_markets=%d "
+            "removed_markets=%d excluded_markets=%d",
+            self._market_limit,
+            len(pruned.effective_market_ids),
+            len(removed_market_ids),
+            len(excluded_market_ids),
+        )
+        token_ids, market_ids = _watchable_subscription(
+            snapshot,
+            now_ms=self._now(),
+            market_limit=self._market_limit,
+            minimum_end_horizon_ms=self._minimum_end_horizon_ms,
+            excluded_market_ids=frozenset(excluded_market_ids),
+        )
+        effective_market_ids = frozenset(pruned.effective_market_ids)
+        added_market_ids = tuple(
+            market_id
+            for market_id in market_ids
+            if market_id not in effective_market_ids
+        )
+        if added_market_ids:
+            snapshot = await self._refresh_markets(
+                snapshot,
+                added_market_ids,
+                trigger="recovery_refill",
+            )
+            token_ids, market_ids = _watchable_subscription(
+                snapshot,
+                now_ms=self._now(),
+                market_limit=self._market_limit,
+                minimum_end_horizon_ms=self._minimum_end_horizon_ms,
+                excluded_market_ids=frozenset(excluded_market_ids),
+            )
+            added_market_ids = tuple(
+                market_id
+                for market_id in market_ids
+                if market_id not in effective_market_ids
+            )
+        if not token_ids or token_ids == requested_token_ids:
+            token_ids = pruned.effective_token_ids
+            market_ids = pruned.effective_market_ids
+            added_market_ids = ()
+            _LOGGER.warning(
+                "watch_recovery_refill_unavailable target_markets=%d "
+                "available_markets=%d excluded_markets=%d",
+                self._market_limit,
+                len(market_ids),
+                len(excluded_market_ids),
+            )
+        context_prepared = await self._prepare_context_catalog(
+            snapshot,
+            expected_revision=snapshot_revision,
+        )
+        if not context_prepared:
+            return None
+        self._hydrate_gateway(snapshot, market_ids)
+        _LOGGER.info(
+            "watch_recovery_refill_prepared target_markets=%d selected_markets=%d "
+            "selected_tokens=%d added_markets=%d excluded_markets=%d "
+            "snapshot_source=%s snapshot_attempt=%d elapsed_ms=%d",
+            self._market_limit,
+            len(market_ids),
+            len(token_ids),
+            len(added_market_ids),
+            len(excluded_market_ids),
+            snapshot_source,
+            snapshot_attempt,
+            int((time.monotonic() - started_at) * 1_000),
+        )
+        return token_ids
+
+    async def _recover_once(
+        self,
+        token_ids: tuple[str, ...],
+    ) -> _RecoveryScopePruned | None:
         if self._closed or self._stop_event.is_set():
             return
         recovery_started_at = time.monotonic()
@@ -1333,9 +1679,13 @@ class WatchTask:
                     DecisionReason.ORDERBOOK_INVALID,
                     detail="recovery_missing_order_books",
                 )
-                self._active_token_ids = effective_token_ids
-                self._active_market_ids = effective_market_ids
-                token_ids = effective_token_ids
+                await _close_owned(session.subscription)
+                session = None
+                return _RecoveryScopePruned(
+                    effective_token_ids=effective_token_ids,
+                    effective_market_ids=effective_market_ids,
+                    removed_token_ids=removed_token_ids,
+                )
             _LOGGER.info(
                 "watch_recovery_baseline_received tokens=%d books=%d "
                 "generation=%d elapsed_ms=%d",
@@ -1346,16 +1696,25 @@ class WatchTask:
             )
             self._cache.begin_resync(generation=generation, token_ids=token_ids)
             self._cache.apply_snapshot(books)
+            self._active_token_ids = effective_token_ids
+            self._active_market_ids = tuple(
+                sorted({book.market_id for book in books}, key=_utf8)
+            )
             self._last_orderbook_observed_at_ms = self._now()
             self._subscription = session.subscription
         except BaseException as error:
-            if isinstance(error, MarketRecoveryInvalidatedError):
+            if isinstance(error, (MarketRecoveryInvalidatedError, CacheInvalidatedError)):
+                reason = (
+                    error.reason
+                    if isinstance(error, MarketRecoveryInvalidatedError)
+                    else f"cache_snapshot_invalid:{error}"
+                )
                 _LOGGER.warning(
                     "watch_recovery_attempt_invalidated tokens=%d elapsed_ms=%d "
                     "reason=%s",
                     len(token_ids),
                     int((time.monotonic() - recovery_started_at) * 1_000),
-                    error.reason,
+                    reason,
                 )
             elif isinstance(error, Exception):
                 _LOGGER.error(
@@ -1464,6 +1823,7 @@ class WatchTask:
         deduplicated_target_count = 0
         evaluated_opportunity_keys: set[str] = set()
         persisted_signal_count = 0
+        stale_after_evaluation_count = 0
         decision_counts: dict[str, int] = {}
         context_elapsed = 0.0
         strategy_elapsed = 0.0
@@ -1472,6 +1832,11 @@ class WatchTask:
         best_required_return_rate: Decimal | None = None
         best_opportunity_key = "none"
         best_market_ids = "none"
+        maximum_observed_exchange_clock_skew_ms: int | None = None
+        exchange_clock_skew_limit_ms: int | None = None
+        exchange_clock_skew_token_id = "none"
+        exchange_clock_skew_exchange_timestamp: int | None = None
+        exchange_clock_skew_received_timestamp: int | None = None
         books = self._cache.view()
         observed_at = self._last_orderbook_observed_at_ms
         batched_targets: Mapping[str, Sequence[EvaluationTarget]] | None = None
@@ -1522,6 +1887,7 @@ class WatchTask:
                 if isinstance(context, StrategyContext):
                     context = replace(
                         context,
+                        evaluated_at=self._now(),
                         orderbook_observed_at=observed_at,
                     )
                 strategy_started_at = time.monotonic()
@@ -1538,8 +1904,62 @@ class WatchTask:
                     return
                 if not isinstance(decision, StrategyDecision.__args__):
                     raise TypeError("strategy engine returned an invalid decision")
+                if isinstance(context, StrategyContext) and observed_at is not None:
+                    completed_at_ms = self._now()
+                    if (
+                        completed_at_ms >= observed_at
+                        and completed_at_ms - observed_at
+                        > context.configuration.maximum_book_age_ms
+                    ):
+                        stale_after_evaluation_count += 1
+                        decision = NotEvaluable(
+                            DecisionReason.ORDERBOOK_STALE,
+                            {
+                                "changed_token_id": context.changed_token_id,
+                                "detail": "orderbook_stale_after_evaluation",
+                                "strategy_type": context.strategy_type.value,
+                            },
+                        )
                 decision_key = _decision_log_key(decision)
                 decision_counts[decision_key] = decision_counts.get(decision_key, 0) + 1
+                if isinstance(decision, NotEvaluable) and (
+                    decision.context.get("detail")
+                    == "orderbook_timestamp_causality_invalid"
+                ):
+                    skew_ms = decision.context.get("exchange_clock_skew_ms")
+                    if type(skew_ms) is int and (
+                        maximum_observed_exchange_clock_skew_ms is None
+                        or skew_ms > maximum_observed_exchange_clock_skew_ms
+                    ):
+                        maximum_observed_exchange_clock_skew_ms = skew_ms
+                        limit_ms = decision.context.get(
+                            "maximum_exchange_clock_skew_ms"
+                        )
+                        token_id = decision.context.get("token_id")
+                        exchange_timestamp = decision.context.get(
+                            "exchange_timestamp"
+                        )
+                        received_timestamp = decision.context.get(
+                            "received_timestamp"
+                        )
+                        exchange_clock_skew_limit_ms = (
+                            limit_ms if type(limit_ms) is int else None
+                        )
+                        exchange_clock_skew_token_id = (
+                            _bounded_log_value(token_id)
+                            if isinstance(token_id, str)
+                            else "unknown"
+                        )
+                        exchange_clock_skew_exchange_timestamp = (
+                            exchange_timestamp
+                            if type(exchange_timestamp) is int
+                            else None
+                        )
+                        exchange_clock_skew_received_timestamp = (
+                            received_timestamp
+                            if type(received_timestamp) is int
+                            else None
+                        )
                 if isinstance(decision, (OpportunityPresent, OpportunityAbsent)) and (
                     best_return_rate is None
                     or decision.calculation.return_rate > best_return_rate
@@ -1587,7 +2007,10 @@ class WatchTask:
             _LOGGER.info(
                 "watch_evaluation_summary generation=%d tokens=%d generated_targets=%d "
                 "targets=%d deduplicated_targets=%d persisted_signals=%d "
-                "observation_age_ms=%s decisions=%s "
+                "stale_after_evaluation=%d observation_age_ms=%s decisions=%s "
+                "exchange_clock_skew_ms=%s exchange_clock_skew_limit_ms=%s "
+                "exchange_clock_skew_token_id=%s exchange_timestamp=%s "
+                "received_timestamp=%s "
                 "best_return_rate=%s required_return_rate=%s best_opportunity_key=%s "
                 "best_market_ids=%s context_ms=%d strategy_ms=%d signal_apply_ms=%d "
                 "elapsed_ms=%d",
@@ -1597,12 +2020,34 @@ class WatchTask:
                 target_count,
                 deduplicated_target_count,
                 persisted_signal_count,
+                stale_after_evaluation_count,
                 (
                     "unknown"
                     if observed_at is None
                     else str(max(0, self._now() - observed_at))
                 ),
                 decisions,
+                (
+                    "none"
+                    if maximum_observed_exchange_clock_skew_ms is None
+                    else str(maximum_observed_exchange_clock_skew_ms)
+                ),
+                (
+                    "none"
+                    if exchange_clock_skew_limit_ms is None
+                    else str(exchange_clock_skew_limit_ms)
+                ),
+                exchange_clock_skew_token_id,
+                (
+                    "none"
+                    if exchange_clock_skew_exchange_timestamp is None
+                    else str(exchange_clock_skew_exchange_timestamp)
+                ),
+                (
+                    "none"
+                    if exchange_clock_skew_received_timestamp is None
+                    else str(exchange_clock_skew_received_timestamp)
+                ),
                 _format_decimal_for_log(best_return_rate),
                 _format_decimal_for_log(best_required_return_rate),
                 best_opportunity_key,
@@ -1648,6 +2093,8 @@ def _watchable_subscription(
     *,
     now_ms: int | None = None,
     market_limit: int = 100,
+    minimum_end_horizon_ms: int = 0,
+    excluded_market_ids: frozenset[str] = frozenset(),
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     if not isinstance(snapshot, CatalogSnapshot):
         raise TypeError("catalog must return CatalogSnapshot")
@@ -1657,6 +2104,12 @@ def _watchable_subscription(
         raise ValueError("now_ms must be a non-negative integer")
     if type(market_limit) is not int or market_limit < 1:
         raise ValueError("market_limit must be a positive integer")
+    if type(minimum_end_horizon_ms) is not int or minimum_end_horizon_ms < 0:
+        raise ValueError("minimum_end_horizon_ms must be a non-negative integer")
+    if not isinstance(excluded_market_ids, frozenset) or any(
+        not isinstance(market_id, str) for market_id in excluded_market_ids
+    ):
+        raise TypeError("excluded_market_ids must be a frozenset of strings")
     tokens_by_market: dict[str, list[Any]] = {}
     for token in snapshot.tokens:
         tokens_by_market.setdefault(token.market_id, []).append(token)
@@ -1665,12 +2118,16 @@ def _watchable_subscription(
         market_tokens = tokens_by_market.get(market.id, ())
         if not (
             market.status is MarketStatus.ACTIVE
+            and market.id not in excluded_market_ids
             and market.active
             and market.accepting_orders
             and market.enable_orderbook
             and market.resolved_at is None
             and market.sync_generation_complete
-            and (market.end_at is None or market.end_at > now_ms)
+            and (
+                market.end_at is None
+                or market.end_at > now_ms + minimum_end_horizon_ms
+            )
             and market_tokens
             and all(
                 token.sync_generation_complete
@@ -1698,6 +2155,12 @@ def _watchable_subscription(
     )
     market_ids = tuple(sorted(watchable_market_ids, key=_utf8))
     return token_ids, market_ids
+
+
+def _catalog_change_generation(change: MarketChange) -> str | None:
+    delimiter = f":{change.change_type.value}:"
+    generation, separator, _ = change.change_id.partition(delimiter)
+    return generation if separator and generation else None
 
 
 def _watchable_token_ids(snapshot: CatalogSnapshot) -> tuple[str, ...]:
@@ -1792,6 +2255,12 @@ def _required_string(value: object, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a non-empty string")
     return value
+
+
+def _optional_string(value: object, name: str) -> str | None:
+    if value is None:
+        return None
+    return _required_string(value, name)
 
 
 def _timestamp_ms(value: object) -> int:
@@ -2028,6 +2497,77 @@ async def _finish_task_drain(tasks: tuple[asyncio.Task[Any], ...]) -> None:
         if not task.done():
             task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _price_change_diagnostic_context(
+    raw_changes: Sequence[Any],
+    *,
+    cache: OrderBookCache,
+) -> str:
+    samples: list[str] = []
+    for raw_change in raw_changes[:8]:
+        if not isinstance(raw_change, Mapping):
+            samples.append("entry_type=" + type(raw_change).__name__)
+            continue
+        token_value = raw_change.get("token_id")
+        token_id = token_value if isinstance(token_value, str) else None
+        current = cache.get(token_id) if token_id is not None else None
+        cache_best_bid = (
+            max((level.price for level in current.bids), default=None)
+            if current is not None
+            else None
+        )
+        cache_best_ask = (
+            min((level.price for level in current.asks), default=None)
+            if current is not None
+            else None
+        )
+        samples.append(
+            " ".join(
+                (
+                    f"token_id={_bounded_log_value(token_value)}",
+                    f"side={_bounded_log_value(raw_change.get('side'))}",
+                    f"price={_bounded_log_value(raw_change.get('price'))}",
+                    f"size={_bounded_log_value(raw_change.get('size'))}",
+                    "server_best_bid="
+                    f"{_bounded_log_value(raw_change.get('best_bid'))}",
+                    "server_best_ask="
+                    f"{_bounded_log_value(raw_change.get('best_ask'))}",
+                    f"cache_best_bid={cache_best_bid}",
+                    f"cache_best_ask={cache_best_ask}",
+                    "cache_exchange_timestamp="
+                    f"{current.exchange_timestamp if current is not None else 'none'}",
+                )
+            )
+        )
+    return (
+        f"change_count={len(raw_changes)} "
+        f"sample_count={len(samples)} samples={' | '.join(samples)}"
+    )
+
+
+def _merge_refreshed_catalog(
+    snapshot: CatalogSnapshot,
+    refreshes: Sequence[MarketSnapshot],
+) -> CatalogSnapshot:
+    market_updates = {refresh.market.id: refresh.market for refresh in refreshes}
+    token_updates = {
+        token.id: token for refresh in refreshes for token in refresh.tokens
+    }
+    markets = tuple(
+        market_updates.pop(market.id, market) for market in snapshot.markets
+    )
+    tokens = tuple(token_updates.pop(token.id, token) for token in snapshot.tokens)
+    if market_updates:
+        markets += tuple(sorted(market_updates.values(), key=lambda item: _utf8(item.id)))
+    if token_updates:
+        tokens += tuple(sorted(token_updates.values(), key=lambda item: _utf8(item.id)))
+    return CatalogSnapshot(events=snapshot.events, markets=markets, tokens=tokens)
+
+
+def _bounded_log_value(value: Any) -> str:
+    compact = " ".join(str(value).split())
+    return compact[:128] if compact else "none"
 
 
 def _utf8(value: str) -> bytes:

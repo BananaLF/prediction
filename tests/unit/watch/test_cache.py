@@ -154,6 +154,44 @@ def test_delta_that_crosses_top_of_book_invalidates_cache() -> None:
     assert cache.view() == ()
 
 
+def test_delta_reconciles_stale_opposite_top_from_authoritative_server_top() -> None:
+    cache = _valid_cache()
+    baseline = replace(
+        _book("token-a"),
+        bids=(OrderBookLevel(Decimal("0.69"), Decimal("2")),),
+        asks=(
+            OrderBookLevel(Decimal("0.70"), Decimal("4")),
+            OrderBookLevel(Decimal("0.71"), Decimal("5")),
+        ),
+    )
+    cache.apply_book(baseline)
+
+    applied = cache.apply_delta(
+        (
+            OrderBookDelta(
+                "token-a",
+                "BUY",
+                "0.7",
+                "19",
+                "post-a",
+                best_bid="0.7",
+                best_ask="0.71",
+            ),
+        ),
+        generation=1,
+        sequence=1,
+        exchange_timestamp=102,
+        received_timestamp=103,
+    )
+
+    assert applied is True
+    book = cache.get("token-a")
+    assert book is not None
+    assert tuple(level.price for level in book.bids) == (Decimal("0.70"), Decimal("0.69"))
+    assert tuple(level.price for level in book.asks) == (Decimal("0.71"),)
+    assert cache.state is CacheState.VALID
+
+
 def test_full_stream_book_replaces_rest_baseline_when_not_older() -> None:
     # Catches a normal initial WebSocket snapshot being treated as corruption.
     cache = _valid_cache()

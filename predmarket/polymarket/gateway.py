@@ -18,6 +18,11 @@ from typing import Any
 
 from pydantic import ValidationError
 from polymarket import AsyncPublicClient
+from polymarket.errors import (
+    RequestRejectedError,
+    TimeoutError as PolymarketTimeoutError,
+    TransportError,
+)
 from polymarket._internal.streams.handle import AsyncSubscriptionHandle
 from polymarket.models.clob.market_events import (
     parse_market_event as _parse_pinned_market_event,
@@ -89,6 +94,43 @@ class MarketRecoveryInvalidatedError(GatewayLifecycleError):
             _InvalidReason.SDK_VERSION_CHANGED.value,
         }
         super().__init__(f"recovery stream invalidated: {reason}")
+
+
+class MarketRecoveryTransientError(GatewayLifecycleError):
+    """A temporary transport failure prevented a recovery baseline."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        status: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        _require_string(reason, "recovery transient reason")
+        self.reason = reason
+        self.status = status
+        self.retry_after = retry_after
+        detail = f" status={status}" if status is not None else ""
+        super().__init__(f"transient market recovery failure: {reason}{detail}")
+
+
+def _market_recovery_transient_error(
+    error: Exception,
+) -> MarketRecoveryTransientError | None:
+    if isinstance(error, RequestRejectedError):
+        status = error.status
+        if status in {408, 425, 429} or 500 <= status <= 599:
+            return MarketRecoveryTransientError(
+                "request_rejected",
+                status=status,
+                retry_after=error.retry_after,
+            )
+        return None
+    if isinstance(error, PolymarketTimeoutError | TimeoutError):
+        return MarketRecoveryTransientError("timeout")
+    if isinstance(error, TransportError | ConnectionError | OSError):
+        return MarketRecoveryTransientError("transport_error")
+    return None
 
 
 async def probe_pinned_sdk_lifecycle_shape() -> Mapping[str, Any]:
@@ -414,6 +456,7 @@ class MarketSubscription(
             MarketStreamEvent | _InvalidReason | object
         ] = asyncio.Queue(maxsize=handoff_queue_capacity)
         self._invalid_reason: _InvalidReason | None = None
+        self._event_pump_invalid_reason: _InvalidReason | None = None
         self._buffered_events: deque[MarketStreamEvent] = deque(
             maxlen=self._recovery_buffer_capacity
         )
@@ -508,10 +551,14 @@ class MarketSubscription(
             except asyncio.CancelledError:
                 raise
             except StopAsyncIteration:
-                await self._live_items.put(_InvalidReason.SDK_HANDLE_ENDED)
+                await self._publish_event_pump_invalidation(
+                    _InvalidReason.SDK_HANDLE_ENDED
+                )
                 return
             except Exception:
-                await self._live_items.put(_InvalidReason.SDK_HANDLE_ENDED)
+                await self._publish_event_pump_invalidation(
+                    _InvalidReason.SDK_HANDLE_ENDED
+                )
                 return
 
             self._pump_sdk_events_total += 1
@@ -520,7 +567,9 @@ class MarketSubscription(
                 mapped = self._mapper(sdk_event)
             except GatewayMappingError:
                 self._pump_mapping_seconds += time.perf_counter() - mapping_started_at
-                await self._live_items.put(_InvalidReason.SDK_EVENT_INVALID)
+                await self._publish_event_pump_invalidation(
+                    _InvalidReason.SDK_EVENT_INVALID
+                )
                 return
             self._pump_mapping_seconds += time.perf_counter() - mapping_started_at
             if mapped is None:
@@ -596,6 +645,15 @@ class MarketSubscription(
             return
         self._invalid_reason = reason
         self._replace_live_item(reason)
+
+    async def _publish_event_pump_invalidation(
+        self,
+        reason: _InvalidReason,
+    ) -> None:
+        if self._normal_close_requested:
+            return
+        self._event_pump_invalid_reason = reason
+        await self._live_items.put(reason)
 
     def _replace_live_item(
         self,
@@ -722,7 +780,10 @@ class MarketSubscription(
                         raise MarketRecoveryInvalidatedError(reason.value)
                     buffered.append(handoff_item)  # type: ignore[arg-type]
                 result = operation_task.result()
-                reason = self._current_invalid_reason()
+                reason = (
+                    self._event_pump_invalid_reason
+                    or self._current_invalid_reason()
+                )
                 if reason is not None:
                     await self._invalidate(reason)
                     raise GatewayLifecycleError(
@@ -1067,6 +1128,9 @@ class PolymarketGateway:
                 int((time.monotonic() - subscribe_started_at) * 1_000),
                 error,
             )
+            transient = _market_recovery_transient_error(error)
+            if transient is not None:
+                raise transient from error
             raise
         _LOGGER.info(
             "market_stream_subscribed generation=%d tokens=%d elapsed_ms=%d",
@@ -1125,6 +1189,10 @@ class PolymarketGateway:
                     error,
                 )
             await subscription.close()
+            if isinstance(error, Exception):
+                transient = _market_recovery_transient_error(error)
+                if transient is not None:
+                    raise transient from error
             raise
         _LOGGER.info(
             "market_recovery_books_received generation=%d tokens=%d books=%d "
@@ -1349,21 +1417,24 @@ class PolymarketGateway:
             raw_items = raw if isinstance(raw, list) else [raw]
             forwarded_items: list[object] = []
             ignored = 0
+            normalized = False
             ignored_sample: object | None = None
             ignored_error: ValidationError | None = None
             for item in raw_items:
                 if _raw_market_event_type(item) != "new_market":
                     forwarded_items.append(item)
                     continue
+                normalized_item = _normalize_new_market_game_start_time(item)
+                normalized = normalized or normalized_item is not item
                 try:
-                    _parse_pinned_market_event(item)
+                    _parse_pinned_market_event(normalized_item)
                 except ValidationError as error:
                     ignored += 1
                     if ignored_sample is None:
                         ignored_sample = item
                         ignored_error = error
                     continue
-                forwarded_items.append(item)
+                forwarded_items.append(normalized_item)
 
             if ignored:
                 previous_ignored_total = ignored_new_market_total
@@ -1391,9 +1462,8 @@ class PolymarketGateway:
 
                 if not forwarded_items:
                     return
-                forwarded: object = (
-                    forwarded_items if isinstance(raw, list) else forwarded_items[0]
-                )
+            if ignored or normalized:
+                forwarded = forwarded_items if isinstance(raw, list) else forwarded_items[0]
             else:
                 forwarded = raw
 
@@ -2021,6 +2091,24 @@ def _raw_market_event_type(value: object) -> str:
         return type(value).__name__
     event_type = value.get("event_type", value.get("type", "missing"))
     return str(event_type)
+
+
+def _normalize_new_market_game_start_time(value: object) -> object:
+    """Bridge the live API's ISO timestamp to the pinned SDK's epoch-ms field."""
+    if not isinstance(value, dict):
+        return value
+    game_start_time = value.get("game_start_time")
+    if not isinstance(game_start_time, str):
+        return value
+    try:
+        parsed = datetime.fromisoformat(game_start_time.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if parsed.utcoffset() is None:
+        return value
+    normalized = dict(value)
+    normalized["game_start_time"] = str(int(parsed.timestamp() * 1_000))
+    return normalized
 
 
 def _validation_error_summary(error: ValidationError) -> str:

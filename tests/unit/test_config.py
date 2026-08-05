@@ -16,8 +16,10 @@ def test_default_config_has_greenfield_limits(tmp_path: Path) -> None:
     assert config.polymarket.sync_interval_seconds == 1800
     assert config.runtime.market_change_queue_capacity == 10_000
     assert config.runtime.watch_market_limit == 50
+    assert config.runtime.watch_minimum_end_horizon_seconds == 1_800
     assert config.runtime.market_stream_queue_capacity == 65_536
     assert config.strategy.bankroll == Decimal("1000")
+    assert config.strategy.maximum_exchange_clock_skew_ms == 100
     assert config.relations.llm_enabled is False
 
 

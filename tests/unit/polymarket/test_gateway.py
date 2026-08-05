@@ -13,6 +13,7 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
+from polymarket.errors import RequestRejectedError
 
 from predmarket.polymarket import gateway as gateway_module
 from predmarket.domain.fees import FeeModel
@@ -377,6 +378,20 @@ class BlockingOrderBookClient(FakePublicClient):
             raise
         self.books_completed.set()
         return tuple(book for book in self.books if book.token_id in token_ids)
+
+
+class RejectingOrderBookClient(FakePublicClient):
+    def __init__(self, *, rejection_status: int = 502, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.rejection_status = rejection_status
+
+    async def get_order_books(self, *, token_ids: tuple[str, ...]) -> tuple[Any, ...]:
+        self.operations.append("get_order_books")
+        raise RequestRejectedError(
+            "Cloudflare upstream failure",
+            status=self.rejection_status,
+            retry_after=1.5,
+        )
 
 
 @pytest.fixture
@@ -807,6 +822,36 @@ async def test_recover_market_session_shares_one_new_generation(
         for message in messages
     )
     await session.subscription.close()
+
+
+async def test_recovery_normalizes_retryable_server_rejection_and_closes_stream(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    client = RejectingOrderBookClient(**sdk_fixture)
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+
+    with pytest.raises(gateway_module.MarketRecoveryTransientError) as caught:
+        await gateway.recover_market_session(("1001", "1002"))
+
+    assert caught.value.reason == "request_rejected"
+    assert caught.value.status == 502
+    assert caught.value.retry_after == 1.5
+    assert client.subscription_handle.closed is True
+
+
+async def test_recovery_does_not_normalize_non_retryable_client_rejection(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+) -> None:
+    client = RejectingOrderBookClient(rejection_status=400, **sdk_fixture)
+    gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
+    await gateway.list_active_markets()
+
+    with pytest.raises(RequestRejectedError) as caught:
+        await gateway.recover_market_session(("1001", "1002"))
+
+    assert caught.value.status == 400
+    assert client.subscription_handle.closed is True
 
 
 async def test_recovery_prunes_whole_market_when_rest_books_disappear(
@@ -1373,15 +1418,15 @@ async def test_market_stream_malformed_event_logs_validation_at_sdk_callback(
     await subscription.close()
 
 
-async def test_malformed_unscoped_new_market_does_not_invalidate_book_stream(
+async def test_iso_game_start_new_market_is_normalized_before_sdk_callback(
     sdk_fixture: dict[str, tuple[Any, ...]],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # Global new_market announcements are not order-book continuity evidence.
+    # The live API uses ISO-8601 here while the pinned SDK requires epoch-ms.
     client = FakePublicClient(**sdk_fixture)
     gateway = PolymarketGateway(client=client, clock_ms=lambda: 1_785_405_970_000)
     subscription = await gateway.subscribe_markets(("1001", "1002"))
-    malformed = {
+    new_market = {
         "event_type": "new_market",
         "id": "999",
         "market": "condition-unknown",
@@ -1390,11 +1435,15 @@ async def test_malformed_unscoped_new_market_does_not_invalidate_book_stream(
     }
 
     with caplog.at_level(logging.WARNING, logger=gateway_module.__name__):
-        client._market_manager._on_message(malformed)
+        client._market_manager._on_message(new_market)
 
-    assert "market_stream_event_malformed event_type=new_market" in caplog.text
-    assert "action=ignored_unscoped_control_event" in caplog.text
-    assert client._market_manager.received_raw_messages == []
+    assert "market_stream_event_malformed event_type=new_market" not in caplog.text
+    assert client._market_manager.received_raw_messages == [
+        {
+            **new_market,
+            "game_start_time": "1786197600000",
+        }
+    ]
     assert client._market_manager.dropped_events == 0
     assert subscription._lifecycle_probe is not None
     assert subscription._lifecycle_probe.check() is None
@@ -1415,7 +1464,7 @@ async def test_malformed_unscoped_new_market_logs_are_bounded_and_rate_limited(
             "id": str(index),
             "market": f"condition-{index}",
             "timestamp": "1785405962000",
-            "game_start_time": "2026-08-08 14:00:00+00",
+            "game_start_time": "not-a-timestamp",
             "description": "x" * 5_000,
         }
 
@@ -1915,6 +1964,52 @@ async def test_market_subscription_prefetches_a_burst_without_per_event_handoff(
     assert await anext(subscription) is events[2]
     assert await anext(subscription) is events[3]
     await subscription.close()
+
+
+async def test_recovery_rejects_handle_end_behind_prefetched_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches a terminal SDK marker queued behind prefetched events allowing a
+    # simultaneously completed recovery baseline to be installed.
+    never_invalidated = asyncio.Event()
+
+    async def wait_for_lifecycle(
+        _subscription: gateway_module.MarketSubscription,
+    ) -> gateway_module._InvalidReason:
+        await never_invalidated.wait()
+        return gateway_module._InvalidReason.CONNECTION_LOST
+
+    monkeypatch.setattr(
+        gateway_module.MarketSubscription,
+        "_wait_for_invalidation",
+        wait_for_lifecycle,
+    )
+    handle = FakeSubscriptionHandle((object(), object(), object()))
+    subscription = gateway_module.MarketSubscription(
+        handle,
+        mapper=lambda event: event,
+        lifecycle_probe=SimpleNamespace(
+            handle_queue_maxsize=handle._queue.maxsize,
+            check=lambda: None,
+        ),
+        initial_invalid_reason=None,
+        token_ids=("1001",),
+        subscription_generation=1,
+        clock_ms=lambda: 1_785_405_970_000,
+        lifecycle_poll_interval=0.01,
+    )
+    subscription._ensure_live_tasks()
+    assert subscription._event_pump_task is not None
+    await subscription._event_pump_task
+
+    try:
+        with pytest.raises(
+            gateway_module.GatewayLifecycleError,
+            match="sdk_handle_ended",
+        ):
+            await subscription._guard_awaitable(asyncio.sleep(0, result="baseline"))
+    finally:
+        await subscription.close()
 
 
 async def test_concurrent_handle_error_and_lifecycle_loss_still_invalidates(

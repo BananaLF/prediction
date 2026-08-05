@@ -621,6 +621,43 @@ async def test_supervisor_reports_pre_notifier_database_failures_to_terminal(
 
 
 @pytest.mark.asyncio
+async def test_supervisor_closes_partial_runtime_when_watch_construction_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer_close_calls = 0
+    original_writer_close = DatabaseWriter.close
+
+    async def track_writer_close(writer: DatabaseWriter) -> None:
+        nonlocal writer_close_calls
+        writer_close_calls += 1
+        await original_writer_close(writer)
+
+    class _Gateway:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    def fail_watch_construction(**_: object) -> _Watch:
+        raise RuntimeError("watch construction failed")
+
+    monkeypatch.setattr("predmarket.app.DatabaseWriter.close", track_writer_close)
+    gateway = _Gateway()
+    supervisor = Supervisor(
+        _config(tmp_path),
+        gateway=gateway,
+        sync_task_factory=lambda **_: _Sync([]),
+        watch_task_factory=fail_watch_construction,
+    )
+
+    assert await supervisor.run() == 1
+    assert writer_close_calls == 1
+    assert gateway.close_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_router_revalidates_generation_source_before_database_commit(tmp_path: Path) -> None:
     database_path = tmp_path / "signals.sqlite3"
     writer = DatabaseWriter(database_path)

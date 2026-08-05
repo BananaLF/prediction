@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import AsyncExitStack
 import inspect
 import logging
 import time
@@ -165,115 +166,127 @@ class Supervisor:
         initialize_database(self._config.database.path)
         check_database_startup(self._config.database.path)
         _LOGGER.info("component_initialized component=database")
-        writer = DatabaseWriter(
-            self._config.database.path,
-            queue_size=self._config.database.writer_queue_capacity,
-            busy_timeout_ms=self._config.database.busy_timeout_ms,
-        )
-        await writer.start()
-        _LOGGER.info("component_initialized component=database_writer")
-        catalog = CatalogRepository(self._config.database.path, writer)
-        relations = RelationRepository(self._config.database.path, writer)
-        signals = SignalRepository(self._config.database.path, writer)
-        system_events = SystemEventRepository(self._config.database.path, writer)
-        _LOGGER.info("component_initialized component=repositories")
-        notifier = self._provided_notifier or Notifier(
-            terminal=self._terminal,
-            desktop=(
-                macos_desktop_notification
-                if self._config.notification.desktop_enabled
-                else None
-            ),
-            system_events=system_events,
-            clock_ms=self._clock_ms,
-        )
-        self._runtime_notifier = notifier
-        _LOGGER.info("component_initialized component=notifier")
-        changes = MarketChangeQueue(
-            self._config.runtime.market_change_queue_capacity,
-            record_system_event=lambda overflow: self._record_overflow(
-                system_events, overflow
-            ),
-            notify=lambda overflow: self._notify_overflow(notifier, overflow),
-        )
-        _LOGGER.info("component_initialized component=market_change_queue")
-        gateway = self._provided_gateway
-        if gateway is None:
-            # This is the one and only Polymarket integration boundary.
-            from predmarket.polymarket.gateway import PolymarketGateway
+        async with AsyncExitStack() as cleanup:
+            writer = DatabaseWriter(
+                self._config.database.path,
+                queue_size=self._config.database.writer_queue_capacity,
+                busy_timeout_ms=self._config.database.busy_timeout_ms,
+            )
+            await writer.start()
+            cleanup.push_async_callback(writer.close)
+            _LOGGER.info("component_initialized component=database_writer")
+            catalog = CatalogRepository(self._config.database.path, writer)
+            relations = RelationRepository(self._config.database.path, writer)
+            signals = SignalRepository(self._config.database.path, writer)
+            system_events = SystemEventRepository(self._config.database.path, writer)
+            _LOGGER.info("component_initialized component=repositories")
+            notifier = self._provided_notifier or Notifier(
+                terminal=self._terminal,
+                desktop=(
+                    macos_desktop_notification
+                    if self._config.notification.desktop_enabled
+                    else None
+                ),
+                system_events=system_events,
+                clock_ms=self._clock_ms,
+            )
+            self._runtime_notifier = notifier
+            _LOGGER.info("component_initialized component=notifier")
+            changes = MarketChangeQueue(
+                self._config.runtime.market_change_queue_capacity,
+                record_system_event=lambda overflow: self._record_overflow(
+                    system_events, overflow
+                ),
+                notify=lambda overflow: self._notify_overflow(notifier, overflow),
+            )
+            _LOGGER.info("component_initialized component=market_change_queue")
+            gateway = self._provided_gateway
+            if gateway is None:
+                # This is the one and only Polymarket integration boundary.
+                from predmarket.polymarket.gateway import PolymarketGateway
 
-            gateway = PolymarketGateway(
-                market_stream_queue_capacity=(
-                    self._config.runtime.market_stream_queue_capacity
+                gateway = PolymarketGateway(
+                    market_stream_queue_capacity=(
+                        self._config.runtime.market_stream_queue_capacity
+                    )
                 )
+            cleanup.push_async_callback(
+                _maybe_await, getattr(gateway, "close", None)
             )
-        _LOGGER.info("component_initialized component=gateway")
-        if self._sync_task_factory is None:
-            from predmarket.catalog.sync import SyncMarketTask
+            _LOGGER.info("component_initialized component=gateway")
+            if self._sync_task_factory is None:
+                from predmarket.catalog.sync import SyncMarketTask
 
-            sync = SyncMarketTask(
-                gateway=gateway,
-                catalog=catalog,
-                changes=changes,
-                system_events=system_events,
-                clock_ms=self._clock_ms,
+                sync = SyncMarketTask(
+                    gateway=gateway,
+                    catalog=catalog,
+                    changes=changes,
+                    system_events=system_events,
+                    clock_ms=self._clock_ms,
+                )
+            else:
+                sync = self._sync_task_factory(
+                    gateway=gateway,
+                    catalog=catalog,
+                    changes=changes,
+                    system_events=system_events,
+                    clock_ms=self._clock_ms,
+                )
+            _LOGGER.info("component_initialized component=sync_task")
+            subscription_generation = _SubscriptionGenerationSource()
+            router = _SignalManagerRouter(
+                signals, notifier, self._clock_ms, subscription_generation
             )
-        else:
-            sync = self._sync_task_factory(
-                gateway=gateway,
-                catalog=catalog,
-                changes=changes,
-                system_events=system_events,
-                clock_ms=self._clock_ms,
-            )
-        _LOGGER.info("component_initialized component=sync_task")
-        subscription_generation = _SubscriptionGenerationSource()
-        router = _SignalManagerRouter(
-            signals, notifier, self._clock_ms, subscription_generation
-        )
-        if self._watch_task_factory is None:
-            from predmarket.watch.task import WatchTask
+            if self._watch_task_factory is None:
+                from predmarket.watch.task import WatchTask
 
-            watch = WatchTask(
-                gateway=gateway,
-                catalog=catalog,
-                changes=changes,
-                strategy_engine=self._strategy_engine or StrategyEngine(),
-                signal_manager=router,
-                clock_ms=self._clock_ms,
-                market_limit=self._config.runtime.watch_market_limit,
-                market_metadata_refresh_interval_seconds=max(
-                    1,
-                    self._config.polymarket.fee_schedule_max_age_seconds // 2,
-                ),
-                context_source=_ApplicationContextSource(
-                    config=self._config,
+                watch = WatchTask(
+                    gateway=gateway,
                     catalog=catalog,
-                    relations=relations,
-                    signals=signals,
+                    changes=changes,
+                    strategy_engine=self._strategy_engine or StrategyEngine(),
+                    signal_manager=router,
                     clock_ms=self._clock_ms,
-                ),
-            )
-        else:
-            watch = self._watch_task_factory(
-                gateway=gateway,
-                catalog=catalog,
-                changes=changes,
-                strategy_engine=self._strategy_engine or StrategyEngine(),
-                signal_manager=router,
-                context_source=_ApplicationContextSource(
-                    config=self._config,
+                    market_limit=self._config.runtime.watch_market_limit,
+                    minimum_end_horizon_seconds=(
+                        self._config.runtime.watch_minimum_end_horizon_seconds
+                    ),
+                    market_metadata_refresh_interval_seconds=max(
+                        1,
+                        self._config.polymarket.fee_schedule_max_age_seconds // 2,
+                    ),
+                    context_source=_ApplicationContextSource(
+                        config=self._config,
+                        catalog=catalog,
+                        relations=relations,
+                        signals=signals,
+                        clock_ms=self._clock_ms,
+                    ),
+                )
+            else:
+                watch = self._watch_task_factory(
+                    gateway=gateway,
                     catalog=catalog,
-                    relations=relations,
-                    signals=signals,
-                    clock_ms=self._clock_ms,
-                ),
+                    changes=changes,
+                    strategy_engine=self._strategy_engine or StrategyEngine(),
+                    signal_manager=router,
+                    context_source=_ApplicationContextSource(
+                        config=self._config,
+                        catalog=catalog,
+                        relations=relations,
+                        signals=signals,
+                        clock_ms=self._clock_ms,
+                    ),
+                )
+            cleanup.push_async_callback(
+                _maybe_await, getattr(watch, "close", None)
             )
-        _LOGGER.info("component_initialized component=watch_task")
-        cache = getattr(watch, "cache", None)
-        if isinstance(cache, OrderBookCache):
-            subscription_generation.bind(cache)
-        return writer, gateway, notifier, sync, watch
+            _LOGGER.info("component_initialized component=watch_task")
+            cache = getattr(watch, "cache", None)
+            if isinstance(cache, OrderBookCache):
+                subscription_generation.bind(cache)
+            cleanup.pop_all()
+            return writer, gateway, notifier, sync, watch
 
     async def _sync_forever(self, sync: Any, notifier: Notifier) -> None:
         is_initial = True
