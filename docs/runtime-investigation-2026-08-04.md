@@ -931,3 +931,12 @@
 - 订单簿保护再次触发：05:46:58 收到把 `size=0` 的删除档位同时声明为 authoritative best bid 的 `price_change`，严格一致性校验按 ISSUE-095 主动使 generation 3 失效。generation 4 在 1,139ms 内重新取得 100 本 baseline 并恢复到 50 markets/100 tokens，没有用未知数量伪造深度，也没有持久化信号。
 - 无信号直接原因：本区间最佳实际收益率为 `-0.00413136`，仍低于要求的 `0.00750000`，差约 1.16 个百分点；当前没有证据表明信号被同步、订阅、评估或 SQLite 阻塞。
 - 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待真实 `1013` 现场以及本轮新 revision 和对应 `signal_transition`。
+
+## 06:17 半小时复验检查点
+
+- 运行连续性：05:47–06:17 共输出 177 条完整评估摘要、11,977 条因 cache revision 推进而主动中止的旧批次；`ERROR=0`、`signal_transition=0`。SDK 行情速率峰值约 1,426.2 events/s，内部队列保持接近 0 且无 drop。
+- 连接证据：本区间发生 5 次 WebSocket `1006`，分别记录到不完整帧 EOF、stream unexpected end 和 closing timeout；均没有服务端 close frame，close 回调时 `websocket_frame_queue_size=0`、`high=16`、`paused=False`。这继续表明回调现场没有残留入口队列积压，但仍受“队列可能在回调前排空”的观测边界限制；本区间没有新的 `1013`，不能直接解释之前的服务端 slow-consumer close。
+- fail-closed 与恢复：两次上游 `price_change` 再现 ISSUE-095 的 authoritative best price 与实际档位不一致，均主动废弃 generation。断线、订单簿失效、候选裁剪/补位和同步后目录换代合计完成 10 次 recovery，最终 generation 15 保持 50 markets/100 tokens，runtime 未退出。
+- 后台同步：第二轮完整同步于 05:57:48 完成，耗时 606,541ms，处理 137,322 个市场和 274,644 个 token；同步提交后仅刷新 8 个新增候选市场，并合并同一 sync generation 的其余目录通知，Watch 全程持续消费行情。
+- 无信号直接原因：本区间最佳实际收益率为 `-0.00363841`，低于要求的 `0.00750000`，差约 1.11 个百分点。177 次完整摘要持续产出，因此没有评估停止或饥饿证据。
+- 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待本轮新 revision 和对应 `signal_transition`。
