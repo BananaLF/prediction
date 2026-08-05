@@ -271,6 +271,7 @@ class WatchTask:
         self._catalog_snapshot_revision = 0
         self._catalog_context_lock = asyncio.Lock()
         self._last_evaluation_summary_at = float("-inf")
+        self._last_exchange_clock_skew_warning_monotonic_ms: int | None = None
         self._recovery_retry_initial_seconds = _RECOVERY_RETRY_INITIAL_SECONDS
         self._recovery_retry_max_seconds = _RECOVERY_RETRY_MAX_SECONDS
 
@@ -1985,6 +1986,7 @@ class WatchTask:
         if self._closed or self._cache.state is not CacheState.VALID:
             return
         started_at = time.monotonic()
+        evaluation_monotonic_ms = self._monotonic_now()
         generation = self._cache.generation
         revision = self._cache.revision
         market_time = self._market_clock.read(generation=generation)
@@ -2024,13 +2026,12 @@ class WatchTask:
             else skew_book.exchange_timestamp - skew_book.received_timestamp
         )
         exchange_clock_skew_warning_ms: int | None = None
-        skew_warning_logged = False
         stream_silence_age_ms = (
             None
             if self._last_market_data_monotonic_ms is None
             else max(
                 0,
-                self._monotonic_now() - self._last_market_data_monotonic_ms,
+                evaluation_monotonic_ms - self._last_market_data_monotonic_ms,
             )
         )
         batched_targets: Mapping[str, Sequence[EvaluationTarget]] | None = None
@@ -2087,11 +2088,17 @@ class WatchTask:
                         context.configuration.exchange_clock_skew_warning_ms
                     )
                     if (
-                        not skew_warning_logged
-                        and skew_book is not None
+                        skew_book is not None
                         and maximum_exchange_clock_skew_ms is not None
                         and abs(maximum_exchange_clock_skew_ms)
                         > exchange_clock_skew_warning_ms
+                        and (
+                            self._last_exchange_clock_skew_warning_monotonic_ms
+                            is None
+                            or evaluation_monotonic_ms
+                            - self._last_exchange_clock_skew_warning_monotonic_ms
+                            >= int(_EVALUATION_SUMMARY_INTERVAL_SECONDS * 1_000)
+                        )
                     ):
                         _LOGGER.warning(
                             "watch_exchange_clock_skew_warning generation=%d "
@@ -2106,7 +2113,9 @@ class WatchTask:
                             maximum_exchange_clock_skew_ms,
                             exchange_clock_skew_warning_ms,
                         )
-                        skew_warning_logged = True
+                        self._last_exchange_clock_skew_warning_monotonic_ms = (
+                            evaluation_monotonic_ms
+                        )
                 strategy_started_at = time.monotonic()
                 evaluate = self._strategy_engine.evaluate
                 if inspect.iscoroutinefunction(evaluate):

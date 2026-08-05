@@ -883,3 +883,12 @@
 - 关闭验证：直接运行收到一次 `Ctrl-C` 后依次输出 `runtime_stopping reason=cancelled` 和 `runtime_stopped`，进程退出码为 0。
 - SQLite 证据边界：本次真实短时运行的决策均为 absent/not-evaluable，没有生成新 signal revision；生产库最新仍是启动前的 4 条历史 revision，最大 `observed_at=1785828290572`，因此不将其声称为本轮日志关联证据。市场时间到 SQLite 的精确对应关系由上述确定性集成测试验证。
 - 剩余风险：ISSUE-093 已确认的外部 WebSocket `1006`/`1013 slow consumer` 仍可能发生；generation invalidation、fail-closed 关闭和自动恢复路径保持有效。本次短时真实运行未复现断线，不能据此宣称外部不稳定已消失。
+
+## ISSUE-103：交易所与本机时钟偏差告警随每批评估重复刷屏
+
+- 状态：根因已修复，并通过 RED/GREEN、WatchTask 全量回归和重启后的真实日志复验。
+- 真实现象：04:10:34 启动后，同一本恢复阶段旧订单簿持续成为最大偏差样本，约 6 分钟内输出 1,211 条 `watch_exchange_clock_skew_warning`，同期只有 34 条按 10 秒限频的评估摘要。告警均明确 `evaluation_continues=true`，数据库仍为启动前的 2 个 CLOSED signal、4 条 revision，没有改变业务判断或制造信号，但大量重复 I/O 掩盖了有效诊断日志。
+- 根因：`skew_warning_logged` 是 `_evaluate_tokens()` 的局部变量，每个行情评估批次都会重置；行情高峰每秒产生多个批次，因此原本的“每批最多一次”仍会持续刷屏。
+- 修复：使用 WatchTask 已注入的主机 monotonic 毫秒时钟保存最近一次偏差 WARN 时间，跨评估批次按 10 秒窗口限频；到期后仍会重新告警。评估摘要继续独立按 10 秒输出最新最大偏差，市场时间、盘口 freshness、策略和信号语义均不变。
+- RED/GREEN：新增测试连续触发启动评估和两个实时批次，旧实现产生 3 条 WARN；修复后窗口内仅 1 条，把 monotonic 推进到 10 秒后产生第 2 条。相关 4 个测试通过，`tests/unit/watch/test_task.py` 全量为 90 passed。
+- 真实复验：修复版于 04:17:24 启动，04:17:36 输出全部组件启动成功和 `runtime_started`；偏差 WARN 随后仅在 04:17:36、04:17:46、04:17:56 各输出一次，约 10 秒一个窗口，期间实时评估持续执行且摘要保留完整偏差信息。

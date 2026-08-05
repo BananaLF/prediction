@@ -1250,6 +1250,46 @@ async def test_evaluation_summary_logs_largest_exchange_clock_skew(
     await watch.close()
 
 
+async def test_exchange_clock_skew_warning_is_rate_limited_across_batches(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monotonic = [0]
+
+    class SkewedRecoveryGateway(FakeGateway):
+        async def recover_market_session(self, token_ids: tuple[str, ...]):
+            session = await super().recover_market_session(token_ids)
+            session.order_books = tuple(
+                replace(
+                    book,
+                    exchange_timestamp=1_240,
+                    received_timestamp=1_000,
+                )
+                for book in session.order_books
+            )
+            return session
+
+    watch, _, _, _, _, _ = _watch(
+        gateway=SkewedRecoveryGateway(),
+        context_source=MarketTimeContextSource(),
+        monotonic_ms=lambda: monotonic[0],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="predmarket.watch.task"):
+        await watch.start()
+        await watch._evaluate_tokens(("token-1",))  # noqa: SLF001
+        await watch._evaluate_tokens(("token-2",))  # noqa: SLF001
+        monotonic[0] = 10_000
+        await watch._evaluate_tokens(("token-1",))  # noqa: SLF001
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("watch_exchange_clock_skew_warning ")
+    ]
+    assert len(warnings) == 2
+    await watch.close()
+
+
 async def test_evaluation_summary_rate_limits_ordinary_live_batches(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
