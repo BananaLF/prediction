@@ -40,6 +40,7 @@ from predmarket.watch.cache import (
     OrderBookCache,
     OrderBookDelta,
 )
+from predmarket.watch.clock import MarketClock
 
 
 _NO_CHANGE = object()
@@ -176,6 +177,7 @@ class WatchTask:
         context_source: ContextSource,
         cache: OrderBookCache | None = None,
         clock_ms: Callable[[], int] | None = None,
+        monotonic_ms: Callable[[], int] | None = None,
         market_limit: int = 100,
         minimum_end_horizon_seconds: int = 1_800,
         market_metadata_refresh_interval_seconds: int = 150,
@@ -214,6 +216,8 @@ class WatchTask:
         self._context_source = context_source
         self._cache = cache or OrderBookCache()
         self._clock_ms = clock_ms or _system_clock_ms
+        self._monotonic_ms = monotonic_ms or _system_monotonic_ms
+        self._market_clock = MarketClock()
         self._market_limit = market_limit
         self._minimum_end_horizon_ms = minimum_end_horizon_seconds * 1_000
         self._market_metadata_refresh_interval_seconds = (
@@ -251,7 +255,7 @@ class WatchTask:
         self._price_change_progress_last_cache_seconds = 0.0
         self._price_change_progress_last_queue_seconds = 0.0
         self._price_change_progress_last_at = time.monotonic()
-        self._last_orderbook_observed_at_ms: int | None = None
+        self._last_market_data_monotonic_ms: int | None = None
         self._pending_evaluation_token_ids: set[str] = set()
         self._evaluation_requested = asyncio.Event()
         self._evaluation_task: asyncio.Task[None] | None = None
@@ -892,6 +896,24 @@ class WatchTask:
             raise ValueError("clock_ms must return a non-negative integer")
         return value
 
+    def _monotonic_now(self) -> int:
+        value = self._monotonic_ms()
+        if type(value) is not int or value < 0:
+            raise ValueError("monotonic_ms must return a non-negative integer")
+        return value
+
+    def _record_market_mutation(
+        self,
+        *,
+        generation: int,
+        exchange_timestamp: int,
+    ) -> None:
+        self._market_clock.advance(
+            generation=generation,
+            exchange_timestamp=exchange_timestamp,
+        )
+        self._last_market_data_monotonic_ms = self._monotonic_now()
+
     async def handle_stream_message(
         self,
         message: MarketStreamEvent | MarketStreamInvalidated,
@@ -923,7 +945,6 @@ class WatchTask:
                 )
                 return
             self._stream_message_count += 1
-            self._last_orderbook_observed_at_ms = self._now()
             progress_at = time.monotonic()
             if (
                 self._stream_message_count == 1
@@ -985,6 +1006,10 @@ class WatchTask:
                     )
                     return
                 if applied:
+                    self._record_market_mutation(
+                        generation=message.subscription_generation,
+                        exchange_timestamp=book.exchange_timestamp,
+                    )
                     if defer_evaluation:
                         self._queue_evaluation((book.token_id,))
                     else:
@@ -1133,6 +1158,11 @@ class WatchTask:
             return
         if not applied:
             return
+        assert exchange_timestamp is not None
+        self._record_market_mutation(
+            generation=message.subscription_generation,
+            exchange_timestamp=exchange_timestamp,
+        )
         changed = tuple(sorted({delta.token_id for delta in deltas}, key=_utf8))
         book_levels = 0
         for token_id in changed:
@@ -1700,12 +1730,25 @@ class WatchTask:
             )
             self._cache.begin_resync(generation=generation, token_ids=token_ids)
             self._cache.apply_snapshot(books)
+            market_time = self._market_clock.initialize(
+                generation=generation,
+                exchange_timestamps=tuple(
+                    book.exchange_timestamp for book in books
+                ),
+            )
             self._active_token_ids = effective_token_ids
             self._active_market_ids = tuple(
                 sorted({book.market_id for book in books}, key=_utf8)
             )
-            self._last_orderbook_observed_at_ms = self._now()
+            self._last_market_data_monotonic_ms = self._monotonic_now()
             self._subscription = session.subscription
+            _LOGGER.info(
+                "watch_market_clock_initialized generation=%d market_time=%d "
+                "books=%d",
+                generation,
+                market_time,
+                len(books),
+            )
         except BaseException as error:
             if isinstance(error, (MarketRecoveryInvalidatedError, CacheInvalidatedError)):
                 reason = (
@@ -1825,13 +1868,22 @@ class WatchTask:
             return
         started_at = time.monotonic()
         generation = self._cache.generation
+        revision = self._cache.revision
+        market_time = self._market_clock.read(generation=generation)
+        if market_time is None:
+            _LOGGER.warning(
+                "watch_evaluation_skipped generation=%d revision=%d "
+                "reason=market_time_unavailable",
+                generation,
+                revision,
+            )
+            return
         normalized_token_ids = tuple(sorted(set(token_ids), key=_utf8))
         generated_target_count = 0
         target_count = 0
         deduplicated_target_count = 0
         evaluated_opportunity_keys: set[str] = set()
         persisted_signal_count = 0
-        stale_after_evaluation_count = 0
         decision_counts: dict[str, int] = {}
         context_elapsed = 0.0
         strategy_elapsed = 0.0
@@ -1840,17 +1892,33 @@ class WatchTask:
         best_required_return_rate: Decimal | None = None
         best_opportunity_key = "none"
         best_market_ids = "none"
-        maximum_observed_exchange_clock_skew_ms: int | None = None
-        exchange_clock_skew_limit_ms: int | None = None
-        exchange_clock_skew_token_id = "none"
-        exchange_clock_skew_exchange_timestamp: int | None = None
-        exchange_clock_skew_received_timestamp: int | None = None
         books = self._cache.view()
-        observed_at = self._last_orderbook_observed_at_ms
+        skew_book = max(
+            books,
+            key=lambda book: abs(
+                book.exchange_timestamp - book.received_timestamp
+            ),
+            default=None,
+        )
+        maximum_exchange_clock_skew_ms = (
+            None
+            if skew_book is None
+            else skew_book.exchange_timestamp - skew_book.received_timestamp
+        )
+        exchange_clock_skew_warning_ms: int | None = None
+        skew_warning_logged = False
+        stream_silence_age_ms = (
+            None
+            if self._last_market_data_monotonic_ms is None
+            else max(
+                0,
+                self._monotonic_now() - self._last_market_data_monotonic_ms,
+            )
+        )
         batched_targets: Mapping[str, Sequence[EvaluationTarget]] | None = None
         contexts_for_batch = getattr(self._context_source, "contexts_for_batch", None)
         if callable(contexts_for_batch):
-            if not self._evaluation_is_current(generation):
+            if not self._evaluation_is_current(generation, revision):
                 self._log_evaluation_aborted(generation, "before_batch_context")
                 return
             context_started_at = time.monotonic()
@@ -1860,11 +1928,11 @@ class WatchTask:
             context_elapsed += time.monotonic() - context_started_at
             if not isinstance(batched_targets, Mapping):
                 raise TypeError("batch context source must return a mapping")
-            if not self._evaluation_is_current(generation):
+            if not self._evaluation_is_current(generation, revision):
                 self._log_evaluation_aborted(generation, "after_batch_context")
                 return
         for token_id in normalized_token_ids:
-            if not self._evaluation_is_current(generation):
+            if not self._evaluation_is_current(generation, revision):
                 self._log_evaluation_aborted(generation, "before_context")
                 return
             if batched_targets is None:
@@ -1875,7 +1943,7 @@ class WatchTask:
                 context_elapsed += time.monotonic() - context_started_at
             else:
                 targets = batched_targets.get(token_id, ())
-            if not self._evaluation_is_current(generation):
+            if not self._evaluation_is_current(generation, revision):
                 self._log_evaluation_aborted(generation, "after_context")
                 return
             materialized = tuple(targets)
@@ -1888,15 +1956,39 @@ class WatchTask:
                     continue
                 evaluated_opportunity_keys.add(target.opportunity_key)
                 target_count += 1
-                if not self._evaluation_is_current(generation):
+                if not self._evaluation_is_current(generation, revision):
                     self._log_evaluation_aborted(generation, "before_strategy")
                     return
                 context = target.context
                 if isinstance(context, StrategyContext):
                     context = replace(
                         context,
-                        evaluated_at=self._now(),
+                        evaluated_at=market_time,
                     )
+                    exchange_clock_skew_warning_ms = (
+                        context.configuration.exchange_clock_skew_warning_ms
+                    )
+                    if (
+                        not skew_warning_logged
+                        and skew_book is not None
+                        and maximum_exchange_clock_skew_ms is not None
+                        and abs(maximum_exchange_clock_skew_ms)
+                        > exchange_clock_skew_warning_ms
+                    ):
+                        _LOGGER.warning(
+                            "watch_exchange_clock_skew_warning generation=%d "
+                            "token_id=%s exchange_timestamp=%d "
+                            "received_timestamp=%d exchange_clock_skew_ms=%d "
+                            "exchange_clock_skew_warning_ms=%d "
+                            "evaluation_continues=true",
+                            generation,
+                            _bounded_log_value(skew_book.token_id),
+                            skew_book.exchange_timestamp,
+                            skew_book.received_timestamp,
+                            maximum_exchange_clock_skew_ms,
+                            exchange_clock_skew_warning_ms,
+                        )
+                        skew_warning_logged = True
                 strategy_started_at = time.monotonic()
                 evaluate = self._strategy_engine.evaluate
                 if inspect.iscoroutinefunction(evaluate):
@@ -1906,67 +1998,13 @@ class WatchTask:
                     if inspect.isawaitable(decision):
                         decision = await decision
                 strategy_elapsed += time.monotonic() - strategy_started_at
-                if not self._evaluation_is_current(generation):
+                if not self._evaluation_is_current(generation, revision):
                     self._log_evaluation_aborted(generation, "after_strategy")
                     return
                 if not isinstance(decision, StrategyDecision.__args__):
                     raise TypeError("strategy engine returned an invalid decision")
-                if isinstance(context, StrategyContext) and observed_at is not None:
-                    completed_at_ms = self._now()
-                    if (
-                        completed_at_ms >= observed_at
-                        and completed_at_ms - observed_at
-                        > context.configuration.maximum_book_age_ms
-                    ):
-                        stale_after_evaluation_count += 1
-                        decision = NotEvaluable(
-                            DecisionReason.ORDERBOOK_STALE,
-                            {
-                                "changed_token_id": context.changed_token_id,
-                                "detail": "orderbook_stale_after_evaluation",
-                                "strategy_type": context.strategy_type.value,
-                            },
-                        )
                 decision_key = _decision_log_key(decision)
                 decision_counts[decision_key] = decision_counts.get(decision_key, 0) + 1
-                if isinstance(decision, NotEvaluable) and (
-                    decision.context.get("detail")
-                    == "orderbook_timestamp_causality_invalid"
-                ):
-                    skew_ms = decision.context.get("exchange_clock_skew_ms")
-                    if type(skew_ms) is int and (
-                        maximum_observed_exchange_clock_skew_ms is None
-                        or skew_ms > maximum_observed_exchange_clock_skew_ms
-                    ):
-                        maximum_observed_exchange_clock_skew_ms = skew_ms
-                        limit_ms = decision.context.get(
-                            "maximum_exchange_clock_skew_ms"
-                        )
-                        token_id = decision.context.get("token_id")
-                        exchange_timestamp = decision.context.get(
-                            "exchange_timestamp"
-                        )
-                        received_timestamp = decision.context.get(
-                            "received_timestamp"
-                        )
-                        exchange_clock_skew_limit_ms = (
-                            limit_ms if type(limit_ms) is int else None
-                        )
-                        exchange_clock_skew_token_id = (
-                            _bounded_log_value(token_id)
-                            if isinstance(token_id, str)
-                            else "unknown"
-                        )
-                        exchange_clock_skew_exchange_timestamp = (
-                            exchange_timestamp
-                            if type(exchange_timestamp) is int
-                            else None
-                        )
-                        exchange_clock_skew_received_timestamp = (
-                            received_timestamp
-                            if type(received_timestamp) is int
-                            else None
-                        )
                 if isinstance(decision, (OpportunityPresent, OpportunityAbsent)) and (
                     best_return_rate is None
                     or decision.calculation.return_rate > best_return_rate
@@ -1982,12 +2020,15 @@ class WatchTask:
                         sorted({leg.market_id for leg in decision.legs}, key=_utf8)
                     )
                 try:
+                    if not self._evaluation_is_current(generation, revision):
+                        self._log_evaluation_aborted(generation, "before_signal_apply")
+                        return
                     signal_apply_started_at = time.monotonic()
                     signal_id = await self._signal_manager.apply(
                         decision,
                         target.opportunity_key,
                         target.expected_revision,
-                        observed_at=self._now(),
+                        observed_at=market_time,
                     )
                     signal_apply_elapsed += time.monotonic() - signal_apply_started_at
                 except SubscriptionGenerationChanged as error:
@@ -1996,6 +2037,9 @@ class WatchTask:
                         "signal_apply_generation_changed",
                         detail=str(error),
                     )
+                    return
+                if not self._evaluation_is_current(generation, revision):
+                    self._log_evaluation_aborted(generation, "after_signal_apply")
                     return
                 if signal_id is not None:
                     persisted_signal_count += 1
@@ -2015,9 +2059,10 @@ class WatchTask:
             _LOGGER.info(
                 "watch_evaluation_summary generation=%d tokens=%d generated_targets=%d "
                 "targets=%d deduplicated_targets=%d persisted_signals=%d "
-                "stale_after_evaluation=%d observation_age_ms=%s decisions=%s "
-                "exchange_clock_skew_ms=%s exchange_clock_skew_limit_ms=%s "
-                "exchange_clock_skew_token_id=%s exchange_timestamp=%s "
+                "market_time=%d stream_silence_age_ms=%s decisions=%s "
+                "maximum_exchange_clock_skew_ms=%s "
+                "exchange_clock_skew_warning_ms=%s "
+                "maximum_exchange_clock_skew_token_id=%s exchange_timestamp=%s "
                 "received_timestamp=%s "
                 "best_return_rate=%s required_return_rate=%s best_opportunity_key=%s "
                 "best_market_ids=%s context_ms=%d strategy_ms=%d signal_apply_ms=%d "
@@ -2028,33 +2073,37 @@ class WatchTask:
                 target_count,
                 deduplicated_target_count,
                 persisted_signal_count,
-                stale_after_evaluation_count,
+                market_time,
                 (
                     "unknown"
-                    if observed_at is None
-                    else str(max(0, self._now() - observed_at))
+                    if stream_silence_age_ms is None
+                    else str(stream_silence_age_ms)
                 ),
                 decisions,
                 (
                     "none"
-                    if maximum_observed_exchange_clock_skew_ms is None
-                    else str(maximum_observed_exchange_clock_skew_ms)
+                    if maximum_exchange_clock_skew_ms is None
+                    else str(maximum_exchange_clock_skew_ms)
                 ),
                 (
                     "none"
-                    if exchange_clock_skew_limit_ms is None
-                    else str(exchange_clock_skew_limit_ms)
-                ),
-                exchange_clock_skew_token_id,
-                (
-                    "none"
-                    if exchange_clock_skew_exchange_timestamp is None
-                    else str(exchange_clock_skew_exchange_timestamp)
+                    if exchange_clock_skew_warning_ms is None
+                    else str(exchange_clock_skew_warning_ms)
                 ),
                 (
                     "none"
-                    if exchange_clock_skew_received_timestamp is None
-                    else str(exchange_clock_skew_received_timestamp)
+                    if skew_book is None
+                    else _bounded_log_value(skew_book.token_id)
+                ),
+                (
+                    "none"
+                    if skew_book is None
+                    else str(skew_book.exchange_timestamp)
+                ),
+                (
+                    "none"
+                    if skew_book is None
+                    else str(skew_book.received_timestamp)
                 ),
                 _format_decimal_for_log(best_return_rate),
                 _format_decimal_for_log(best_required_return_rate),
@@ -2066,11 +2115,12 @@ class WatchTask:
                 int(elapsed * 1_000),
             )
 
-    def _evaluation_is_current(self, generation: int) -> bool:
+    def _evaluation_is_current(self, generation: int, revision: int) -> bool:
         return (
             not self._closed
             and self._cache.state is CacheState.VALID
             and self._cache.generation == generation
+            and self._cache.revision == revision
         )
 
     def _log_evaluation_aborted(
@@ -2179,6 +2229,10 @@ def _watchable_token_ids(snapshot: CatalogSnapshot) -> tuple[str, ...]:
 
 def _system_clock_ms() -> int:
     return time.time_ns() // 1_000_000
+
+
+def _system_monotonic_ms() -> int:
+    return time.monotonic_ns() // 1_000_000
 
 
 def _decision_log_key(decision: StrategyDecision) -> str:

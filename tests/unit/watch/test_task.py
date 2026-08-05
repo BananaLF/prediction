@@ -93,7 +93,14 @@ def _catalog(*, second_market: bool = False, first_active: bool = True) -> Catal
     )
 
 
-def _book(token_id: str, generation: int, *, market_id: str | None = None) -> OrderBook:
+def _book(
+    token_id: str,
+    generation: int,
+    *,
+    market_id: str | None = None,
+    exchange_timestamp: int = 100,
+    received_timestamp: int = 101,
+) -> OrderBook:
     inferred_market_id = {
         "token-3": "market-2",
         "token-4": "market-2",
@@ -107,8 +114,8 @@ def _book(token_id: str, generation: int, *, market_id: str | None = None) -> Or
         asks=(OrderBookLevel(Decimal("0.50"), Decimal("4")),),
         subscription_generation=generation,
         book_hash=f"hash-{generation}-{token_id}",
-        exchange_timestamp=100,
-        received_timestamp=101,
+        exchange_timestamp=exchange_timestamp,
+        received_timestamp=received_timestamp,
         tick_size=Decimal("0.01"),
         minimum_order_size=Decimal("1"),
     )
@@ -686,6 +693,48 @@ class BatchContextSource(FakeContextSource):
         }
 
 
+class MarketTimeContextSource(FakeContextSource):
+    def __init__(self) -> None:
+        self.configuration = StrategyConfig(
+            bankroll=Decimal("1000"),
+            minimum_return_rate=Decimal("0.0075"),
+            maximum_risk_rate=Decimal("1"),
+            maximum_unhedged_notional=Decimal("1000"),
+            safety_buffer_rate=Decimal("0"),
+            conversion_cost=Decimal("0"),
+            maximum_book_age_ms=1_000,
+            exchange_clock_skew_warning_ms=100,
+            maximum_leg_skew_ms=250,
+        )
+
+    def contexts_for(
+        self,
+        changed_token_id: str,
+        orderbooks: tuple[OrderBook, ...],
+    ) -> tuple[EvaluationTarget, ...]:
+        return (
+            EvaluationTarget(
+                context=StrategyContext(
+                    strategy_type=StrategyType.BINARY_UNDERPRICED,
+                    changed_token_id=changed_token_id,
+                    markets=(_market("market-1"),),
+                    tokens=(
+                        _token("token-1", "market-1", 0),
+                        _token("token-2", "market-1", 1),
+                    ),
+                    approved_implication_relation=None,
+                    orderbooks=orderbooks,
+                    fee_schedules={},
+                    evaluated_at=1,
+                    fee_schedule_evaluated_at=1,
+                    configuration=self.configuration,
+                ),
+                opportunity_key=f"opportunity:{changed_token_id}",
+                expected_revision=None,
+            ),
+        )
+
+
 class CatalogAwareContextSource(FakeContextSource):
     def __init__(self) -> None:
         self.snapshots: list[CatalogSnapshot] = []
@@ -703,24 +752,6 @@ class FakeStrategy:
         return NotEvaluable(
             DecisionReason.INPUT_METADATA_MISSING,
             {"changed_token_id": context.changed_token_id},
-        )
-
-
-class CausalityDiagnosticStrategy(FakeStrategy):
-    def evaluate(self, context: Any) -> NotEvaluable:
-        self.calls.append(context)
-        skew_ms = 150 if context.changed_token_id == "token-1" else 240
-        return NotEvaluable(
-            DecisionReason.ORDERBOOK_INVALID,
-            {
-                "changed_token_id": context.changed_token_id,
-                "detail": "orderbook_timestamp_causality_invalid",
-                "token_id": context.changed_token_id,
-                "exchange_timestamp": 1_000 + skew_ms,
-                "received_timestamp": 1_000,
-                "exchange_clock_skew_ms": skew_ms,
-                "maximum_exchange_clock_skew_ms": 100,
-            },
         )
 
 
@@ -779,6 +810,7 @@ class BlockingSyncStreamStrategy(FakeStrategy):
 class FakeSignals:
     def __init__(self) -> None:
         self.applied: list[tuple[Any, str, int | None]] = []
+        self.observed_at: list[int] = []
         self.closed: list[tuple[tuple[str, ...], NotEvaluable]] = []
         self.close_entered = asyncio.Event()
         self.close_gate: asyncio.Event | None = None
@@ -792,6 +824,7 @@ class FakeSignals:
         observed_at: int,
     ) -> str:
         self.applied.append((decision, opportunity_key, expected_revision))
+        self.observed_at.append(observed_at)
         return f"signal-{len(self.applied)}"
 
     async def close_for_tokens(
@@ -817,6 +850,7 @@ class NoPersistSignals(FakeSignals):
         observed_at: int,
     ) -> None:
         self.applied.append((decision, opportunity_key, expected_revision))
+        self.observed_at.append(observed_at)
         return None
 
 
@@ -854,6 +888,7 @@ def _watch(
     signals: FakeSignals | None = None,
     context_source: FakeContextSource | None = None,
     clock_ms: Any | None = None,
+    monotonic_ms: Any | None = None,
     market_limit: int = 100,
     minimum_end_horizon_seconds: int = 1_800,
 ) -> tuple[WatchTask, FakeGateway, FakeCatalog, FakeChanges, FakeStrategy, FakeSignals]:
@@ -872,6 +907,7 @@ def _watch(
             signal_manager=signals,
             context_source=context_source,
             clock_ms=clock_ms,
+            monotonic_ms=monotonic_ms,
             market_limit=market_limit,
             minimum_end_horizon_seconds=minimum_end_horizon_seconds,
         ),
@@ -928,6 +964,138 @@ async def test_run_subscribes_all_initial_watchable_tokens_and_evaluates_after_r
     assert gateway.subscriptions[0].closed is True
 
 
+@pytest.mark.parametrize("host_wall_time", [900, 3_000])
+async def test_recovery_evaluates_and_persists_at_market_watermark(
+    host_wall_time: int,
+) -> None:
+    class TimestampedGateway(FakeGateway):
+        async def recover_market_session(self, token_ids: tuple[str, ...]):
+            session = await super().recover_market_session(token_ids)
+            session.order_books = (
+                _book("token-1", 1, exchange_timestamp=1_000),
+                _book("token-2", 1, exchange_timestamp=1_050),
+            )
+            return session
+
+    strategy = FakeStrategy()
+    signals = FakeSignals()
+    watch, _, _, _, _, _ = _watch(
+        gateway=TimestampedGateway(),
+        strategy=strategy,
+        signals=signals,
+        context_source=MarketTimeContextSource(),
+        clock_ms=lambda: host_wall_time,
+    )
+
+    await watch.start()
+
+    assert {context.evaluated_at for context in strategy.calls} == {1_050}
+    assert signals.observed_at == [1_050, 1_050]
+    await watch.close()
+
+
+async def test_stream_mutation_advances_market_time_but_regression_does_not() -> None:
+    strategy = FakeStrategy()
+    signals = FakeSignals()
+    watch, _, _, _, _, _ = _watch(
+        strategy=strategy,
+        signals=signals,
+        context_source=MarketTimeContextSource(),
+        clock_ms=lambda: 9_000,
+    )
+    await watch.start()
+    strategy.calls.clear()
+    signals.applied.clear()
+    signals.observed_at.clear()
+
+    await watch.handle_stream_message(
+        MarketStreamEvent(
+            event_type="book",
+            market_id="market-1",
+            payload={
+                "token_id": "token-1",
+                "timestamp": 1_100,
+                "bids": [{"price": "0.41", "size": "9"}],
+                "asks": [{"price": "0.51", "size": "8"}],
+                "hash": "stream-1100",
+                "tick_size": "0.01",
+            },
+            received_timestamp=800,
+            subscription_generation=1,
+            mapping_version="mapping-v1",
+        )
+    )
+    calls_after_accepted = len(strategy.calls)
+
+    await watch.handle_stream_message(
+        MarketStreamEvent(
+            event_type="book",
+            market_id="market-1",
+            payload={
+                "token_id": "token-1",
+                "timestamp": 1_090,
+                "bids": [{"price": "0.42", "size": "7"}],
+                "asks": [{"price": "0.52", "size": "6"}],
+                "hash": "stream-1090",
+                "tick_size": "0.01",
+            },
+            received_timestamp=9_500,
+            subscription_generation=1,
+            mapping_version="mapping-v1",
+        )
+    )
+
+    assert strategy.calls[-1].evaluated_at == 1_100
+    assert signals.observed_at == [1_100]
+    assert len(strategy.calls) == calls_after_accepted
+    await watch.close()
+
+
+async def test_evaluation_without_generation_market_watermark_is_skipped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    strategy = FakeStrategy()
+    signals = FakeSignals()
+    watch, _, _, _, _, _ = _watch(strategy=strategy, signals=signals)
+    watch.cache.begin_resync(generation=1, token_ids=("token-1", "token-2"))
+    watch.cache.apply_snapshot((_book("token-1", 1), _book("token-2", 1)))
+
+    with caplog.at_level(logging.WARNING, logger="predmarket.watch.task"):
+        await watch._evaluate_tokens(("token-1",))  # noqa: SLF001
+
+    assert strategy.calls == []
+    assert signals.applied == []
+    assert "watch_evaluation_skipped" in caplog.text
+    assert "market_time_unavailable" in caplog.text
+
+
+async def test_stream_silence_uses_monotonic_time_not_host_wall(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    wall = [100]
+    monotonic = [1_000]
+    watch, _, _, _, _, _ = _watch(
+        context_source=MarketTimeContextSource(),
+        clock_ms=lambda: wall[0],
+        monotonic_ms=lambda: monotonic[0],
+    )
+    await watch.start()
+    wall[0] = 50_000
+    monotonic[0] = 1_400
+
+    with caplog.at_level(logging.INFO, logger="predmarket.watch.task"):
+        await watch._evaluate_tokens(("token-1",), force_log=True)  # noqa: SLF001
+
+    summary = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("watch_evaluation_summary ")
+    )
+    assert "market_time=100" in summary
+    assert "stream_silence_age_ms=400" in summary
+    await watch.close()
+
+
 async def test_evaluation_batch_deduplicates_shared_opportunity_keys() -> None:
     # Both token updates for one market must evaluate the shared opportunity once.
     context_source = SharedOpportunityContextSource()
@@ -965,7 +1133,29 @@ async def test_evaluation_summary_logs_stage_timings(
 async def test_evaluation_summary_logs_largest_exchange_clock_skew(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    watch, _, _, _, _, _ = _watch(strategy=CausalityDiagnosticStrategy())
+    class SkewedRecoveryGateway(FakeGateway):
+        async def recover_market_session(self, token_ids: tuple[str, ...]):
+            session = await super().recover_market_session(token_ids)
+            session.order_books = (
+                _book(
+                    "token-1",
+                    1,
+                    exchange_timestamp=1_150,
+                    received_timestamp=1_000,
+                ),
+                _book(
+                    "token-2",
+                    1,
+                    exchange_timestamp=1_240,
+                    received_timestamp=1_000,
+                ),
+            )
+            return session
+
+    watch, _, _, _, _, _ = _watch(
+        gateway=SkewedRecoveryGateway(),
+        context_source=MarketTimeContextSource(),
+    )
 
     with caplog.at_level(logging.INFO, logger="predmarket.watch.task"):
         await watch.start()
@@ -975,11 +1165,13 @@ async def test_evaluation_summary_logs_largest_exchange_clock_skew(
         for record in caplog.records
         if record.getMessage().startswith("watch_evaluation_summary ")
     )
-    assert "exchange_clock_skew_ms=240" in summary
-    assert "exchange_clock_skew_limit_ms=100" in summary
-    assert "exchange_clock_skew_token_id=token-2" in summary
+    assert "maximum_exchange_clock_skew_ms=240" in summary
+    assert "exchange_clock_skew_warning_ms=100" in summary
+    assert "maximum_exchange_clock_skew_token_id=token-2" in summary
     assert "exchange_timestamp=1240" in summary
     assert "received_timestamp=1000" in summary
+    assert "watch_exchange_clock_skew_warning" in caplog.text
+    assert "evaluation_continues=true" in caplog.text
     await watch.close()
 
 
@@ -1039,7 +1231,7 @@ async def test_evaluation_prefers_batch_context_materialization() -> None:
     await watch.close()
 
 
-async def test_evaluation_rejects_book_that_becomes_stale_while_strategy_runs() -> None:
+async def test_host_wall_movement_does_not_make_market_book_stale() -> None:
     clock = [100]
     configuration = StrategyConfig(
         bankroll=Decimal("1000"),
@@ -1092,14 +1284,43 @@ async def test_evaluation_rejects_book_that_becomes_stale_while_strategy_runs() 
     await watch.start()
     strategy.calls.clear()
     signals.applied.clear()
+    signals.observed_at.clear()
     clock[0] = 100
-    watch._last_orderbook_observed_at_ms = 100  # noqa: SLF001
     strategy.advance_to = 1_101
 
     await watch._evaluate_tokens(("token-1",))  # noqa: SLF001
 
     assert strategy.calls[0].evaluated_at == 100
-    assert signals.applied[0][0].reason_code is DecisionReason.ORDERBOOK_STALE
+    assert signals.applied[0][0].reason_code is DecisionReason.INPUT_METADATA_MISSING
+    assert signals.observed_at == [100]
+    await watch.close()
+
+
+async def test_same_generation_cache_revision_change_fences_stale_evaluation() -> None:
+    strategy = BlockingStreamStrategy()
+    signals = FakeSignals()
+    watch, _, _, _, _, _ = _watch(strategy=strategy, signals=signals)
+    await watch.start()
+    applied_before = len(signals.applied)
+
+    evaluation = asyncio.create_task(
+        watch._evaluate_tokens(("token-1",))  # noqa: SLF001
+    )
+    await asyncio.wait_for(strategy.stream_evaluation_started.wait(), timeout=1)
+    current = watch.cache.get("token-1")
+    assert current is not None
+    assert watch.cache.apply_book(
+        replace(
+            current,
+            bids=(OrderBookLevel(Decimal("0.41"), Decimal("9")),),
+            exchange_timestamp=101,
+            book_hash="newer-same-generation",
+        )
+    ) is True
+    strategy.release_stream_evaluation.set()
+    await evaluation
+
+    assert len(signals.applied) == applied_before
     await watch.close()
 
 
