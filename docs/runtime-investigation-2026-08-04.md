@@ -958,3 +958,13 @@
 - 后台同步：第四轮完整同步于 07:15:07 完成，耗时 477,187ms，看到 138,268 个市场和 276,536 个 token；Watch 在同步期间持续消费行情，同步提交和目录换代没有阻塞 runtime。
 - 无信号直接原因：本区间最佳实际收益率为 `-0.00660163`，低于要求的 `0.00750000`，差约 1.41 个百分点；完整评估持续产出，没有评估停止证据。
 - 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待本轮新 revision 和对应 `signal_transition`。
+
+## 07:47 半小时复验检查点
+
+- 运行连续性：07:17–07:47 共输出 174 条完整评估摘要、35,304 条 cache revision 推进后的旧批次主动中止日志；`ERROR=0`、`signal_transition=0`。SDK 行情速率峰值约 1,462.0 events/s，内部队列仍未记录 drop。
+- 连接与恢复：07:37–07:45 共发生 8 次 WebSocket 断线，其中两次服务端明确返回 `1013 slow consumer: send buffer full`，其余为关闭超时、BrokenPipe 和不完整帧导致的 `1006`。所有 close 回调仍为 `websocket_frame_queue_size=0`、`high=16`、`paused=False`；14 次 recovery 均完成，通常约 0.7–1.3 秒，runtime 未退出。
+- 盘口一致性：07:30 和 07:42 两次再现 ISSUE-095 的 `size=0` 删除档位与 authoritative best price 自相矛盾，均严格 fail-closed；另有两次 `tick_size_changed` 使旧 generation 立即失效。没有使用未知数量伪造盘口，也没有持久化信号。
+- 市场范围自愈：catalog 更新后首轮请求 98 tokens，其中 24 个已无 REST orderbook；恢复链路剪枝到 74 tokens，并因新 generation 尚无有效市场时间记录 `watch_signal_mutation_skipped`，没有用主机时间伪造生命周期 revision。排除 12 个无盘口市场并补选后，generation 52 恢复到 50 markets/100 tokens。
+- 后台同步：第五轮完整同步于 07:45:08 异步启动，检查点时仍在分页抓取；Watch 同期持续消费、恢复和评估，没有被同步阻塞。
+- 无信号直接原因：本区间最佳实际收益率为 `-0.00493403`，低于要求的 `0.00750000`，差约 1.24 个百分点；174 次完整摘要持续产出，没有评估停止证据。
+- 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待本轮新 revision 和对应 `signal_transition`。
