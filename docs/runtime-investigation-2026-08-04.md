@@ -922,3 +922,12 @@
 - 无信号直接原因：新进程本轮最佳实际收益率为 `-0.01908950`，低于要求的 `0.00750000`，差约 2.66 个百分点；完整评估还会按市场时间把部分盘口判为 stale 或缺少执行深度。没有证据表明信号被启动顺序、同步、订阅或 SQLite 阻塞。
 - 数据库证据：`signal_revisions=4`、最大 `observed_at=1785828290572`，两条历史信号仍均为 `CLOSED`；`PRAGMA quick_check=ok`。水位与 04:17 基线一致，未把历史记录误计为本轮新信号。
 - 结论：保持新进程运行，继续等待下一次高流量 close 以读取入口帧队列现场，同时继续等待收益达到阈值后的新 revision 与对应 `signal_transition`。
+
+## 05:47 半小时复验检查点
+
+- 运行连续性：05:17–05:47 共输出 176 条完整评估摘要、12,957 条过期评估主动中止日志；`ERROR=0`、`signal_transition=0`。SDK 行情速率峰值约 851.6 events/s，Gateway handoff queue 和 SDK handle queue 仍接近 0，未记录 drop。
+- 首次入口帧队列现场：05:46:01 出现一次 WebSocket `1006`，close reason 为空，reader exception 为 `TimeoutError: timed out while closing connection`；当时 `websocket_latency_seconds=17.421`、`websocket_frame_queue_size=0`、`high=16`、`low=4`、`paused=False`。本次现场不支持“断线时默认 16-frame 队列仍处于饱和回压”的判断，更接近传输停顿或关闭握手超时；但 close 回调发生在连接关闭阶段，队列可能已经排空，且本轮没有新的 `1013` 现场，因此不能据此排除瞬时回压或解释服务端此前的 slow-consumer close。
+- 断线恢复：generation 2 失效后，generation 3 在 444ms 内订阅完成、903ms 内收到 100 本完整 baseline，总恢复耗时 1,350ms；恢复后的首轮评估正常完成，runtime 未退出。
+- 订单簿保护再次触发：05:46:58 收到把 `size=0` 的删除档位同时声明为 authoritative best bid 的 `price_change`，严格一致性校验按 ISSUE-095 主动使 generation 3 失效。generation 4 在 1,139ms 内重新取得 100 本 baseline 并恢复到 50 markets/100 tokens，没有用未知数量伪造深度，也没有持久化信号。
+- 无信号直接原因：本区间最佳实际收益率为 `-0.00413136`，仍低于要求的 `0.00750000`，差约 1.16 个百分点；当前没有证据表明信号被同步、订阅、评估或 SQLite 阻塞。
+- 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待真实 `1013` 现场以及本轮新 revision 和对应 `signal_transition`。
