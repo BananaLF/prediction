@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -42,7 +46,7 @@ class StrategyConfig:
     safety_buffer_rate: Decimal
     conversion_cost: Decimal
     maximum_book_age_ms: int
-    maximum_exchange_clock_skew_ms: int
+    exchange_clock_skew_warning_ms: int
     maximum_leg_skew_ms: int
 
 
@@ -154,6 +158,22 @@ def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
 
 
 def _strategy_config(raw: dict[str, Any]) -> StrategyConfig:
+    warning_key = "exchange_clock_skew_warning_ms"
+    legacy_key = "maximum_exchange_clock_skew_ms"
+    if warning_key in raw and legacy_key in raw:
+        raise ValueError(
+            "strategy cannot contain both "
+            f"{legacy_key} and {warning_key}"
+        )
+    if legacy_key in raw:
+        raw = dict(raw)
+        raw[warning_key] = raw.pop(legacy_key)
+        _LOGGER.warning(
+            "strategy.%s is deprecated; use strategy.%s; exchange clock skew "
+            "is diagnostic only and no longer rejects market data",
+            legacy_key,
+            warning_key,
+        )
     _require_keys(
         raw,
         {
@@ -164,7 +184,7 @@ def _strategy_config(raw: dict[str, Any]) -> StrategyConfig:
             "safety_buffer_rate",
             "conversion_cost",
             "maximum_book_age_ms",
-            "maximum_exchange_clock_skew_ms",
+            "exchange_clock_skew_warning_ms",
             "maximum_leg_skew_ms",
         },
         "strategy",
@@ -177,8 +197,8 @@ def _strategy_config(raw: dict[str, Any]) -> StrategyConfig:
         safety_buffer_rate=_decimal(raw, "safety_buffer_rate", "strategy"),
         conversion_cost=_decimal(raw, "conversion_cost", "strategy"),
         maximum_book_age_ms=_integer(raw, "maximum_book_age_ms", "strategy"),
-        maximum_exchange_clock_skew_ms=_integer(
-            raw, "maximum_exchange_clock_skew_ms", "strategy"
+        exchange_clock_skew_warning_ms=_integer(
+            raw, "exchange_clock_skew_warning_ms", "strategy"
         ),
         maximum_leg_skew_ms=_integer(raw, "maximum_leg_skew_ms", "strategy"),
     )

@@ -190,32 +190,19 @@ def validate_inputs(
             DecisionReason.ORDERBOOK_INVALID,
             "orderbook_generation_mismatch",
         )
-    if any(book.received_timestamp > context.evaluated_at for book in books):
+    future_books = tuple(
+        book for book in books if book.exchange_timestamp > context.evaluated_at
+    )
+    if future_books:
+        future_book = max(future_books, key=lambda book: book.exchange_timestamp)
         return not_evaluable(
             context,
             DecisionReason.ORDERBOOK_INVALID,
             "orderbook_from_future",
-        )
-    most_future_book = max(
-        books,
-        key=lambda book: book.exchange_timestamp - book.received_timestamp,
-    )
-    exchange_clock_skew_ms = (
-        most_future_book.exchange_timestamp - most_future_book.received_timestamp
-    )
-    if exchange_clock_skew_ms > context.configuration.maximum_exchange_clock_skew_ms:
-        return not_evaluable(
-            context,
-            DecisionReason.ORDERBOOK_INVALID,
-            "orderbook_timestamp_causality_invalid",
             diagnostics={
-                "token_id": most_future_book.token_id,
-                "exchange_timestamp": most_future_book.exchange_timestamp,
-                "received_timestamp": most_future_book.received_timestamp,
-                "exchange_clock_skew_ms": exchange_clock_skew_ms,
-                "maximum_exchange_clock_skew_ms": (
-                    context.configuration.maximum_exchange_clock_skew_ms
-                ),
+                "token_id": future_book.token_id,
+                "exchange_timestamp": future_book.exchange_timestamp,
+                "evaluated_at": context.evaluated_at,
             },
         )
     if any(
@@ -293,8 +280,8 @@ def validate_configuration(context: StrategyContext) -> NotEvaluable | None:
     for name, value in (
         ("maximum_book_age_ms", config.maximum_book_age_ms),
         (
-            "maximum_exchange_clock_skew_ms",
-            config.maximum_exchange_clock_skew_ms,
+            "exchange_clock_skew_warning_ms",
+            config.exchange_clock_skew_warning_ms,
         ),
         ("maximum_leg_skew_ms", config.maximum_leg_skew_ms),
     ):

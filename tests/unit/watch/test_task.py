@@ -1049,7 +1049,7 @@ async def test_evaluation_rejects_book_that_becomes_stale_while_strategy_runs() 
         safety_buffer_rate=Decimal("0"),
         conversion_cost=Decimal("0"),
         maximum_book_age_ms=1_000,
-        maximum_exchange_clock_skew_ms=100,
+        exchange_clock_skew_warning_ms=100,
         maximum_leg_skew_ms=250,
     )
 

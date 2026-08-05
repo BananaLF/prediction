@@ -20,7 +20,7 @@ def strategy_config_factory():
             "safety_buffer_rate": Decimal("0"),
             "conversion_cost": Decimal("0"),
             "maximum_book_age_ms": 1000,
-            "maximum_exchange_clock_skew_ms": 100,
+            "exchange_clock_skew_warning_ms": 100,
             "maximum_leg_skew_ms": 250,
         }
         values.update(overrides)
