@@ -892,3 +892,13 @@
 - 修复：使用 WatchTask 已注入的主机 monotonic 毫秒时钟保存最近一次偏差 WARN 时间，跨评估批次按 10 秒窗口限频；到期后仍会重新告警。评估摘要继续独立按 10 秒输出最新最大偏差，市场时间、盘口 freshness、策略和信号语义均不变。
 - RED/GREEN：新增测试连续触发启动评估和两个实时批次，旧实现产生 3 条 WARN；修复后窗口内仅 1 条，把 monotonic 推进到 10 秒后产生第 2 条。相关 4 个测试通过，`tests/unit/watch/test_task.py` 全量为 90 passed。
 - 真实复验：修复版于 04:17:24 启动，04:17:36 输出全部组件启动成功和 `runtime_started`；偏差 WARN 随后仅在 04:17:36、04:17:46、04:17:56 各输出一次，约 10 秒一个窗口，期间实时评估持续执行且摘要保留完整偏差信息。
+
+## 04:47 半小时复验检查点
+
+- 运行区间：修复版从 04:17:24 持续运行至 04:47:34，runtime 未退出；日志中 `ERROR=0`、`Traceback=0`、`connection_lost=0`、`signal_transition=0`。
+- 异步启动与同步：Watch 和其他 runtime 组件约 12 秒完成启动；后台完整同步于 04:30:40 成功结束，耗时 783,818ms，处理 138,274 个市场和 276,548 个 token。完整同步没有阻塞 Watch 启动或实时消费。
+- 订阅与恢复：共开始 15 次 recovery，其中 7 次取得完整 REST baseline；两次明确失效均为 `tick_size_changed`，其余换代来自 catalog 更新、缺失盘口裁剪和候选补位。最终 generation 23 自 04:31:34 起保持有效，恢复到 50 markets/100 tokens，未出现 SDK drop 或连接丢失。
+- 实时消费与评估：截至检查点已处理超过 56,000 条 `price_change`，输出 91 条流进度和 172 条完整评估摘要；最新 `stream_silence_age_ms=1`、完整评估耗时约 26–31ms。另有 7,179 次 `watch_evaluation_aborted`，均是高频行情在策略执行期间推进 cache revision 后主动丢弃旧快照；完整摘要仍约每 10 秒持续产生，因此当前证据不支持其造成评估饥饿或信号遗漏。
+- 无信号直接原因：166 条摘要包含 `ABSENT.PROFIT_BELOW_THRESHOLD`，少量批次同时包含缺少执行深度；本轮最优实际收益率为 `-0.01192459`，仍低于要求的 `0.00750000`，差约 1.94 个百分点。最新候选和 market id 持续变化，说明不是停留在旧快照。
+- 数据库证据：`arbitrage_signals=2`、`signal_revisions=4`、最大 `observed_at=1785828290572`，两条信号均为启动前已有的 `CLOSED`；`PRAGMA quick_check=ok`。本检查点没有把历史信号误计为本轮信号。
+- 结论：同步、订阅、评估和 SQLite 持久化链路当前均无故障证据；尚未产生新信号的原因是市场条件未达到收益阈值。保持进程运行并继续按半小时检查日志与数据库，直到观察到本轮新 revision 和对应 `signal_transition`。
