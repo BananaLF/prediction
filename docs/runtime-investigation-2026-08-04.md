@@ -940,3 +940,11 @@
 - 后台同步：第二轮完整同步于 05:57:48 完成，耗时 606,541ms，处理 137,322 个市场和 274,644 个 token；同步提交后仅刷新 8 个新增候选市场，并合并同一 sync generation 的其余目录通知，Watch 全程持续消费行情。
 - 无信号直接原因：本区间最佳实际收益率为 `-0.00363841`，低于要求的 `0.00750000`，差约 1.11 个百分点。177 次完整摘要持续产出，因此没有评估停止或饥饿证据。
 - 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待本轮新 revision 和对应 `signal_transition`。
+
+## 06:47 半小时复验检查点
+
+- 运行连续性：06:17–06:47 共输出 177 条完整评估摘要、10,740 条 cache revision 推进后的旧批次主动中止日志；`ERROR=0`、`signal_transition=0`。SDK 行情速率峰值约 397.2 events/s，内部队列无 drop。
+- 故障与恢复：06:30:06 出现一次不完整 WebSocket 帧导致的 `1006`，close 回调仍记录 `websocket_frame_queue_size=0`、`high=16`、`paused=False`，950ms 内恢复。06:28、06:29 和 06:30 三次再现 ISSUE-095 的 `size=0` 与 authoritative best price 自相矛盾，均严格 fail-closed；断线、订单簿失效及同步目录换代合计完成 5 次 recovery，最终 generation 20 保持 50 markets/100 tokens。
+- 后台同步：第三轮完整同步于 06:37:09 完成，耗时 560,390ms，处理 137,105 个市场和 274,210 个 token；提交后 50 个候选市场全部刷新成功，订阅换代耗时 1,183ms，Watch 全程持续消费行情。
+- 无信号直接原因：本区间最佳实际收益率为 `-0.00650294`，低于要求的 `0.00750000`，差约 1.40 个百分点；完整评估持续产出，没有信号漏评或评估停止证据。
+- 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待本轮新 revision 和对应 `signal_transition`。
