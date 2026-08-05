@@ -912,3 +912,13 @@
 - 修复：`market_stream_connection_lost` 新增 `websocket_frame_queue_size/high/low/paused`，直接从发生 close 的 socket assembler 读取；对象形状不可用时输出 `unavailable`，不影响 SDK 原始回调和恢复语义。当前只增加证据，不修改私有 SDK 或缓冲参数。
 - RED/GREEN：close-path 测试先要求输出模拟的 `size=3/high=16/low=4/paused=True`，旧实现稳定失败；最小实现后通过，`tests/unit/polymarket/test_gateway.py` 全量 80 个测试通过，compileall 和 `git diff --check` 通过。项目环境没有安装 `ruff`，未将该项计为已验证。
 - 重启验证：旧进程收到一次 `Ctrl-C` 后正常以退出码 0 停止；新代码于 05:07:27 启动，05:07:40 输出 `component_started` 和 `runtime_started`，后台完整同步随后异步开始，Watch 持续消费和评估。等待下一次真实 close 读取新增字段后，再决定是否需要调整入口帧缓冲。
+
+## 05:17 一小时复验检查点
+
+- 运行连续性：04:17 启动的旧进程在 04:47–05:07 区间产生 122 条完整评估摘要，没有 `ERROR`、`Traceback` 或 `signal_transition`。05:00:14–05:06:24 的高流量窗口发生 16 次连接丢失，其中 4 次为服务端明确返回 `1013 slow consumer: send buffer full`；20 次 recovery 完成，runtime 没有退出。为加载 ISSUE-104 的诊断字段，旧进程随后通过一次 `Ctrl-C` 正常停止。
+- 新进程启动与同步：新代码于 05:07:27 启动，05:07:40 输出 `runtime_started`，随后才异步开始完整同步。同步于 05:17:41 完成，耗时 600,569ms，处理 137,666 个市场和 275,332 个 token；Watch 同期持续消费行情并已安全切换到 generation 2。
+- 新进程健康度：截至检查点输出 59 条完整评估摘要、917 条过期评估主动中止日志；`connection_lost=0`、`signal_transition=0`、`ERROR/Traceback=0`。Gateway handoff queue 和 SDK handle queue 仍接近 0，drop 均为 0。由于尚未发生真实 close，ISSUE-104 新增的 WebSocket frame queue 字段还没有现场值，不能据此确认或排除默认 16-frame 高水位假设。
+- 过期评估解释：`watch_evaluation_aborted` 中 expected/actual generation 相同并不表示条件矛盾；实际失效条件是高频行情在 context 或 strategy 执行期间推进了 cache revision，旧结果因此被主动丢弃。期间完整摘要持续产生，说明当前没有评估饥饿；现有日志缺少 expected/actual revision，下一步补齐该诊断字段。
+- 无信号直接原因：新进程本轮最佳实际收益率为 `-0.01908950`，低于要求的 `0.00750000`，差约 2.66 个百分点；完整评估还会按市场时间把部分盘口判为 stale 或缺少执行深度。没有证据表明信号被启动顺序、同步、订阅或 SQLite 阻塞。
+- 数据库证据：`signal_revisions=4`、最大 `observed_at=1785828290572`，两条历史信号仍均为 `CLOSED`；`PRAGMA quick_check=ok`。水位与 04:17 基线一致，未把历史记录误计为本轮新信号。
+- 结论：保持新进程运行，继续等待下一次高流量 close 以读取入口帧队列现场，同时继续等待收益达到阈值后的新 revision 与对应 `signal_transition`。
