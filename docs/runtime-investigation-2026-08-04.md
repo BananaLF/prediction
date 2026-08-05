@@ -948,3 +948,13 @@
 - 后台同步：第三轮完整同步于 06:37:09 完成，耗时 560,390ms，处理 137,105 个市场和 274,210 个 token；提交后 50 个候选市场全部刷新成功，订阅换代耗时 1,183ms，Watch 全程持续消费行情。
 - 无信号直接原因：本区间最佳实际收益率为 `-0.00650294`，低于要求的 `0.00750000`，差约 1.40 个百分点；完整评估持续产出，没有信号漏评或评估停止证据。
 - 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待本轮新 revision 和对应 `signal_transition`。
+
+## 07:17 半小时复验检查点
+
+- 运行连续性：06:47–07:17 共输出 172 条完整评估摘要、13,032 条 cache revision 推进后的旧批次主动中止日志；`ERROR=0`、`signal_transition=0`。SDK 行情速率峰值约 1,087.3 events/s，Gateway handoff queue 和 SDK handle queue 保持接近 0，未记录 drop。
+- 服务端断线原因：07:05–07:09 的高流量窗口共发生 7 次 WebSocket 断线，其中两次服务端明确返回 `1013 slow consumer: send buffer full`；其余 5 次为 `1006`，包括不完整帧 EOF、关闭超时和无附加异常的异常关闭。每次 close 回调均记录 `websocket_frame_queue_size=0`、`high=16`、`paused=False`，因此可以确认断开收尾现场没有残留帧队列积压，但仍不能排除回调前发生过瞬时回压。
+- 慢消费者定位边界：首个 `1013` 前 40 秒应用实际处理约 457–901 events/s，单条 `price_change` 缓存处理约 0.21ms；SDK handle queue 为 `0/65536`、Gateway handoff queue 约 `1/4096` 且无 drop。现有证据不支持 Gateway→Watch 业务队列是慢点；可疑范围收窄到 WebSocket/SDK 解帧到 SDK event 产出之间，或服务端连接发送缓冲策略。当前没有足够证据安全修改 SDK 私有缓冲参数。
+- fail-closed 与自愈：7 次断线均立即废弃旧 generation，并在约 0.9–2.1 秒内重建 baseline。07:11 一次 `tick_size_changed` 同样触发严格失效；部分市场失去 orderbook 后三次剪枝到 86/92 tokens，并通过候选补位最终恢复到 generation 36、50 markets/100 tokens。合计完成 13 次 recovery，runtime 未退出。
+- 后台同步：第四轮完整同步于 07:15:07 完成，耗时 477,187ms，看到 138,268 个市场和 276,536 个 token；Watch 在同步期间持续消费行情，同步提交和目录换代没有阻塞 runtime。
+- 无信号直接原因：本区间最佳实际收益率为 `-0.00660163`，低于要求的 `0.00750000`，差约 1.41 个百分点；完整评估持续产出，没有评估停止证据。
+- 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待本轮新 revision 和对应 `signal_transition`。
