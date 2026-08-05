@@ -124,12 +124,16 @@ class SignalManager(Protocol):
         decision: StrategyDecision,
         opportunity_key: str,
         expected_revision: int | None,
+        *,
+        observed_at: int,
     ) -> Any: ...
 
     async def close_for_tokens(
         self,
         token_ids: tuple[str, ...],
         decision: NotEvaluable,
+        *,
+        observed_at: int,
     ) -> None: ...
 
 
@@ -315,7 +319,7 @@ class WatchTask:
                 self._signal_manager, "close_unwatchable_for_active_tokens", None
             )
             if recover_open_signals is not None:
-                result = recover_open_signals(token_ids)
+                result = recover_open_signals(token_ids, observed_at=self._now())
                 if inspect.isawaitable(result):
                     await result
             if token_ids:
@@ -1805,7 +1809,11 @@ class WatchTask:
                 "detail": detail,
             },
         )
-        await self._signal_manager.close_for_tokens(normalized, decision)
+        await self._signal_manager.close_for_tokens(
+            normalized,
+            decision,
+            observed_at=self._now(),
+        )
 
     async def _evaluate_tokens(
         self,
@@ -1980,6 +1988,7 @@ class WatchTask:
                         decision,
                         target.opportunity_key,
                         target.expected_revision,
+                        observed_at=self._now(),
                     )
                     signal_apply_elapsed += time.monotonic() - signal_apply_started_at
                 except SubscriptionGenerationChanged as error:

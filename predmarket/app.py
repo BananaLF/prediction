@@ -235,7 +235,7 @@ class Supervisor:
             _LOGGER.info("component_initialized component=sync_task")
             subscription_generation = _SubscriptionGenerationSource()
             router = _SignalManagerRouter(
-                signals, notifier, self._clock_ms, subscription_generation
+                signals, notifier, subscription_generation
             )
             if self._watch_task_factory is None:
                 from predmarket.watch.task import WatchTask
@@ -602,12 +602,10 @@ class _SignalManagerRouter:
         self,
         repository: SignalRepository,
         notifier: Notifier,
-        clock_ms: Clock,
         subscription_generation: Callable[[str], int | None] | None = None,
     ) -> None:
         self._repository = repository
         self._notifier = notifier
-        self._clock_ms = clock_ms
         self._subscription_generation = subscription_generation
         self._managers: dict[tuple[StrategyType, str | None], SignalManager] = {}
         self._closure_manager = SignalManager(
@@ -615,21 +613,46 @@ class _SignalManagerRouter:
             strategy_type=StrategyType.BINARY_UNDERPRICED,
             execution_mode=ExecutionMode.IMMEDIATE_CONVERSION,
             notifier=notifier,
-            clock=clock_ms,
         )
 
-    async def apply(self, decision: Any, opportunity_key: str, expected_revision: int | None) -> Any:
+    async def apply(
+        self,
+        decision: Any,
+        opportunity_key: str,
+        expected_revision: int | None,
+        *,
+        observed_at: int,
+    ) -> Any:
         return await self._manager(opportunity_key).apply(
-            decision, opportunity_key, expected_revision
+            decision,
+            opportunity_key,
+            expected_revision,
+            observed_at=observed_at,
         )
 
-    async def close_for_tokens(self, token_ids: tuple[str, ...], decision: NotEvaluable) -> None:
-        await self._closure_manager.close_for_tokens(token_ids, decision)
+    async def close_for_tokens(
+        self,
+        token_ids: tuple[str, ...],
+        decision: NotEvaluable,
+        *,
+        observed_at: int,
+    ) -> None:
+        await self._closure_manager.close_for_tokens(
+            token_ids,
+            decision,
+            observed_at=observed_at,
+        )
 
     async def close_unwatchable_for_active_tokens(
-        self, active_token_ids: tuple[str, ...]
+        self,
+        active_token_ids: tuple[str, ...],
+        *,
+        observed_at: int,
     ) -> None:
-        await self._closure_manager.close_unwatchable_for_active_tokens(active_token_ids)
+        await self._closure_manager.close_unwatchable_for_active_tokens(
+            active_token_ids,
+            observed_at=observed_at,
+        )
 
     def _manager(self, opportunity_key: str) -> SignalManager:
         parts = opportunity_key.split(":", 2)
@@ -651,7 +674,6 @@ class _SignalManagerRouter:
                 relation_id=relation_id,
                 subscription_generation=self._subscription_generation,
                 notifier=self._notifier,
-                clock=self._clock_ms,
             )
         return self._managers[key]
 

@@ -788,6 +788,8 @@ class FakeSignals:
         decision: Any,
         opportunity_key: str,
         expected_revision: int | None,
+        *,
+        observed_at: int,
     ) -> str:
         self.applied.append((decision, opportunity_key, expected_revision))
         return f"signal-{len(self.applied)}"
@@ -796,6 +798,8 @@ class FakeSignals:
         self,
         token_ids: tuple[str, ...],
         decision: NotEvaluable,
+        *,
+        observed_at: int,
     ) -> None:
         self.closed.append((token_ids, decision))
         self.close_entered.set()
@@ -809,6 +813,8 @@ class NoPersistSignals(FakeSignals):
         decision: Any,
         opportunity_key: str,
         expected_revision: int | None,
+        *,
+        observed_at: int,
     ) -> None:
         self.applied.append((decision, opportunity_key, expected_revision))
         return None
@@ -824,12 +830,19 @@ class GenerationChangingSignals(FakeSignals):
         decision: Any,
         opportunity_key: str,
         expected_revision: int | None,
+        *,
+        observed_at: int,
     ) -> str:
         if self.reject_apply:
             raise SubscriptionGenerationChanged(
                 "subscription generation is unavailable for 'token-1'"
             )
-        return await super().apply(decision, opportunity_key, expected_revision)
+        return await super().apply(
+            decision,
+            opportunity_key,
+            expected_revision,
+            observed_at=observed_at,
+        )
 
 
 def _watch(

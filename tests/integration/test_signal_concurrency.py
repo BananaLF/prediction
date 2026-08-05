@@ -33,7 +33,9 @@ async def test_market_deactivation_queued_before_open_is_revalidated_in_transact
         )
         await asyncio.sleep(0)
         with pytest.raises(ValueError, match="watchable"):
-            await manager.apply(_present(), "opportunity-race", None)
+            await manager.apply(
+                _present(), "opportunity-race", None, observed_at=100
+            )
         await deactivation
     finally:
         await writer.close()
@@ -53,7 +55,6 @@ async def test_subscription_generation_is_revalidated_after_waiting_for_writer(
         strategy_type=StrategyType.BINARY_UNDERPRICED,
         execution_mode=ExecutionMode.IMMEDIATE_CONVERSION,
         subscription_generation=generations,
-        clock=lambda: 101,
     )
     release = asyncio.Event()
     entered = asyncio.Event()
@@ -65,7 +66,11 @@ async def test_subscription_generation_is_revalidated_after_waiting_for_writer(
     try:
         blocker = asyncio.create_task(writer.execute(block_writer))
         await entered.wait()
-        open_task = asyncio.create_task(manager.apply(_present(), "opportunity-generation", None))
+        open_task = asyncio.create_task(
+            manager.apply(
+                _present(), "opportunity-generation", None, observed_at=101
+            )
+        )
         await asyncio.sleep(0)
         generations["token-1"] = 2
         release.set()
@@ -87,11 +92,15 @@ async def test_missing_subscription_generation_fails_closed_before_open(tmp_path
         strategy_type=StrategyType.BINARY_UNDERPRICED,
         execution_mode=ExecutionMode.IMMEDIATE_CONVERSION,
         subscription_generation=lambda _token_id: None,
-        clock=lambda: 101,
     )
     try:
         with pytest.raises(ValueError, match="subscription generation is unavailable"):
-            await manager.apply(_present(), "opportunity-generation-missing", None)
+            await manager.apply(
+                _present(),
+                "opportunity-generation-missing",
+                None,
+                observed_at=101,
+            )
     finally:
         await writer.close()
 
@@ -105,14 +114,25 @@ async def test_two_managers_do_not_reapply_stale_decision_after_revision_conflic
         SignalRepository(tmp_path / "signals.db", writer),
         strategy_type=StrategyType.BINARY_UNDERPRICED,
         execution_mode=ExecutionMode.IMMEDIATE_CONVERSION,
-        clock=lambda: 101,
     )
     try:
-        signal_id = await first.apply(_present(), "opportunity-race", None)
+        signal_id = await first.apply(
+            _present(), "opportunity-race", None, observed_at=100
+        )
         assert signal_id is not None
         results = await asyncio.gather(
-            first.apply(_present(expected_profit="0.24"), "opportunity-race", 1),
-            second.apply(_present(expected_profit="0.23"), "opportunity-race", 1),
+            first.apply(
+                _present(expected_profit="0.24"),
+                "opportunity-race",
+                1,
+                observed_at=101,
+            ),
+            second.apply(
+                _present(expected_profit="0.23"),
+                "opportunity-race",
+                1,
+                observed_at=101,
+            ),
         )
         assert results == [signal_id, None]
         assert await signals.get_latest_revision(signal_id) == 2
@@ -136,10 +156,11 @@ async def test_stale_present_does_not_reopen_signal_closed_by_competing_writer(
         SignalRepository(tmp_path / "signals.db", writer),
         strategy_type=StrategyType.BINARY_UNDERPRICED,
         execution_mode=ExecutionMode.IMMEDIATE_CONVERSION,
-        clock=lambda: 101,
     )
     try:
-        signal_id = await manager.apply(_present(), "opportunity-close-race", None)
+        signal_id = await manager.apply(
+            _present(), "opportunity-close-race", None, observed_at=100
+        )
         assert signal_id is not None
         closed = await closer.apply(
             OpportunityAbsent(
@@ -150,9 +171,15 @@ async def test_stale_present_does_not_reopen_signal_closed_by_competing_writer(
             ),
             "opportunity-close-race",
             1,
+            observed_at=101,
         )
         assert closed == signal_id
-        assert await manager.apply(_present(expected_profit="0.24"), "opportunity-close-race", 1) is None
+        assert await manager.apply(
+            _present(expected_profit="0.24"),
+            "opportunity-close-race",
+            1,
+            observed_at=102,
+        ) is None
         assert await signals.find_open_signal_id("opportunity-close-race") is None
     finally:
         await writer.close()
@@ -162,7 +189,9 @@ async def test_stale_present_does_not_reopen_signal_closed_by_competing_writer(
 async def test_revision_payload_failure_rolls_back_main_signal_and_all_evidence(tmp_path: Path) -> None:
     writer, _catalog_repo, _signals, manager = await _open_manager(tmp_path)
     try:
-        signal_id = await manager.apply(_present(), "opportunity-atomic", None)
+        signal_id = await manager.apply(
+            _present(), "opportunity-atomic", None, observed_at=100
+        )
         assert signal_id is not None
 
         async def install_failure(connection) -> None:
@@ -176,7 +205,12 @@ async def test_revision_payload_failure_rolls_back_main_signal_and_all_evidence(
 
         await writer.execute(install_failure)
         with pytest.raises(sqlite3.IntegrityError, match="injected evidence failure"):
-            await manager.apply(_present(expected_profit="0.24"), "opportunity-atomic", 1)
+            await manager.apply(
+                _present(expected_profit="0.24"),
+                "opportunity-atomic",
+                1,
+                observed_at=101,
+            )
     finally:
         await writer.close()
 

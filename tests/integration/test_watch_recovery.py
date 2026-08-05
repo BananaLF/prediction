@@ -207,6 +207,8 @@ class _LifecycleSignals:
         decision: Any,
         opportunity_key: str,
         expected_revision: int | None,
+        *,
+        observed_at: int,
     ) -> str | None:
         assert opportunity_key == "same-opportunity"
         assert expected_revision is None
@@ -218,7 +220,13 @@ class _LifecycleSignals:
             self.opened_ids.append(self.open_id)
         return self.open_id
 
-    async def close_for_tokens(self, token_ids: tuple[str, ...], decision: Any) -> None:
+    async def close_for_tokens(
+        self,
+        token_ids: tuple[str, ...],
+        decision: Any,
+        *,
+        observed_at: int,
+    ) -> None:
         assert token_ids == ("token-1", "token-2")
         if self.open_id is not None:
             self.closed_ids.append(self.open_id)
@@ -351,7 +359,6 @@ async def test_queued_control_change_closes_persisted_signal_after_empty_restart
             signal_manager=_SignalManagerRouter(
                 signals,
                 Notifier(terminal=StringIO()),
-                lambda: 2,
             ),
             context_source=object(),
         )
@@ -432,7 +439,6 @@ async def test_start_recovers_open_signal_when_catalog_commit_was_not_queued(
             signal_manager=_SignalManagerRouter(
                 signals,
                 Notifier(terminal=StringIO()),
-                lambda: 2,
             ),
             context_source=object(),
         )

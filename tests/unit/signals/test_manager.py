@@ -124,7 +124,6 @@ async def _open_manager(
         signals,
         strategy_type=StrategyType.BINARY_UNDERPRICED,
         execution_mode=ExecutionMode.IMMEDIATE_CONVERSION,
-        clock=lambda: 100,
         notifier=notifier,
     )
     return writer, catalog, signals, manager
@@ -138,10 +137,19 @@ async def test_signal_manager_persists_open_update_noop_and_close_lifecycle(
     writer, _catalog_repo, _signals, manager = await _open_manager(tmp_path)
     try:
         with caplog.at_level(logging.INFO, logger="predmarket.signals.manager"):
-            signal_id = await manager.apply(_present(), "opportunity-1", None)
+            signal_id = await manager.apply(
+                _present(), "opportunity-1", None, observed_at=100
+            )
             assert signal_id is not None
-            assert await manager.apply(_present(), "opportunity-1", 1) == signal_id
-            assert await manager.apply(_present(expected_profit="0.24"), "opportunity-1", 1) == signal_id
+            assert await manager.apply(
+                _present(), "opportunity-1", 1, observed_at=101
+            ) == signal_id
+            assert await manager.apply(
+                _present(expected_profit="0.24"),
+                "opportunity-1",
+                1,
+                observed_at=102,
+            ) == signal_id
 
             absent = OpportunityAbsent(
                 reason_code=DecisionReason.PROFIT_BELOW_THRESHOLD,
@@ -149,9 +157,13 @@ async def test_signal_manager_persists_open_update_noop_and_close_lifecycle(
                 legs=_present().legs,
                 evidence=_present().evidence,
             )
-            assert await manager.apply(absent, "opportunity-1", 2) == signal_id
+            assert await manager.apply(
+                absent, "opportunity-1", 2, observed_at=103
+            ) == signal_id
 
-            reopened = await manager.apply(_present(), "opportunity-1", 3)
+            reopened = await manager.apply(
+                _present(), "opportunity-1", 3, observed_at=104
+            )
             assert reopened is not None and reopened != signal_id
     finally:
         await writer.close()
@@ -171,23 +183,109 @@ async def test_signal_manager_persists_open_update_noop_and_close_lifecycle(
 
     with sqlite3.connect(tmp_path / "signals.db") as connection:
         rows = connection.execute(
-            "SELECT id, status, latest_revision, close_reason FROM arbitrage_signals ORDER BY id"
+            "SELECT id, status, latest_revision, close_reason, opened_at, updated_at, closed_at "
+            "FROM arbitrage_signals ORDER BY id"
         ).fetchall()
         events = connection.execute(
-            "SELECT signal_id, event_type FROM signal_revisions ORDER BY signal_id, revision"
+            "SELECT signal_id, event_type, observed_at "
+            "FROM signal_revisions ORDER BY signal_id, revision"
         ).fetchall()
     assert len(rows) == 2
     assert sum(row[1] == "OPEN" for row in rows) == 1
     closed_row = next(row for row in rows if row[1] == "CLOSED")
     assert closed_row[2] == 3
     assert closed_row[3] == DecisionReason.PROFIT_BELOW_THRESHOLD.value
+    assert closed_row[4:] == (100, 103, 103)
+    open_row = next(row for row in rows if row[1] == "OPEN")
+    assert open_row[4:] == (104, 104, None)
     event_types_by_signal: dict[str, list[str]] = {}
-    for event_signal_id, event_type in events:
+    for event_signal_id, event_type, _observed_at in events:
         event_types_by_signal.setdefault(event_signal_id, []).append(event_type)
     assert sorted(event_types_by_signal.values()) == [
         ["OPENED"],
         ["OPENED", "UPDATED", "CLOSED"],
     ]
+    assert sorted(row[2] for row in events) == [100, 102, 103, 104]
+
+
+@pytest.mark.asyncio
+async def test_signal_manager_closure_apis_preserve_observed_at(tmp_path: Path) -> None:
+    writer, _catalog_repo, _signals, manager = await _open_manager(tmp_path)
+    try:
+        first_id = await manager.apply(
+            _present(), "close-by-token", None, observed_at=100
+        )
+        assert first_id is not None
+        closed = await manager.close_for_tokens(
+            ("token-1",),
+            NotEvaluable(
+                reason_code=DecisionReason.MARKET_CLOSED,
+                context={"detail": "token closed"},
+            ),
+            observed_at=120,
+        )
+        assert closed == (first_id,)
+
+        second_id = await manager.apply(
+            _present(), "close-unwatchable", None, observed_at=130
+        )
+        assert second_id is not None
+        closed = await manager.close_unwatchable_for_active_tokens(
+            (),
+            observed_at=140,
+        )
+        assert closed == (second_id,)
+    finally:
+        await writer.close()
+
+    with sqlite3.connect(tmp_path / "signals.db") as connection:
+        rows = connection.execute(
+            "SELECT opportunity_key, closed_at, updated_at FROM arbitrage_signals "
+            "ORDER BY opportunity_key"
+        ).fetchall()
+        revisions = connection.execute(
+            "SELECT s.opportunity_key, r.observed_at FROM signal_revisions AS r "
+            "JOIN arbitrage_signals AS s ON s.id = r.signal_id "
+            "WHERE r.event_type = 'CLOSED' ORDER BY s.opportunity_key"
+        ).fetchall()
+    assert rows == [
+        ("close-by-token", 120, 120),
+        ("close-unwatchable", 140, 140),
+    ]
+    assert revisions == [
+        ("close-by-token", 120),
+        ("close-unwatchable", 140),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observed_at", [-1, True, 1.5])
+async def test_signal_manager_rejects_invalid_observed_at_before_database_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    observed_at: object,
+) -> None:
+    writer, _catalog_repo, _signals, manager = await _open_manager(tmp_path)
+    execute_calls = 0
+    original_execute = writer.execute
+
+    async def counted_execute(command):
+        nonlocal execute_calls
+        execute_calls += 1
+        return await original_execute(command)
+
+    monkeypatch.setattr(writer, "execute", counted_execute)
+    try:
+        with pytest.raises(ValueError, match="observed_at"):
+            await manager.apply(
+                _present(),
+                "invalid-time",
+                None,
+                observed_at=observed_at,  # type: ignore[arg-type]
+            )
+        assert execute_calls == 0
+    finally:
+        await writer.close()
 
 
 @pytest.mark.asyncio
@@ -220,12 +318,15 @@ async def test_significant_update_replaces_canonical_signal_market_ids(tmp_path:
         tokens=(second_token,),
     )
     try:
-        signal_id = await manager.apply(_present(), "opportunity-1", None)
+        signal_id = await manager.apply(
+            _present(), "opportunity-1", None, observed_at=100
+        )
         assert signal_id is not None
         assert await manager.apply(
             _present(expected_profit="0.24", market_id="market-2", token_id="token-2"),
             "opportunity-1",
             1,
+            observed_at=101,
         ) == signal_id
     finally:
         await writer.close()
@@ -241,13 +342,19 @@ async def test_significant_update_replaces_canonical_signal_market_ids(tmp_path:
 async def test_not_evaluable_closes_without_economic_or_orderbook_evidence(tmp_path: Path) -> None:
     writer, _catalog_repo, _signals, manager = await _open_manager(tmp_path)
     try:
-        signal_id = await manager.apply(_present(), "opportunity-1", None)
+        signal_id = await manager.apply(
+            _present(), "opportunity-1", None, observed_at=100
+        )
         decision = NotEvaluable(
             reason_code=DecisionReason.MARKET_CLOSED,
             context={"affected_market_id": "market-1", "detail": "deactivated"},
         )
-        assert await manager.apply(decision, "opportunity-1", 1) == signal_id
-        assert await manager.apply(decision, "never-opened", None) is None
+        assert await manager.apply(
+            decision, "opportunity-1", 1, observed_at=101
+        ) == signal_id
+        assert await manager.apply(
+            decision, "never-opened", None, observed_at=102
+        ) is None
     finally:
         await writer.close()
 
@@ -292,8 +399,12 @@ async def test_closing_decisions_without_open_signal_skip_database_writer(
             context={"detail": "missing depth"},
         )
 
-        assert await manager.apply(absent, "never-opened-absent", None) is None
-        assert await manager.apply(not_evaluable, "never-opened-invalid", None) is None
+        assert await manager.apply(
+            absent, "never-opened-absent", None, observed_at=100
+        ) is None
+        assert await manager.apply(
+            not_evaluable, "never-opened-invalid", None, observed_at=101
+        ) is None
         assert execute_calls == 0
     finally:
         await writer.close()
@@ -303,11 +414,23 @@ async def test_closing_decisions_without_open_signal_skip_database_writer(
 async def test_signal_manager_rejects_stale_decision_without_duplicate_revision(tmp_path: Path) -> None:
     writer, _catalog_repo, signals, manager = await _open_manager(tmp_path)
     try:
-        signal_id = await manager.apply(_present(), "opportunity-1", None)
+        signal_id = await manager.apply(
+            _present(), "opportunity-1", None, observed_at=100
+        )
         assert signal_id is not None
         results = await __import__("asyncio").gather(
-            manager.apply(_present(expected_profit="0.24"), "opportunity-1", 1),
-            manager.apply(_present(expected_profit="0.24"), "opportunity-1", 1),
+            manager.apply(
+                _present(expected_profit="0.24"),
+                "opportunity-1",
+                1,
+                observed_at=101,
+            ),
+            manager.apply(
+                _present(expected_profit="0.24"),
+                "opportunity-1",
+                1,
+                observed_at=101,
+            ),
         )
         assert results == [signal_id, None]
         assert await signals.get_latest_revision(signal_id) == 2
@@ -329,7 +452,7 @@ async def test_deactivated_market_fails_closed_before_open(tmp_path: Path) -> No
             )
         )
         with pytest.raises(ValueError, match="watchable"):
-            await manager.apply(_present(), "opportunity-1", None)
+            await manager.apply(_present(), "opportunity-1", None, observed_at=100)
     finally:
         await writer.close()
 
@@ -338,7 +461,9 @@ async def test_deactivated_market_fails_closed_before_open(tmp_path: Path) -> No
 async def test_same_payload_noop_revalidates_deactivated_market(tmp_path: Path) -> None:
     writer, catalog, signals, manager = await _open_manager(tmp_path)
     try:
-        signal_id = await manager.apply(_present(), "opportunity-1", None)
+        signal_id = await manager.apply(
+            _present(), "opportunity-1", None, observed_at=100
+        )
         assert signal_id is not None
         _event, market, _token = _catalog()
         await catalog.save_market(
@@ -351,7 +476,7 @@ async def test_same_payload_noop_revalidates_deactivated_market(tmp_path: Path) 
         )
 
         with pytest.raises(ValueError, match="watchable"):
-            await manager.apply(_present(), "opportunity-1", 1)
+            await manager.apply(_present(), "opportunity-1", 1, observed_at=101)
 
         assert await signals.get_latest_revision(signal_id) == 1
     finally:
@@ -369,7 +494,9 @@ async def test_absent_without_open_does_not_create_signal(tmp_path: Path) -> Non
             legs=present.legs,
             evidence=present.evidence,
         )
-        assert await manager.apply(absent, "never-opened", None) is None
+        assert await manager.apply(
+            absent, "never-opened", None, observed_at=100
+        ) is None
     finally:
         await writer.close()
 
@@ -400,7 +527,7 @@ async def test_notification_observes_only_committed_complete_evidence(tmp_path: 
 
     writer, _catalog_repo, _signals, manager = await _open_manager(tmp_path, notifier=notify)
     try:
-        await manager.apply(_present(), "opportunity-1", None)
+        await manager.apply(_present(), "opportunity-1", None, observed_at=100)
     finally:
         await writer.close()
 

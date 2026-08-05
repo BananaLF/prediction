@@ -667,18 +667,27 @@ async def test_router_revalidates_generation_source_before_database_commit(tmp_p
         router = _SignalManagerRouter(
             SignalRepository(database_path, writer),
             Notifier(terminal=StringIO()),
-            lambda: 1,
             subscription_generation=source,
         )
         decision = _persisted_open_signal()[3]
         with pytest.raises(ValueError, match="subscription generation is unavailable"):
-            await router.apply(decision, "BINARY_UNDERPRICED:market-1", None)
+            await router.apply(
+                decision,
+                "BINARY_UNDERPRICED:market-1",
+                None,
+                observed_at=1,
+            )
         cache = OrderBookCache()
         cache.begin_resync(generation=2, token_ids=("token-1",))
         cache.apply_snapshot((replace(decision.evidence[0], subscription_generation=2),))
         source.bind(cache)
         with pytest.raises(ValueError, match="stale subscription generation"):
-            await router.apply(decision, "BINARY_UNDERPRICED:market-1", None)
+            await router.apply(
+                decision,
+                "BINARY_UNDERPRICED:market-1",
+                None,
+                observed_at=1,
+            )
     finally:
         await writer.close()
 
@@ -778,7 +787,6 @@ async def test_router_closes_persisted_signal_after_restart_without_evaluation_c
         restarted_router = _SignalManagerRouter(
             signals,
             Notifier(terminal=StringIO()),
-            lambda: 2,
         )
 
         await restarted_router.close_for_tokens(
@@ -787,6 +795,7 @@ async def test_router_closes_persisted_signal_after_restart_without_evaluation_c
                 reason_code=DecisionReason.MARKET_CLOSED,
                 context={"detail": "initial sync made every token unwatchable"},
             ),
+            observed_at=2,
         )
 
         assert await signals.find_open_signal_id("BINARY_UNDERPRICED:market-1") is None
