@@ -5,6 +5,7 @@ from dataclasses import replace
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 from typing import Any
 
@@ -33,12 +34,18 @@ from predmarket.persistence.repositories import (
     SignalRepository,
 )
 from predmarket.persistence.writer import DatabaseWriter
-from predmarket.polymarket.gateway import MarketStreamInvalidated
+from predmarket.polymarket.gateway import MarketStreamEvent, MarketStreamInvalidated
 from predmarket.watch.cache import CacheState
 from predmarket.watch.task import EvaluationTarget, WatchTask
 
 
-def _book(token_id: str, generation: int) -> OrderBook:
+def _book(
+    token_id: str,
+    generation: int,
+    *,
+    exchange_timestamp: int | None = None,
+    received_timestamp: int | None = None,
+) -> OrderBook:
     return OrderBook(
         market_id="market-1",
         token_id=token_id,
@@ -46,8 +53,12 @@ def _book(token_id: str, generation: int) -> OrderBook:
         asks=(OrderBookLevel(Decimal("0.50"), Decimal("4")),),
         subscription_generation=generation,
         book_hash=f"hash-{generation}-{token_id}",
-        exchange_timestamp=100 + generation,
-        received_timestamp=101 + generation,
+        exchange_timestamp=(
+            100 + generation if exchange_timestamp is None else exchange_timestamp
+        ),
+        received_timestamp=(
+            101 + generation if received_timestamp is None else received_timestamp
+        ),
         tick_size=Decimal("0.01"),
         minimum_order_size=Decimal("1"),
     )
@@ -159,6 +170,31 @@ class _Contexts:
                 ),  # type: ignore[arg-type]
                 opportunity_key="same-opportunity",
                 expected_revision=None,
+            ),
+        )
+
+
+class _PersistedContexts:
+    def __init__(self, signals: SignalRepository) -> None:
+        self._signals = signals
+
+    async def contexts_for(
+        self,
+        changed_token_id: str,
+        orderbooks: tuple[OrderBook, ...],
+    ) -> tuple[EvaluationTarget, ...]:
+        if changed_token_id != "token-1":
+            return ()
+        opportunity_key = "BINARY_UNDERPRICED:market-1"
+        revisions = await self._signals.find_open_revisions((opportunity_key,))
+        return (
+            EvaluationTarget(
+                context=SimpleNamespace(
+                    changed_token_id=changed_token_id,
+                    orderbooks=orderbooks,
+                ),  # type: ignore[arg-type]
+                opportunity_key=opportunity_key,
+                expected_revision=revisions.get(opportunity_key),
             ),
         )
 
@@ -512,3 +548,173 @@ async def test_recovery_closes_old_signal_and_reopens_with_new_signal_id() -> No
     assert signals.opened_ids == ["signal-1", "signal-2"]
     assert signals.open_id == "signal-2"
     await watch.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_signal_times_follow_each_market_generation_across_recovery(
+    tmp_path: Path,
+) -> None:
+    class MarketTimeGateway(_Gateway):
+        async def recover_market_session(self, token_ids: tuple[str, ...]):
+            self.generation += 1
+            generation = self.generation
+            subscription = _Subscription(generation)
+            self.subscriptions.append(subscription)
+            if self.block_next is not None:
+                await self.block_next.wait()
+            timestamps = {
+                1: (20_000, 20_020),
+                2: (5_000, 5_020),
+            }[generation]
+            return SimpleNamespace(
+                order_books=tuple(
+                    _book(
+                        token_id,
+                        generation,
+                        exchange_timestamp=timestamps[index],
+                        received_timestamp=10_000,
+                    )
+                    for index, token_id in enumerate(token_ids)
+                ),
+                subscription=subscription,
+                subscription_generation=generation,
+            )
+
+    database_path = tmp_path / "signals.sqlite3"
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    gateway = MarketTimeGateway()
+    watch: WatchTask | None = None
+    try:
+        catalog = CatalogRepository(database_path, writer)
+        signals = SignalRepository(database_path, writer)
+        snapshot = await _Catalog().load_catalog()
+        await catalog.save_catalog(
+            events=snapshot.events,
+            markets=snapshot.markets,
+            tokens=snapshot.tokens,
+        )
+        watch = WatchTask(
+            gateway=gateway,
+            catalog=catalog,
+            changes=_Changes(),
+            strategy_engine=_ProfitableStrategy(),
+            signal_manager=_SignalManagerRouter(
+                signals,
+                Notifier(terminal=StringIO()),
+            ),
+            context_source=_PersistedContexts(signals),
+            clock_ms=lambda: 10_000,
+        )
+
+        await watch.start()
+        await watch.handle_stream_message(
+            MarketStreamEvent(
+                event_type="book",
+                market_id="market-1",
+                payload={
+                    "token_id": "token-1",
+                    "timestamp": 20_100,
+                    "bids": [{"price": "0.41", "size": "3"}],
+                    "asks": [{"price": "0.51", "size": "4"}],
+                    "hash": "stream-generation-1",
+                    "tick_size": "0.01",
+                },
+                received_timestamp=10_000,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+
+        gateway.block_next = asyncio.Event()
+        recovering = asyncio.create_task(
+            watch.handle_stream_message(
+                MarketStreamInvalidated(
+                    reason="connection_lost",
+                    token_ids=("token-1", "token-2"),
+                    received_timestamp=10_000,
+                    subscription_generation=1,
+                    mapping_version="mapping-v1",
+                )
+            )
+        )
+        for _ in range(50):
+            if await signals.find_open_signal_id(
+                "BINARY_UNDERPRICED:market-1"
+            ) is None:
+                break
+            await asyncio.sleep(0)
+
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute(
+                """
+                SELECT event_type, observed_at
+                FROM signal_revisions
+                ORDER BY rowid
+                """
+            ).fetchall() == [
+                ("OPENED", 20_020),
+                ("UPDATED", 20_100),
+                ("CLOSED", 20_100),
+            ]
+
+        gateway.block_next.set()
+        await recovering
+
+        with sqlite3.connect(database_path) as connection:
+            revisions_before_old_event = connection.execute(
+                """
+                SELECT event_type, observed_at
+                FROM signal_revisions
+                ORDER BY rowid
+                """
+            ).fetchall()
+            assert revisions_before_old_event == [
+                ("OPENED", 20_020),
+                ("UPDATED", 20_100),
+                ("CLOSED", 20_100),
+                ("OPENED", 5_020),
+            ]
+            assert connection.execute(
+                """
+                SELECT status, opened_at, updated_at, closed_at
+                FROM arbitrage_signals
+                ORDER BY opened_at DESC
+                """
+            ).fetchall() == [
+                ("CLOSED", 20_020, 20_100, 20_100),
+                ("OPEN", 5_020, 5_020, None),
+            ]
+
+        await watch.handle_stream_message(
+            MarketStreamEvent(
+                event_type="book",
+                market_id="market-1",
+                payload={
+                    "token_id": "token-1",
+                    "timestamp": 99_999,
+                    "bids": [{"price": "0.42", "size": "3"}],
+                    "asks": [{"price": "0.52", "size": "4"}],
+                    "hash": "stale-generation-1",
+                    "tick_size": "0.01",
+                },
+                received_timestamp=10_000,
+                subscription_generation=1,
+                mapping_version="mapping-v1",
+            )
+        )
+
+        assert watch.cache.generation == 2
+        assert watch.cache.get("token-1").exchange_timestamp == 5_000
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute(
+                """
+                SELECT event_type, observed_at
+                FROM signal_revisions
+                ORDER BY rowid
+                """
+            ).fetchall() == revisions_before_old_event
+    finally:
+        if watch is not None:
+            await watch.close()
+        await writer.close()
