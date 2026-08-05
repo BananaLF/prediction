@@ -218,40 +218,22 @@ def validate_inputs(
                 ),
             },
         )
-    observed_at = context.orderbook_observed_at
-    if observed_at is not None:
-        if observed_at > context.evaluated_at:
-            return not_evaluable(
-                context,
-                DecisionReason.ORDERBOOK_INVALID,
-                "orderbook_observation_from_future",
-            )
-        if (
-            context.evaluated_at - observed_at
-            > context.configuration.maximum_book_age_ms
-        ):
-            return not_evaluable(
-                context,
-                DecisionReason.ORDERBOOK_STALE,
-                "orderbook_subscription_stale",
-            )
-    else:
-        if any(
-            context.evaluated_at - book.exchange_timestamp
-            > context.configuration.maximum_book_age_ms
-            for book in books
-        ):
-            return not_evaluable(context, DecisionReason.ORDERBOOK_STALE, "orderbook_stale")
-        exchange_times = [book.exchange_timestamp for book in books]
-        if (
-            max(exchange_times) - min(exchange_times)
-            > context.configuration.maximum_leg_skew_ms
-        ):
-            return not_evaluable(
-                context,
-                DecisionReason.LEG_SKEW_EXCEEDED,
-                "leg_exchange_timestamp_skew",
-            )
+    if any(
+        context.evaluated_at - book.exchange_timestamp
+        > context.configuration.maximum_book_age_ms
+        for book in books
+    ):
+        return not_evaluable(context, DecisionReason.ORDERBOOK_STALE, "orderbook_stale")
+    exchange_times = [book.exchange_timestamp for book in books]
+    if (
+        max(exchange_times) - min(exchange_times)
+        > context.configuration.maximum_leg_skew_ms
+    ):
+        return not_evaluable(
+            context,
+            DecisionReason.LEG_SKEW_EXCEEDED,
+            "leg_exchange_timestamp_skew",
+        )
     for book, action in zip(books, actions):
         execution_levels = book.asks if action is Action.BUY else book.bids
         if not execution_levels:
@@ -271,7 +253,7 @@ def validate_inputs(
             )
         try:
             stale = schedule.is_stale(
-                evaluated_at=context.evaluated_at,
+                evaluated_at=context.fee_schedule_evaluated_at,
                 max_age_seconds=context.fee_schedule_max_age_seconds,
             )
         except ValueError:
@@ -345,7 +327,7 @@ def trade(
         schedule,
         fill.average_price,
         quantity,
-        evaluated_at_ms=context.evaluated_at,
+        evaluated_at_ms=context.fee_schedule_evaluated_at,
         max_age_seconds=context.fee_schedule_max_age_seconds,  # type: ignore[arg-type]
     )
     return Trade(market, token, book, action, fill, fee, schedule)
@@ -516,7 +498,7 @@ def long_entry_risk(
     )
     return assess_failure_scenarios(
         tuple(scenarios),
-        evaluated_at_ms=context.evaluated_at,
+        evaluated_at_ms=context.fee_schedule_evaluated_at,
         fee_max_age_seconds=context.fee_schedule_max_age_seconds,  # type: ignore[arg-type]
     )
 
@@ -551,7 +533,7 @@ def split_inventory_risk(
         )
     return assess_failure_scenarios(
         tuple(scenarios),
-        evaluated_at_ms=context.evaluated_at,
+        evaluated_at_ms=context.fee_schedule_evaluated_at,
         fee_max_age_seconds=context.fee_schedule_max_age_seconds,  # type: ignore[arg-type]
     )
 

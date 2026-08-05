@@ -1073,6 +1073,7 @@ async def test_evaluation_rejects_book_that_becomes_stale_while_strategy_runs() 
                         orderbooks=orderbooks,
                         fee_schedules={},
                         evaluated_at=1,
+                        fee_schedule_evaluated_at=1,
                         configuration=configuration,
                     ),
                     opportunity_key=f"opportunity:{changed_token_id}",

@@ -569,7 +569,8 @@ class _ApplicationContextSource:
             fee_schedules={
                 token.id: token.fee_schedule for token in tokens if token.fee_schedule is not None
             },
-            evaluated_at=self._clock_ms(),
+            evaluated_at=0,
+            fee_schedule_evaluated_at=self._clock_ms(),
             configuration=self._config.strategy,
             events=events,
             fee_schedule_max_age_seconds=self._config.polymarket.fee_schedule_max_age_seconds,

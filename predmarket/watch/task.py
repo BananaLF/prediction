@@ -1896,7 +1896,6 @@ class WatchTask:
                     context = replace(
                         context,
                         evaluated_at=self._now(),
-                        orderbook_observed_at=observed_at,
                     )
                 strategy_started_at = time.monotonic()
                 evaluate = self._strategy_engine.evaluate

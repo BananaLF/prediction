@@ -29,7 +29,7 @@ def _binary_context(
     no_time=1_000,
     fees=None,
     evaluated_at=1_000,
-    orderbook_observed_at=None,
+    fee_schedule_evaluated_at=1_000,
     configuration=None,
     size="10",
     minimum="1",
@@ -66,7 +66,7 @@ def _binary_context(
         orderbooks=books,
         fees=fees,
         evaluated_at=evaluated_at,
-        orderbook_observed_at=orderbook_observed_at,
+        fee_schedule_evaluated_at=fee_schedule_evaluated_at,
         configuration=configuration,
     )
 
@@ -236,10 +236,10 @@ def test_binary_fails_closed_for_stale_or_skewed_books(
     assert decision.reason_code is reason
 
 
-def test_binary_uses_subscription_observation_for_unchanged_books(
+def test_binary_uses_market_time_for_unchanged_books(
     context_factory, market_factory, token_factory, book_factory
 ) -> None:
-    # A resting book remains current while its lossless subscription is alive.
+    # A resting book is stale when market time advances beyond its exchange timestamp.
     context = _binary_context(
         context_factory,
         market_factory,
@@ -248,12 +248,12 @@ def test_binary_uses_subscription_observation_for_unchanged_books(
         yes_time=1_000,
         no_time=1_500,
         evaluated_at=10_000,
-        orderbook_observed_at=10_000,
     )
 
     decision = evaluate_binary(context)
 
-    assert isinstance(decision, OpportunityPresent)
+    assert isinstance(decision, NotEvaluable)
+    assert decision.reason_code is DecisionReason.ORDERBOOK_STALE
 
 
 def test_binary_uses_exchange_time_for_freshness_and_bounded_clock_skew(
@@ -317,7 +317,6 @@ def test_binary_fails_closed_for_unknown_or_stale_fee(
     token_factory,
     book_factory,
     fee_factory,
-    strategy_config_factory,
 ) -> None:
     # Catches silently substituting zero for absent or expired fee proof.
     missing = _binary_context(
@@ -334,6 +333,7 @@ def test_binary_fails_closed_for_unknown_or_stale_fee(
         book_factory,
         fees={"yes": fee_factory(updated_at=0), "no": fee_factory(updated_at=0)},
         evaluated_at=11_001,
+        fee_schedule_evaluated_at=11_001,
         configuration=strategy_config_factory(maximum_book_age_ms=20_000),
     )
 
@@ -342,6 +342,39 @@ def test_binary_fails_closed_for_unknown_or_stale_fee(
 
     assert isinstance(missing_decision, NotEvaluable)
     assert missing_decision.reason_code is DecisionReason.FEE_SCHEDULE_UNKNOWN
+    assert isinstance(stale_decision, NotEvaluable)
+    assert stale_decision.reason_code is DecisionReason.FEE_SCHEDULE_STALE
+
+
+def test_binary_fee_freshness_uses_fee_cache_time_not_market_time(
+    context_factory,
+    market_factory,
+    token_factory,
+    book_factory,
+    fee_factory,
+    strategy_config_factory,
+) -> None:
+    fees = {
+        "yes": fee_factory(updated_at=9_500),
+        "no": fee_factory(updated_at=9_500),
+    }
+    fresh = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+        yes_time=2_000,
+        no_time=2_000,
+        fees=fees,
+        evaluated_at=2_000,
+        fee_schedule_evaluated_at=10_000,
+    )
+    stale = replace(fresh, fee_schedule_evaluated_at=19_501)
+
+    fresh_decision = evaluate_binary(fresh)
+    stale_decision = evaluate_binary(stale)
+
+    assert isinstance(fresh_decision, OpportunityPresent)
     assert isinstance(stale_decision, NotEvaluable)
     assert stale_decision.reason_code is DecisionReason.FEE_SCHEDULE_STALE
 
