@@ -62,6 +62,7 @@ class OrderBookCache:
         self._state = CacheState.INVALID
         self._generation = 0
         self._last_sequence = 0
+        self._revision = 0
         self._expected_token_ids: tuple[str, ...] = ()
         self._books: dict[str, OrderBook] = {}
         self._invalid_reason: str | None = "not_initialized"
@@ -77,6 +78,10 @@ class OrderBookCache:
     @property
     def last_sequence(self) -> int:
         return self._last_sequence
+
+    @property
+    def revision(self) -> int:
+        return self._revision
 
     @property
     def invalid_reason(self) -> str | None:
@@ -125,6 +130,7 @@ class OrderBookCache:
         self._books = by_token
         self._state = CacheState.VALID
         self._invalid_reason = None
+        self._revision += 1
         return self.view()
 
     def apply_book(self, book: OrderBook) -> bool:
@@ -151,6 +157,7 @@ class OrderBookCache:
         if book == current:
             return False
         self._books = {**self._books, book.token_id: book}
+        self._revision += 1
         return True
 
     def apply_delta(
@@ -288,6 +295,7 @@ class OrderBookCache:
 
         if applied:
             self._books = candidates
+            self._revision += 1
         self._last_sequence = sequence
         return applied
 

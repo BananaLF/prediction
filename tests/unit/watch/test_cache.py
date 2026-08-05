@@ -48,6 +48,74 @@ def _valid_cache(*, verifier=None) -> OrderBookCache:
     return cache
 
 
+def test_revision_starts_at_zero_and_snapshot_increments_once() -> None:
+    cache = OrderBookCache()
+
+    assert cache.revision == 0
+    cache.begin_resync(generation=1, token_ids=("token-a", "token-b"))
+    assert cache.revision == 0
+
+    cache.apply_snapshot((_book("token-a"), _book("token-b")))
+
+    assert cache.revision == 1
+
+
+def test_revision_increments_only_for_accepted_full_book_mutation() -> None:
+    cache = _valid_cache()
+    baseline_revision = cache.revision
+    current = cache.get("token-a")
+    assert current is not None
+
+    assert cache.apply_book(current) is False
+    assert cache.apply_book(
+        _book("token-a", book_hash="stale", exchange_timestamp=99)
+    ) is False
+    assert cache.revision == baseline_revision
+
+    assert cache.apply_book(
+        _book("token-a", book_hash="accepted", exchange_timestamp=101)
+    ) is True
+    assert cache.revision == baseline_revision + 1
+
+
+def test_revision_increments_once_for_multi_token_delta() -> None:
+    cache = _valid_cache()
+    baseline_revision = cache.revision
+
+    assert cache.apply_delta(
+        (
+            OrderBookDelta("token-a", "BUY", "0.41", "7", "post-a"),
+            OrderBookDelta("token-b", "BUY", "0.41", "8", "post-b"),
+        ),
+        generation=1,
+        sequence=1,
+        exchange_timestamp=102,
+        received_timestamp=103,
+    ) is True
+
+    assert cache.revision == baseline_revision + 1
+
+
+def test_revision_does_not_change_for_rejected_or_resync_state_changes() -> None:
+    cache = _valid_cache()
+    baseline_revision = cache.revision
+
+    assert cache.apply_delta(
+        (OrderBookDelta("token-a", "BUY", "0.41", "9", "stale"),),
+        generation=1,
+        sequence=1,
+        exchange_timestamp=99,
+        received_timestamp=103,
+    ) is False
+    assert cache.revision == baseline_revision
+
+    assert cache.invalidate(generation=1, reason="disconnect") is True
+    assert cache.apply_book(_book("token-a", exchange_timestamp=200)) is False
+    cache.begin_resync(generation=2, token_ids=("token-a", "token-b"))
+
+    assert cache.revision == baseline_revision
+
+
 def test_complete_snapshot_becomes_valid_sorted_immutable_view() -> None:
     # Catches partial/mutable REST baselines escaping the recovery barrier.
     cache = OrderBookCache()
