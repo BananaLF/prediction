@@ -870,3 +870,16 @@
 - 代码改动：`NotEvaluable` 为该原因携带最大偏差、阈值、token 及两端时间戳；Watch 评估汇总输出本批最大偏差，保持聚合和限频，不改变策略判定。
 - RED/GREEN：新增 strategy 决策上下文字段测试和 Watch 最大偏差汇总测试；旧实现分别因字段缺失和日志缺失失败，实现后 strategy + Watch 共 161 个测试通过。
 - 操作步骤：启用 macOS 自动日期与时间，或以管理员权限同步受信任 NTP；同步后重新执行 `sntp -t 5 time.apple.com`，偏差需回到 100ms 以内，再重启 runtime 以重建全部 REST baseline 的本机接收时间。
+
+## ISSUE-102：业务时间错误依赖主机时钟，市场时间领先时误拒绝有效盘口
+
+- 状态：时间域已统一并通过全量自动化测试、真实启动和 SQLite 集成验证。
+- 根因：旧实现同时用主机 wall clock 判断盘口因果关系、生成策略评估时间和写入 signal revision。当 Polymarket 时间领先本机时，即使行情本身有效，也会被 `orderbook_timestamp_causality_invalid` 拒绝；直接校准主机时钟只能缓解现场，不能消除业务语义对部署环境时钟的错误依赖。
+- 时间域规则：每个活跃 subscription generation 独立维护 `MarketClock`，以该 generation 已接收订单簿的最大 `exchange_timestamp` 作为只增业务水位；策略 `evaluated_at`、signal revision `observed_at` 和 Watch 生命周期关闭时间均使用该水位。主机 wall clock 只保留为接收时间及 exchange/host 偏差诊断；超阈值输出 warning 并明确 `evaluation_continues=true`，不再拒绝行情。流静默、退避和执行耗时继续使用 monotonic clock；fee 缓存 freshness 仍属于本地运行时间域。
+- 换代和 fail-closed：恢复成功后从 REST baseline 初始化新 generation 水位，允许新 generation 的初始市场时间小于旧 generation；旧 generation 事件不能更新新 cache、watermark 或数据库。无有效市场水位时不伪造业务时间，也不写入生命周期 revision。盘口回退、盘口过旧、腿间偏差、generation 失效和执行期间变旧等现有安全校验保持不变。
+- 配置兼容：新配置名为 `exchange_clock_skew_warning_ms`。旧键 `maximum_exchange_clock_skew_ms` 仅在新键缺失时兼容读取并输出迁移 warning；新旧键同时出现时拒绝启动，避免配置含义不明确。
+- 自动化验证：`python -m compileall -q predmarket tests` 成功；全量 `pytest -q` 为 `642 passed, 1 skipped`。新增 SQLite 恢复集成场景使用 host wall `10000`、generation 1 baseline `20000/20020`、stream update `20100`，精确验证 OPENED/UPDATED/CLOSED revision 的 `observed_at` 分别来自市场水位；generation 2 可从更小的 `5000/5020` 重新初始化，旧 generation 的 `99999` 事件不能污染 cache 或 SQLite。
+- 真实启动：两次启动均完成 catalog 加载、50 markets/100 tokens 恢复和全部组件启动；代表日志为 `watch_market_clock_initialized generation=1 market_time=1785956494307 books=100`，随后输出 `component_started watch_bootstrap`、`component_started watch_task`、`component_started sync_task` 和 `runtime_started`，行情持续进入评估。一次历史较旧盘口产生 `exchange_clock_skew_ms=-1451915` warning，但日志明确继续评估，策略再按市场时间将其判为 stale，没有因 exchange/host 偏差终止 runtime。
+- 关闭验证：直接运行收到一次 `Ctrl-C` 后依次输出 `runtime_stopping reason=cancelled` 和 `runtime_stopped`，进程退出码为 0。
+- SQLite 证据边界：本次真实短时运行的决策均为 absent/not-evaluable，没有生成新 signal revision；生产库最新仍是启动前的 4 条历史 revision，最大 `observed_at=1785828290572`，因此不将其声称为本轮日志关联证据。市场时间到 SQLite 的精确对应关系由上述确定性集成测试验证。
+- 剩余风险：ISSUE-093 已确认的外部 WebSocket `1006`/`1013 slow consumer` 仍可能发生；generation invalidation、fail-closed 关闭和自动恢复路径保持有效。本次短时真实运行未复现断线，不能据此宣称外部不稳定已消失。
