@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,9 @@ class PolymarketConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     market_change_queue_capacity: int
+    watch_market_limit: int
+    watch_minimum_end_horizon_seconds: int
+    market_stream_queue_capacity: int
 
 
 @dataclass(frozen=True)
@@ -39,6 +46,7 @@ class StrategyConfig:
     safety_buffer_rate: Decimal
     conversion_cost: Decimal
     maximum_book_age_ms: int
+    exchange_clock_skew_warning_ms: int
     maximum_leg_skew_ms: int
 
 
@@ -127,13 +135,45 @@ def _polymarket_config(raw: dict[str, Any]) -> PolymarketConfig:
 
 
 def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
-    _require_keys(raw, {"market_change_queue_capacity"}, "runtime")
+    _require_keys(
+        raw,
+        {
+            "market_change_queue_capacity",
+            "watch_market_limit",
+            "watch_minimum_end_horizon_seconds",
+            "market_stream_queue_capacity",
+        },
+        "runtime",
+    )
     return RuntimeConfig(
-        market_change_queue_capacity=_integer(raw, "market_change_queue_capacity", "runtime")
+        market_change_queue_capacity=_integer(raw, "market_change_queue_capacity", "runtime"),
+        watch_market_limit=_integer(raw, "watch_market_limit", "runtime"),
+        watch_minimum_end_horizon_seconds=_integer(
+            raw, "watch_minimum_end_horizon_seconds", "runtime"
+        ),
+        market_stream_queue_capacity=_integer(
+            raw, "market_stream_queue_capacity", "runtime"
+        ),
     )
 
 
 def _strategy_config(raw: dict[str, Any]) -> StrategyConfig:
+    warning_key = "exchange_clock_skew_warning_ms"
+    legacy_key = "maximum_exchange_clock_skew_ms"
+    if warning_key in raw and legacy_key in raw:
+        raise ValueError(
+            "strategy cannot contain both "
+            f"{legacy_key} and {warning_key}"
+        )
+    if legacy_key in raw:
+        raw = dict(raw)
+        raw[warning_key] = raw.pop(legacy_key)
+        _LOGGER.warning(
+            "strategy.%s is deprecated; use strategy.%s; exchange clock skew "
+            "is diagnostic only and no longer rejects market data",
+            legacy_key,
+            warning_key,
+        )
     _require_keys(
         raw,
         {
@@ -144,6 +184,7 @@ def _strategy_config(raw: dict[str, Any]) -> StrategyConfig:
             "safety_buffer_rate",
             "conversion_cost",
             "maximum_book_age_ms",
+            "exchange_clock_skew_warning_ms",
             "maximum_leg_skew_ms",
         },
         "strategy",
@@ -156,6 +197,9 @@ def _strategy_config(raw: dict[str, Any]) -> StrategyConfig:
         safety_buffer_rate=_decimal(raw, "safety_buffer_rate", "strategy"),
         conversion_cost=_decimal(raw, "conversion_cost", "strategy"),
         maximum_book_age_ms=_integer(raw, "maximum_book_age_ms", "strategy"),
+        exchange_clock_skew_warning_ms=_integer(
+            raw, "exchange_clock_skew_warning_ms", "strategy"
+        ),
         maximum_leg_skew_ms=_integer(raw, "maximum_leg_skew_ms", "strategy"),
     )
 

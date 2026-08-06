@@ -8,6 +8,7 @@ from collections.abc import Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass, replace
 import logging
 import math
+import time
 from typing import Any, Protocol, TypeVar
 from uuid import uuid4
 
@@ -155,34 +156,88 @@ class SyncMarketTask:
         return self._degraded
 
     async def run_once(self) -> SyncResult:
+        sync_started_at = time.monotonic()
         _LOGGER.info("正在开始执行第一次扫描")
         occurred_at = self._now()
         generation = self._new_generation()
+        _LOGGER.info("sync_started sync_generation=%s", generation)
         errors: list[str] = []
         events: list[Event] = []
         snapshots: list[MarketSnapshot] = []
         market_warnings: tuple[MarketMappingWarning, ...] = ()
+        orphan_warnings: tuple[str, ...] = ()
 
+        stage_started_at = time.monotonic()
+        _LOGGER.info(
+            "sync_stage_started sync_generation=%s stage=events_fetch", generation
+        )
         try:
             raw_events = await self._gateway.list_active_events()
         except Exception as error:
             errors.append(_error_text("event request failed", error))
+            _LOGGER.exception(
+                "sync_stage_failed sync_generation=%s stage=events_fetch "
+                "elapsed_ms=%d error=%s",
+                generation,
+                int((time.monotonic() - stage_started_at) * 1_000),
+                error,
+            )
         else:
             events, validation_error = _validated_events(raw_events)
             if validation_error is not None:
                 errors.append(validation_error)
+            _LOGGER.info(
+                "sync_stage_completed sync_generation=%s stage=events_fetch "
+                "events=%d elapsed_ms=%d",
+                generation,
+                len(events),
+                int((time.monotonic() - stage_started_at) * 1_000),
+            )
 
+        stage_started_at = time.monotonic()
+        _LOGGER.info(
+            "sync_stage_started sync_generation=%s stage=markets_fetch", generation
+        )
         try:
             raw_snapshots = await self._gateway.list_active_markets()
             market_warnings = _gateway_market_mapping_warnings(self._gateway)
         except Exception as error:
             errors.append(_error_text("market request failed", error))
+            _LOGGER.exception(
+                "sync_stage_failed sync_generation=%s stage=markets_fetch "
+                "elapsed_ms=%d error=%s",
+                generation,
+                int((time.monotonic() - stage_started_at) * 1_000),
+                error,
+            )
         else:
             snapshots, validation_error = _validated_snapshots(raw_snapshots)
             if validation_error is not None:
                 errors.append(validation_error)
+            _LOGGER.info(
+                "sync_stage_completed sync_generation=%s stage=markets_fetch "
+                "markets=%d tokens=%d warnings=%d elapsed_ms=%d",
+                generation,
+                len(snapshots),
+                sum(len(item.tokens) for item in snapshots),
+                len(market_warnings),
+                int((time.monotonic() - stage_started_at) * 1_000),
+            )
 
+        stage_started_at = time.monotonic()
+        _LOGGER.info(
+            "sync_stage_started sync_generation=%s stage=catalog_load", generation
+        )
         previous = await self._catalog.load_catalog()
+        _LOGGER.info(
+            "sync_stage_completed sync_generation=%s stage=catalog_load "
+            "events=%d markets=%d tokens=%d elapsed_ms=%d",
+            generation,
+            len(previous.events),
+            len(previous.markets),
+            len(previous.tokens),
+            int((time.monotonic() - stage_started_at) * 1_000),
+        )
         published_market_ids = await self._system_events.list_published_market_ids()
         persisted_refresh_cursor = (
             await self._system_events.get_settlement_refresh_cursor()
@@ -194,6 +249,13 @@ class SyncMarketTask:
         )
         next_refresh_cursor: str | None = None
         if not errors:
+            stage_started_at = time.monotonic()
+            _LOGGER.info(
+                "sync_stage_started sync_generation=%s stage=settlement_refresh "
+                "budget=%d",
+                generation,
+                self._settlement_refresh_budget,
+            )
             (
                 resolved_snapshots,
                 refresh_error,
@@ -207,9 +269,22 @@ class SyncMarketTask:
                 timeout_seconds=self._settlement_refresh_timeout_seconds,
             )
             snapshots.extend(resolved_snapshots)
+            _LOGGER.info(
+                "sync_stage_completed sync_generation=%s stage=settlement_refresh "
+                "markets=%d error=%s elapsed_ms=%d",
+                generation,
+                len(resolved_snapshots),
+                refresh_error,
+                int((time.monotonic() - stage_started_at) * 1_000),
+            )
             if refresh_error is not None:
                 errors.append(refresh_error)
         if not errors:
+            snapshots, orphan_warnings = _detach_missing_parent_events(
+                events=events,
+                snapshots=snapshots,
+            )
+            _log_orphan_warnings(orphan_warnings)
             validation_error = _validate_complete_source(
                 events=events,
                 snapshots=snapshots,
@@ -229,10 +304,25 @@ class SyncMarketTask:
             )
             markets_persisted = len(partial.markets)
             if partial.events or partial.markets or partial.tokens:
+                stage_started_at = time.monotonic()
+                _LOGGER.info(
+                    "sync_stage_started sync_generation=%s stage=catalog_persist "
+                    "complete=false",
+                    generation,
+                )
                 await self._catalog.save_catalog(
                     events=partial.events,
                     markets=partial.markets,
                     tokens=partial.tokens,
+                )
+                _LOGGER.info(
+                    "sync_stage_completed sync_generation=%s stage=catalog_persist "
+                    "complete=false events=%d markets=%d tokens=%d elapsed_ms=%d",
+                    generation,
+                    len(partial.events),
+                    len(partial.markets),
+                    len(partial.tokens),
+                    int((time.monotonic() - stage_started_at) * 1_000),
                 )
             error_message = "; ".join(errors)
             await self._system_events.append(
@@ -264,11 +354,12 @@ class SyncMarketTask:
                 )
             _LOGGER.error(
                 "sync_incomplete sync_generation=%s markets_seen=%d "
-                "markets_persisted=%d tokens_seen=%d error=%s",
+                "markets_persisted=%d tokens_seen=%d elapsed_ms=%d error=%s",
                 generation,
                 len(snapshots),
                 markets_persisted,
                 sum(len(item.tokens) for item in snapshots),
+                int((time.monotonic() - sync_started_at) * 1_000),
                 error_message,
             )
             return SyncResult(
@@ -286,10 +377,19 @@ class SyncMarketTask:
                 skipped_market_ids=tuple(
                     warning.market_id for warning in market_warnings
                 ),
-                warnings=tuple(warning.error for warning in market_warnings),
+                warnings=(
+                    tuple(warning.error for warning in market_warnings)
+                    + orphan_warnings
+                ),
             )
 
-        prepared = _prepare_complete(
+        stage_started_at = time.monotonic()
+        _LOGGER.info(
+            "sync_stage_started sync_generation=%s stage=catalog_prepare",
+            generation,
+        )
+        prepared = await asyncio.to_thread(
+            _prepare_complete,
             events=events,
             snapshots=snapshots,
             previous=previous,
@@ -297,17 +397,71 @@ class SyncMarketTask:
             occurred_at=occurred_at,
             published_market_ids=published_market_ids,
         )
+        _LOGGER.info(
+            "sync_stage_completed sync_generation=%s stage=catalog_prepare "
+            "events=%d markets=%d tokens=%d event_upserts=%d "
+            "market_upserts=%d token_upserts=%d changes=%d elapsed_ms=%d",
+            generation,
+            len(prepared.events),
+            len(prepared.markets),
+            len(prepared.tokens),
+            len(prepared.event_upserts),
+            len(prepared.market_upserts),
+            len(prepared.token_upserts),
+            len(prepared.changes),
+            int((time.monotonic() - stage_started_at) * 1_000),
+        )
         # One writer transaction completes before any Watch-visible change.
-        await self._catalog.save_catalog(
-            events=prepared.events,
-            markets=prepared.markets,
-            tokens=prepared.tokens,
+        stage_started_at = time.monotonic()
+        _LOGGER.info(
+            "sync_stage_started sync_generation=%s stage=catalog_persist "
+            "complete=true",
+            generation,
+        )
+        complete_save = getattr(self._catalog, "save_complete_catalog", None)
+        if callable(complete_save):
+            await complete_save(
+                generation=generation,
+                updated_at=occurred_at,
+                events=prepared.event_upserts,
+                markets=prepared.market_upserts,
+                tokens=prepared.token_upserts,
+            )
+        else:
+            await self._catalog.save_catalog(
+                events=prepared.events,
+                markets=prepared.markets,
+                tokens=prepared.tokens,
+            )
+        _LOGGER.info(
+            "sync_stage_completed sync_generation=%s stage=catalog_persist "
+            "complete=true events=%d markets=%d tokens=%d elapsed_ms=%d",
+            generation,
+            len(prepared.events),
+            len(prepared.markets),
+            len(prepared.tokens),
+            int((time.monotonic() - stage_started_at) * 1_000),
         )
         markets_persisted = len(prepared.markets)
         published = 0
-        dropped = 0
+        capacity = getattr(self._changes, "maxsize", None)
+        delivery_changes, coalesced = _changes_for_delivery(
+            prepared.changes,
+            capacity=capacity if type(capacity) is int else None,
+        )
+        dropped = coalesced
+        if coalesced:
+            _LOGGER.warning(
+                "sync_market_changes_coalesced sync_generation=%s total=%d "
+                "delivered=%d coalesced=%d queue_capacity=%d",
+                generation,
+                len(prepared.changes),
+                len(delivery_changes),
+                coalesced,
+                capacity,
+            )
         admitted: list[tuple[MarketChange, tuple[str, ...]]] = []
-        for change in prepared.changes:
+        for change in delivery_changes:
             if await self._changes.put(change):
                 published += 1
                 if change.market_id is not None:
@@ -370,13 +524,14 @@ class SyncMarketTask:
         _LOGGER.info(
             "sync_completed sync_generation=%s markets_seen=%d "
             "markets_persisted=%d tokens_seen=%d changes_published=%d "
-            "changes_dropped=%d",
+            "changes_dropped=%d elapsed_ms=%d",
             generation,
             len(snapshots),
             markets_persisted,
             sum(len(item.tokens) for item in snapshots),
             published,
             dropped,
+            int((time.monotonic() - sync_started_at) * 1_000),
         )
         return SyncResult(
             sync_generation=generation,
@@ -393,7 +548,10 @@ class SyncMarketTask:
             skipped_market_ids=tuple(
                 warning.market_id for warning in market_warnings
             ),
-            warnings=tuple(warning.error for warning in market_warnings),
+            warnings=(
+                tuple(warning.error for warning in market_warnings)
+                + orphan_warnings
+            ),
         )
 
     async def _record_publication_marker(
@@ -501,6 +659,9 @@ class _PreparedCatalog:
     markets: tuple[Market, ...]
     tokens: tuple[Token, ...]
     changes: tuple[MarketChange, ...] = ()
+    event_upserts: tuple[Event, ...] = ()
+    market_upserts: tuple[Market, ...] = ()
+    token_upserts: tuple[Token, ...] = ()
 
 
 def _validated_events(values: object) -> tuple[list[Event], str | None]:
@@ -669,6 +830,79 @@ def _validate_complete_source(
     return None
 
 
+def _detach_missing_parent_events(
+    *,
+    events: Sequence[Event],
+    snapshots: Sequence[MarketSnapshot],
+) -> tuple[list[MarketSnapshot], tuple[str, ...]]:
+    event_ids = {event.id for event in events}
+    normalized: list[MarketSnapshot] = []
+    warnings: list[str] = []
+    for snapshot in snapshots:
+        market = snapshot.market
+        if (
+            market.status is MarketStatus.ACTIVE
+            and market.active
+            and market.event_id is not None
+            and market.event_id not in event_ids
+        ):
+            warnings.append(
+                f"market {market.id} parent event {market.event_id} was absent; "
+                "persisting market as orphan"
+            )
+            market = replace(
+                market,
+                event_id=None,
+                neg_risk_member_complete=False,
+                neg_risk_outcome_position=None,
+            )
+            snapshot = replace(snapshot, market=market)
+        normalized.append(snapshot)
+    return normalized, tuple(warnings)
+
+
+def _log_orphan_warnings(
+    warnings: Sequence[str],
+    *,
+    sample_limit: int = 10,
+) -> None:
+    for warning in warnings[:sample_limit]:
+        _LOGGER.warning("sync_market_parent_missing %s", warning)
+    omitted = len(warnings) - sample_limit
+    if omitted > 0:
+        _LOGGER.warning(
+            "sync_market_parent_missing summary total=%d omitted=%d",
+            len(warnings),
+            omitted,
+        )
+
+
+def _changes_for_delivery(
+    changes: Sequence[MarketChange],
+    *,
+    capacity: int | None,
+) -> tuple[tuple[MarketChange, ...], int]:
+    """Collapse bulk catalog wake-ups while preserving control changes."""
+
+    ordered = tuple(changes)
+    if capacity is None or len(ordered) <= capacity:
+        return ordered, 0
+
+    representative_selected = False
+    selected: list[MarketChange] = []
+    for change in ordered:
+        if change.change_type in {
+            MarketChangeType.MARKET_ADDED,
+            MarketChangeType.MARKET_UPDATED,
+        }:
+            if not representative_selected:
+                selected.append(change)
+                representative_selected = True
+        else:
+            selected.append(change)
+    return tuple(selected), len(ordered) - len(selected)
+
+
 def _prepare_complete(
     *,
     events: Sequence[Event],
@@ -752,9 +986,8 @@ def _prepare_complete(
         if incoming is None:
             assert old is not None
             related_markets = tuple(
-                market
-                for market in final_markets.values()
-                if market.event_id == event_id
+                final_markets[market_id]
+                for market_id in market_ids_by_event.get(event_id, ())
             )
             fully_resolved = bool(related_markets) and all(
                 market.status is MarketStatus.RESOLVED
@@ -781,7 +1014,9 @@ def _prepare_complete(
             )
         else:
             event = incoming
-        market_ids = tuple(market_ids_by_event[event_id])
+        market_ids = tuple(
+            sorted(market_ids_by_event[event_id], key=_utf8)
+        )
         final_events[event_id] = replace(
             event,
             market_ids=market_ids,
@@ -820,11 +1055,33 @@ def _prepare_complete(
         occurred_at=occurred_at,
         published_market_ids=published_market_ids,
     )
+    event_upserts = {
+        event_id: event
+        for event_id, event in final_events.items()
+        if event_id not in old_events
+        or _event_persistence_signature(event)
+        != _event_persistence_signature(old_events[event_id])
+    }
+    market_upserts = {
+        market_id: market
+        for market_id, market in final_markets.items()
+        if market_id not in old_markets
+        or _market_signature(market) != _market_signature(old_markets[market_id])
+    }
+    token_upserts = {
+        token_id: token
+        for token_id, token in final_tokens.items()
+        if token_id not in old_tokens
+        or _token_signature(token) != _token_signature(old_tokens[token_id])
+    }
     return _PreparedCatalog(
         events=_ordered(final_events.values()),
         markets=_ordered(final_markets.values()),
         tokens=_ordered(final_tokens.values()),
         changes=changes,
+        event_upserts=_ordered(event_upserts.values()),
+        market_upserts=_ordered(market_upserts.values()),
+        token_upserts=_ordered(token_upserts.values()),
     )
 
 
@@ -1131,16 +1388,17 @@ def _tokens_by_market(tokens: Iterable[Token]) -> dict[str, tuple[Token, ...]]:
 
 
 def _token_signatures(tokens: Sequence[Token]) -> tuple[tuple[Any, ...], ...]:
-    return tuple(
-        (
-            token.id,
-            token.market_id,
-            token.outcome,
-            token.position,
-            token.fee_schedule,
-            token.fee_updated_at,
-        )
-        for token in tokens
+    return tuple(_token_signature(token) for token in tokens)
+
+
+def _token_signature(token: Token) -> tuple[Any, ...]:
+    return (
+        token.id,
+        token.market_id,
+        token.outcome,
+        token.position,
+        token.fee_schedule,
+        token.fee_updated_at,
     )
 
 
@@ -1202,6 +1460,10 @@ def _event_signature(event: Event) -> tuple[Any, ...]:
         event.resolved_at,
         event.source_updated_at,
     )
+
+
+def _event_persistence_signature(event: Event) -> tuple[Any, ...]:
+    return (*_event_signature(event), event.market_ids)
 
 
 def _event_critical_signature(event: Event) -> tuple[Any, ...]:

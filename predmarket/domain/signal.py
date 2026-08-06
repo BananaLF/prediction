@@ -233,6 +233,7 @@ class StrategyContext:
     orderbooks: tuple[OrderBook, ...]
     fee_schedules: Mapping[str, FeeSchedule]
     evaluated_at: int
+    fee_schedule_evaluated_at: int
     configuration: StrategyConfig
     events: tuple[Event, ...] = ()
     fee_schedule_max_age_seconds: int | None = None
@@ -260,6 +261,13 @@ class StrategyContext:
                 raise ValueError("fee schedule values must be FeeSchedule instances")
         if type(self.evaluated_at) is not int or self.evaluated_at < 0:
             raise ValueError("evaluated_at must be a non-negative integer")
+        if (
+            type(self.fee_schedule_evaluated_at) is not int
+            or self.fee_schedule_evaluated_at < 0
+        ):
+            raise ValueError(
+                "fee_schedule_evaluated_at must be a non-negative integer"
+            )
         if not isinstance(self.configuration, StrategyConfig):
             raise ValueError("configuration must be a StrategyConfig")
         if self.fee_schedule_max_age_seconds is not None and (

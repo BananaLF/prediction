@@ -10,7 +10,6 @@ import inspect
 import json
 import logging
 from pathlib import Path
-import time
 from typing import Any
 from uuid import uuid4
 
@@ -32,13 +31,16 @@ from predmarket.domain.signal import (
 from predmarket.persistence.repositories import SignalRepository
 
 
-Clock = Callable[[], int]
 StateSource = Mapping[str, Any] | Callable[[str], Any] | None
 _LOGGER = logging.getLogger(__name__)
 
 
 class SignalRevisionConflict(RuntimeError):
     """The caller's revision was superseded before its transaction committed."""
+
+
+class SubscriptionGenerationChanged(ValueError):
+    """A strategy decision references subscription evidence that is no longer current."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +70,6 @@ class SignalManager:
         relation_state: StateSource = None,
         subscription_generation: Mapping[str, int] | Callable[[str], int | None] | None = None,
         notifier: Any = None,
-        clock: Clock | None = None,
         max_retries: int = 3,
     ) -> None:
         if not isinstance(repository, SignalRepository):
@@ -92,7 +93,6 @@ class SignalManager:
         self._relation_state = relation_state
         self._subscription_generation = subscription_generation
         self._notifier = notifier
-        self._clock = clock or (lambda: time.time_ns() // 1_000_000)
         self._max_retries = max_retries
         self._apply_lock = asyncio.Lock()
 
@@ -101,6 +101,8 @@ class SignalManager:
         decision: StrategyDecision,
         opportunity_key: str,
         expected_revision: int | None,
+        *,
+        observed_at: int,
     ) -> str | None:
         """Persist one decision and return its signal ID, if one exists."""
 
@@ -112,12 +114,13 @@ class SignalManager:
             type(expected_revision) is not int or expected_revision < 0
         ):
             raise ValueError("expected_revision must be a non-negative integer or None")
+        if type(observed_at) is not int or observed_at < 0:
+            raise ValueError("observed_at must be a non-negative integer")
 
         async with self._apply_lock:
             self._validate_external_state(decision)
-            observed_at = self._clock()
-            if type(observed_at) is not int or observed_at < 0:
-                raise ValueError("clock must return a non-negative integer")
+            if not isinstance(decision, OpportunityPresent) and expected_revision is None:
+                return None
             try:
                 result = await self._repository._writer.execute(  # noqa: SLF001
                     lambda connection: self._apply_transaction(
@@ -141,11 +144,15 @@ class SignalManager:
         self,
         token_ids: Sequence[str],
         decision: StrategyDecision,
+        *,
+        observed_at: int,
     ) -> tuple[str, ...]:
         """Close open signals whose persisted trade legs reference any token."""
 
         if not isinstance(decision, (OpportunityAbsent, NotEvaluable)):
             raise TypeError("close_for_tokens requires a closing decision")
+        if type(observed_at) is not int or observed_at < 0:
+            raise ValueError("observed_at must be a non-negative integer")
         wanted = tuple(token_ids)
         if not wanted or any(not isinstance(token_id, str) or not token_id for token_id in wanted):
             raise ValueError("token_ids must contain non-empty strings")
@@ -161,17 +168,27 @@ class SignalManager:
         )
         closed: list[str] = []
         for row in rows:
-            signal_id = await self.apply(decision, str(row[0]), int(row[1]))
+            signal_id = await self.apply(
+                decision,
+                str(row[0]),
+                int(row[1]),
+                observed_at=observed_at,
+            )
             if signal_id is not None:
                 closed.append(signal_id)
         return tuple(closed)
 
     async def close_unwatchable_for_active_tokens(
-        self, active_token_ids: Sequence[str]
+        self,
+        active_token_ids: Sequence[str],
+        *,
+        observed_at: int,
     ) -> tuple[str, ...]:
         """Close persisted OPEN signals whose legs are absent from the catalog."""
 
         active = frozenset(active_token_ids)
+        if type(observed_at) is not int or observed_at < 0:
+            raise ValueError("observed_at must be a non-negative integer")
         rows = await _read_all(
             self._repository._path,  # noqa: SLF001
             """
@@ -199,6 +216,7 @@ class SignalManager:
                     "token_ids": unavailable,
                 },
             ),
+            observed_at=observed_at,
         )
 
     async def _current_expected_revision(self, opportunity_key: str) -> int | None:
@@ -345,9 +363,13 @@ class SignalManager:
         for book in decision.evidence:
             generation = _generation_value(self._subscription_generation, book.token_id)
             if self._subscription_generation is not None and generation is None:
-                raise ValueError(f"subscription generation is unavailable for {book.token_id!r}")
+                raise SubscriptionGenerationChanged(
+                    f"subscription generation is unavailable for {book.token_id!r}"
+                )
             if generation is not None and generation != book.subscription_generation:
-                raise ValueError(f"stale subscription generation for {book.token_id!r}")
+                raise SubscriptionGenerationChanged(
+                    f"stale subscription generation for {book.token_id!r}"
+                )
         if self._relation_id is not None:
             state = _state_value(self._relation_state, self._relation_id)
             if state is not None and not _relation_approved(state):

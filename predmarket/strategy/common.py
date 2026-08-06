@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 from predmarket.domain.fees import FeeCalculator, FeeSchedule
 from predmarket.domain.decimal import encode_decimal
@@ -99,14 +99,19 @@ def not_evaluable(
     context: StrategyContext,
     reason: DecisionReason,
     detail: str,
+    *,
+    diagnostics: Mapping[str, Any] | None = None,
 ) -> NotEvaluable:
+    decision_context: dict[str, Any] = {
+        "changed_token_id": context.changed_token_id,
+        "detail": detail,
+        "strategy_type": context.strategy_type.value,
+    }
+    if diagnostics is not None:
+        decision_context.update(diagnostics)
     return NotEvaluable(
         reason_code=reason,
-        context={
-            "changed_token_id": context.changed_token_id,
-            "detail": detail,
-            "strategy_type": context.strategy_type.value,
-        },
+        context=decision_context,
     )
 
 
@@ -185,17 +190,20 @@ def validate_inputs(
             DecisionReason.ORDERBOOK_INVALID,
             "orderbook_generation_mismatch",
         )
-    if any(book.received_timestamp > context.evaluated_at for book in books):
+    future_books = tuple(
+        book for book in books if book.exchange_timestamp > context.evaluated_at
+    )
+    if future_books:
+        future_book = max(future_books, key=lambda book: book.exchange_timestamp)
         return not_evaluable(
             context,
             DecisionReason.ORDERBOOK_INVALID,
             "orderbook_from_future",
-        )
-    if any(book.exchange_timestamp > book.received_timestamp for book in books):
-        return not_evaluable(
-            context,
-            DecisionReason.ORDERBOOK_INVALID,
-            "orderbook_timestamp_causality_invalid",
+            diagnostics={
+                "token_id": future_book.token_id,
+                "exchange_timestamp": future_book.exchange_timestamp,
+                "evaluated_at": context.evaluated_at,
+            },
         )
     if any(
         context.evaluated_at - book.exchange_timestamp
@@ -204,7 +212,10 @@ def validate_inputs(
     ):
         return not_evaluable(context, DecisionReason.ORDERBOOK_STALE, "orderbook_stale")
     exchange_times = [book.exchange_timestamp for book in books]
-    if max(exchange_times) - min(exchange_times) > context.configuration.maximum_leg_skew_ms:
+    if (
+        max(exchange_times) - min(exchange_times)
+        > context.configuration.maximum_leg_skew_ms
+    ):
         return not_evaluable(
             context,
             DecisionReason.LEG_SKEW_EXCEEDED,
@@ -229,7 +240,7 @@ def validate_inputs(
             )
         try:
             stale = schedule.is_stale(
-                evaluated_at=context.evaluated_at,
+                evaluated_at=context.fee_schedule_evaluated_at,
                 max_age_seconds=context.fee_schedule_max_age_seconds,
             )
         except ValueError:
@@ -268,6 +279,10 @@ def validate_configuration(context: StrategyContext) -> NotEvaluable | None:
             )
     for name, value in (
         ("maximum_book_age_ms", config.maximum_book_age_ms),
+        (
+            "exchange_clock_skew_warning_ms",
+            config.exchange_clock_skew_warning_ms,
+        ),
         ("maximum_leg_skew_ms", config.maximum_leg_skew_ms),
     ):
         if type(value) is not int or value < 0:
@@ -299,7 +314,7 @@ def trade(
         schedule,
         fill.average_price,
         quantity,
-        evaluated_at_ms=context.evaluated_at,
+        evaluated_at_ms=context.fee_schedule_evaluated_at,
         max_age_seconds=context.fee_schedule_max_age_seconds,  # type: ignore[arg-type]
     )
     return Trade(market, token, book, action, fill, fee, schedule)
@@ -470,7 +485,7 @@ def long_entry_risk(
     )
     return assess_failure_scenarios(
         tuple(scenarios),
-        evaluated_at_ms=context.evaluated_at,
+        evaluated_at_ms=context.fee_schedule_evaluated_at,
         fee_max_age_seconds=context.fee_schedule_max_age_seconds,  # type: ignore[arg-type]
     )
 
@@ -505,7 +520,7 @@ def split_inventory_risk(
         )
     return assess_failure_scenarios(
         tuple(scenarios),
-        evaluated_at_ms=context.evaluated_at,
+        evaluated_at_ms=context.fee_schedule_evaluated_at,
         fee_max_age_seconds=context.fee_schedule_max_age_seconds,  # type: ignore[arg-type]
     )
 

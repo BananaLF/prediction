@@ -29,6 +29,7 @@ def _binary_context(
     no_time=1_000,
     fees=None,
     evaluated_at=1_000,
+    fee_schedule_evaluated_at=1_000,
     configuration=None,
     size="10",
     minimum="1",
@@ -65,6 +66,7 @@ def _binary_context(
         orderbooks=books,
         fees=fees,
         evaluated_at=evaluated_at,
+        fee_schedule_evaluated_at=fee_schedule_evaluated_at,
         configuration=configuration,
     )
 
@@ -87,6 +89,30 @@ def test_binary_underpriced_uses_full_depth_and_exact_economics(
     assert decision.calculation.unhedged_notional == Decimal("4.00")
     assert [leg.action for leg in decision.legs] == [Action.BUY, Action.BUY, Action.MERGE]
     assert [book.token_id for book in decision.evidence] == ["no", "yes"]
+
+
+def test_binary_underpriced_uses_authoritative_positions_for_arbitrary_labels(
+    context_factory, market_factory, token_factory, book_factory
+) -> None:
+    # Binary complete sets are identified by SDK positions, not display labels.
+    context = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+    )
+    context = replace(
+        context,
+        tokens=tuple(
+            replace(token, outcome=("Up" if token.position == 0 else "Down"))
+            for token in context.tokens
+        ),
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, OpportunityPresent)
+    assert [leg.token_id for leg in decision.legs[:2]] == ["yes", "no"]
 
 
 def test_binary_evidence_details_encode_decimal_without_exponents(
@@ -210,10 +236,32 @@ def test_binary_fails_closed_for_stale_or_skewed_books(
     assert decision.reason_code is reason
 
 
-def test_binary_uses_exchange_time_for_freshness_and_enforces_causality(
+def test_binary_uses_market_time_for_unchanged_books(
     context_factory, market_factory, token_factory, book_factory
 ) -> None:
-    # Catches a freshly received but old snapshot, or exchange time after receipt.
+    # A resting book is stale when market time advances beyond its exchange timestamp.
+    context = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+        yes_time=1_000,
+        no_time=1_500,
+        evaluated_at=10_000,
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, NotEvaluable)
+    assert decision.reason_code is DecisionReason.ORDERBOOK_STALE
+
+
+def test_binary_uses_only_market_time_for_orderbook_validity(
+    context_factory,
+    market_factory,
+    token_factory,
+    book_factory,
+) -> None:
     base = _binary_context(
         context_factory,
         market_factory,
@@ -228,21 +276,40 @@ def test_binary_uses_exchange_time_for_freshness_and_enforces_causality(
             for book in base.orderbooks
         ),
     )
-    impossible_time = replace(
+    exchange_ahead_of_host = replace(
         base,
         orderbooks=tuple(
-            replace(book, exchange_timestamp=1_100, received_timestamp=1_000)
+            replace(book, exchange_timestamp=1_400, received_timestamp=1_000)
+            for book in base.orderbooks
+        ),
+    )
+    host_receipt_ahead = replace(
+        base,
+        orderbooks=tuple(
+            replace(book, exchange_timestamp=1_400, received_timestamp=10_000)
+            for book in base.orderbooks
+        ),
+    )
+    future_market_time = replace(
+        base,
+        orderbooks=tuple(
+            replace(book, exchange_timestamp=1_501, received_timestamp=0)
             for book in base.orderbooks
         ),
     )
 
     old_decision = evaluate_binary(old_exchange)
-    impossible_decision = evaluate_binary(impossible_time)
+    exchange_ahead_decision = evaluate_binary(exchange_ahead_of_host)
+    host_receipt_ahead_decision = evaluate_binary(host_receipt_ahead)
+    future_market_time_decision = evaluate_binary(future_market_time)
 
     assert isinstance(old_decision, NotEvaluable)
     assert old_decision.reason_code is DecisionReason.ORDERBOOK_STALE
-    assert isinstance(impossible_decision, NotEvaluable)
-    assert impossible_decision.reason_code is DecisionReason.ORDERBOOK_INVALID
+    assert isinstance(exchange_ahead_decision, OpportunityPresent)
+    assert isinstance(host_receipt_ahead_decision, OpportunityPresent)
+    assert isinstance(future_market_time_decision, NotEvaluable)
+    assert future_market_time_decision.reason_code is DecisionReason.ORDERBOOK_INVALID
+    assert future_market_time_decision.context["detail"] == "orderbook_from_future"
 
 
 def test_binary_fails_closed_for_unknown_or_stale_fee(
@@ -268,6 +335,7 @@ def test_binary_fails_closed_for_unknown_or_stale_fee(
         book_factory,
         fees={"yes": fee_factory(updated_at=0), "no": fee_factory(updated_at=0)},
         evaluated_at=11_001,
+        fee_schedule_evaluated_at=11_001,
         configuration=strategy_config_factory(maximum_book_age_ms=20_000),
     )
 
@@ -276,6 +344,38 @@ def test_binary_fails_closed_for_unknown_or_stale_fee(
 
     assert isinstance(missing_decision, NotEvaluable)
     assert missing_decision.reason_code is DecisionReason.FEE_SCHEDULE_UNKNOWN
+    assert isinstance(stale_decision, NotEvaluable)
+    assert stale_decision.reason_code is DecisionReason.FEE_SCHEDULE_STALE
+
+
+def test_binary_fee_freshness_uses_fee_cache_time_not_market_time(
+    context_factory,
+    market_factory,
+    token_factory,
+    book_factory,
+    fee_factory,
+) -> None:
+    fees = {
+        "yes": fee_factory(updated_at=9_500),
+        "no": fee_factory(updated_at=9_500),
+    }
+    fresh = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+        yes_time=2_000,
+        no_time=2_000,
+        fees=fees,
+        evaluated_at=2_000,
+        fee_schedule_evaluated_at=10_000,
+    )
+    stale = replace(fresh, fee_schedule_evaluated_at=19_501)
+
+    fresh_decision = evaluate_binary(fresh)
+    stale_decision = evaluate_binary(stale)
+
+    assert isinstance(fresh_decision, OpportunityPresent)
     assert isinstance(stale_decision, NotEvaluable)
     assert stale_decision.reason_code is DecisionReason.FEE_SCHEDULE_STALE
 
@@ -458,6 +558,7 @@ def test_positive_but_insufficient_bankroll_returns_auditable_absent(
         {"bankroll": Decimal("NaN")},
         {"conversion_cost": Decimal("-1")},
         {"maximum_book_age_ms": -1},
+        {"exchange_clock_skew_warning_ms": -1},
         {"maximum_leg_skew_ms": -1},
         {"maximum_risk_rate": Decimal("-0.1")},
         {"safety_buffer_rate": Decimal("1.1")},

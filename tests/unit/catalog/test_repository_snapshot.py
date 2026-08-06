@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
+import pytest
+
+import predmarket.persistence.repositories as repositories_module
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.persistence.repositories import CatalogRepository
 from predmarket.persistence.writer import DatabaseWriter
@@ -57,6 +61,37 @@ async def test_catalog_snapshot_reads_one_typed_catalog_view(tmp_path: Path) -> 
     assert tuple(item.id for item in snapshot.events) == ("event-1",)
     assert tuple(item.id for item in snapshot.markets) == ("market-1",)
     assert tuple(item.id for item in snapshot.tokens) == ("token-0", "token-1")
+
+
+async def test_catalog_snapshot_materialization_runs_off_event_loop_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "catalog.db"
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    catalog = CatalogRepository(database_path, writer)
+    event_loop_thread = threading.current_thread()
+    materialization_threads: list[threading.Thread] = []
+    original = repositories_module._materialize_catalog_snapshot
+
+    def recording_materialization(*args: object) -> object:
+        materialization_threads.append(threading.current_thread())
+        return original(*args)
+
+    monkeypatch.setattr(
+        repositories_module,
+        "_materialize_catalog_snapshot",
+        recording_materialization,
+    )
+    try:
+        snapshot = await catalog.load_catalog()
+    finally:
+        await writer.close()
+
+    assert snapshot == repositories_module.CatalogSnapshot((), (), ())
+    assert len(materialization_threads) == 1
+    assert materialization_threads[0] is not event_loop_thread
 
 
 async def test_catalog_repository_persists_orphan_markets_and_rebuilds_event_index(

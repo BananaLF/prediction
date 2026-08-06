@@ -23,7 +23,6 @@ from predmarket.strategy.common import (
     plan_trade_quantities,
     select_trade_optimization,
     split_inventory_risk,
-    token_by_outcome,
     trade,
     trade_root_quantities,
     validate_inputs,
@@ -64,15 +63,21 @@ def _evaluate_binary(context: StrategyContext) -> StrategyDecision:
         )
     market = context.markets[0]
     market_tokens = tuple(token for token in context.tokens if token.market_id == market.id)
-    yes = token_by_outcome(market_tokens, "yes")
-    no = token_by_outcome(market_tokens, "no")
-    if len(market_tokens) != 2 or yes is None or no is None:
+    tokens_by_position = {token.position: token for token in market_tokens}
+    first = tokens_by_position.get(0)
+    second = tokens_by_position.get(1)
+    if (
+        len(market_tokens) != 2
+        or len(tokens_by_position) != 2
+        or first is None
+        or second is None
+    ):
         return not_evaluable(
             context,
             DecisionReason.INPUT_METADATA_MISSING,
-            "binary_yes_no_mapping_incomplete",
+            "binary_position_mapping_incomplete",
         )
-    required = (yes, no)
+    required = (first, second)
     actions = (
         (Action.BUY, Action.BUY)
         if context.strategy_type is StrategyType.BINARY_UNDERPRICED
@@ -87,8 +92,8 @@ def _evaluate_binary(context: StrategyContext) -> StrategyDecision:
     if invalid is not None:
         return invalid
     if context.strategy_type is StrategyType.BINARY_UNDERPRICED:
-        return _underpriced(context, market, yes, no)
-    return _overpriced(context, market, yes, no)
+        return _underpriced(context, market, first, second)
+    return _overpriced(context, market, first, second)
 
 
 def _underpriced(context, market, yes, no) -> StrategyDecision:

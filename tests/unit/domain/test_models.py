@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
 from types import MappingProxyType
 
@@ -111,6 +111,7 @@ def _strategy_config() -> StrategyConfig:
         safety_buffer_rate=Decimal("0.0025"),
         conversion_cost=Decimal("0"),
         maximum_book_age_ms=2_000,
+        exchange_clock_skew_warning_ms=100,
         maximum_leg_skew_ms=500,
     )
 
@@ -500,6 +501,7 @@ def test_strategy_context_is_deeply_immutable_and_canonical() -> None:
         orderbooks=(book_a,),
         fee_schedules={"token-a": schedule},
         evaluated_at=200,
+        fee_schedule_evaluated_at=200,
         configuration=_strategy_config(),
     )
 
@@ -508,6 +510,10 @@ def test_strategy_context_is_deeply_immutable_and_canonical() -> None:
     assert isinstance(context.fee_schedules, MappingProxyType)
     with pytest.raises(TypeError):
         context.fee_schedules["token-b"] = schedule  # type: ignore[index]
+    with pytest.raises(ValueError, match="evaluated_at"):
+        replace(context, evaluated_at=-1)
+    with pytest.raises(ValueError, match="fee_schedule_evaluated_at"):
+        replace(context, fee_schedule_evaluated_at=-1)
 
 
 def test_signal_leg_enforces_trade_and_conversion_payloads() -> None:
