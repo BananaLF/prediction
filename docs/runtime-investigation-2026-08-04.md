@@ -986,3 +986,13 @@
 - 后台同步：第六轮完整同步于 08:24:26 异步启动，08:33:19 完成，耗时 533,552ms，看到 137,769 个市场和 275,538 个 token，发布 513 个有效变化。Watch 在同步期间持续消费、评估和恢复，未被同步阻塞。
 - 无信号直接原因：本区间最佳实际收益率为 `-0.00894280`，低于要求的 `0.00750000`，差约 1.64 个百分点；同步后的完整评估也持续产出。部分低活跃 token 的 exchange timestamp 明显落后于接收时间时，系统仍使用预测市场水位并由 freshness 规则拒绝陈旧盘口；后续活跃候选的时差已回到约 614ms，未发现系统市场时间整体倒退。
 - 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待本轮新 revision 和对应 `signal_transition`。
+
+## 09:17 半小时复验检查点
+
+- 运行连续性：08:47–09:17 共输出 180 条完整评估摘要、14,904 条 cache revision 推进后的旧批次主动中止日志；`ERROR=0`、`signal_transition=0`。SDK 行情速率峰值约 1,448.4 events/s，完整摘要持续产出。
+- 连接风暴：09:00:46–09:06:07 共发生 15 次 WebSocket 断线，其中 5 次服务端明确返回 `1013 slow consumer: send buffer full`，10 次为 `1006`；9 次 `1006` 的 parser exception 明确为截断 frame EOF，另一次是关闭超时。所有 close 回调仍记录 `websocket_frame_queue_size=0`、`high=16`、`paused=False`。从 09:06:07 到检查点未再断线，说明该问题仍呈时段性。
+- 当前定位边界：`websockets 15` 官方文档确认默认 `max_queue=16` 是入站 frame 高水位，超过后会暂停网络读取并形成 TCP backpressure；同时该版本客户端默认自动使用系统代理。本机启用了系统 SOCKS 代理，项目没有显式覆盖，早前缺少 `python-socks` 的启动错误也证明 WebSocket 实际选择了 SOCKS 路径。close 回调发生在连接收尾，队列为 0 不能排除回调前瞬时积压；连续截断 frame 也使代理/网络传输路径成为同等可疑项。现有证据仍不足以在“瞬时 frame 回压、代理链路截断、服务端发送策略”之间确定唯一根因，因此按已确认方案保持当前进程和网络路径不变，继续观察，不猜测性修改 SDK 私有缓冲。
+- fail-closed 与恢复：15 次断线和 4 次 ISSUE-095 矛盾盘口均使旧 generation 立即失效；本窗口共完成 22 次 recovery，通常约 0.9–1.6 秒。一次恢复缺少 5 个市场的 10 本订单簿，先剪枝到 44 markets/88 tokens；新 generation 尚无市场时间时记录 `watch_signal_mutation_skipped`，没有使用主机时间伪造 revision，候选补位后恢复到 50 markets/100 tokens。runtime 未退出。
+- 后台同步：第七轮完整同步于 09:03:20 异步启动，09:12:14 完成，耗时 534,001ms，看到 137,555 个市场和 275,110 个 token，发布 488 个有效变化。同步发布的 `MARKET_UPDATED` 正常触发 generation 87 换代，989ms 内取得完整 100-token baseline；Watch 全程持续消费和评估。
+- 无信号直接原因：本区间最佳实际收益率为 `-0.01474047`，低于要求的 `0.00750000`，差约 2.22 个百分点；没有证据表明信号被同步、订阅、评估或 SQLite 阻塞。
+- 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，最新 revision 关联查询与基线一致，`PRAGMA quick_check=ok`。继续保持进程运行，等待本轮新 revision 和对应 `signal_transition`。
