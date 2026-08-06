@@ -968,3 +968,11 @@
 - 后台同步：第五轮完整同步于 07:45:08 异步启动，检查点时仍在分页抓取；Watch 同期持续消费、恢复和评估，没有被同步阻塞。
 - 无信号直接原因：本区间最佳实际收益率为 `-0.00493403`，低于要求的 `0.00750000`，差约 1.24 个百分点；174 次完整摘要持续产出，没有评估停止证据。
 - 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待本轮新 revision 和对应 `signal_transition`。
+
+## 08:17 半小时复验检查点
+
+- 运行连续性：07:47–08:17 共输出 174 条完整评估摘要、8,049 条 cache revision 推进后的旧批次主动中止日志；`connection_lost=0`、`watch_price_change_invalid=0`、`ERROR=0`、`signal_transition=0`。SDK 行情速率峰值约 109.7 events/s。
+- 后台同步与换代：07:45 启动的第五轮完整同步于 07:54:25 完成，耗时 556,991ms，处理 138,063 个市场和 276,126 个 token。同步提交只触发一次 catalog 换代恢复，generation 53 在 1,929ms 内取得完整 baseline 并维持 50 markets/100 tokens；其余同代目录通知被合并，Watch 全程持续评估。
+- 稳定性结论：本区间没有 WebSocket 断线、盘口一致性失效、范围剪枝或 signal mutation 跳过；同步结束后 generation 53 持续有效。上一窗口的断线风暴没有延续到本窗口，说明外部连接问题具有明显时段性，不能简单归因于固定的应用处理能力不足。
+- 无信号直接原因：本区间最佳实际收益率为 `-0.00818889`，低于要求的 `0.00750000`，差约 1.57 个百分点；完整评估持续产出，没有评估停止证据。
+- 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待本轮新 revision 和对应 `signal_transition`。
