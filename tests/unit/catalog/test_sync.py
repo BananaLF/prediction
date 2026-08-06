@@ -10,11 +10,17 @@ from typing import Any
 
 import pytest
 
+import predmarket.catalog.sync as sync_module
 from predmarket.catalog.changes import MarketChange, MarketChangeType
-from predmarket.catalog.sync import SyncMarketTask
+from predmarket.catalog.sync import (
+    SyncMarketTask,
+    _changes_for_delivery,
+    _log_orphan_warnings,
+)
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.persistence.repositories import (
     CatalogRepository,
+    CatalogSnapshot,
     SystemEventRepository,
 )
 from predmarket.persistence.writer import DatabaseWriter
@@ -150,6 +156,88 @@ class _RecordingQueue:
             assert await self._repository.get_market(change.market_id) is not None
         self.items.append(change)
         return self._admit
+
+
+def _change(
+    market_id: str,
+    *,
+    change_type: MarketChangeType = MarketChangeType.MARKET_ADDED,
+    critical: bool = False,
+) -> MarketChange:
+    return MarketChange(
+        change_id=f"sync:{change_type.value}:{market_id}",
+        change_type=change_type,
+        event_id=None,
+        market_id=market_id,
+        token_ids=(f"{market_id}-token",),
+        occurred_at=100,
+        critical=critical,
+    )
+
+
+def test_changes_for_delivery_coalesces_bulk_droppable_refresh() -> None:
+    changes = tuple(_change(f"market-{index}") for index in range(12))
+    critical = _change(
+        "market-critical",
+        change_type=MarketChangeType.MARKET_DEACTIVATED,
+        critical=True,
+    )
+
+    selected, coalesced = _changes_for_delivery(changes + (critical,), capacity=10)
+
+    assert selected == (changes[0], critical)
+    assert coalesced == 11
+
+
+def test_changes_for_delivery_preserves_batch_within_capacity() -> None:
+    changes = tuple(_change(f"market-{index}") for index in range(3))
+
+    selected, coalesced = _changes_for_delivery(changes, capacity=10)
+
+    assert selected == changes
+    assert coalesced == 0
+
+
+def test_changes_for_delivery_coalesces_critical_catalog_wakeups() -> None:
+    updates = tuple(
+        _change(
+            f"market-{index}",
+            change_type=MarketChangeType.MARKET_UPDATED,
+            critical=True,
+        )
+        for index in range(12)
+    )
+    deactivated = _change(
+        "market-closed",
+        change_type=MarketChangeType.MARKET_DEACTIVATED,
+        critical=True,
+    )
+
+    selected, coalesced = _changes_for_delivery(
+        updates + (deactivated,),
+        capacity=10,
+    )
+
+    assert selected == (updates[0], deactivated)
+    assert coalesced == 11
+
+
+def test_orphan_warning_logs_are_sampled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    warnings = tuple(f"market market-{index} parent event missing" for index in range(12))
+
+    with caplog.at_level(logging.WARNING, logger="predmarket.catalog.sync"):
+        _log_orphan_warnings(warnings)
+
+    records = [
+        record
+        for record in caplog.records
+        if record.message.startswith("sync_market_parent_missing ")
+    ]
+    assert len(records) == 11
+    assert "market market-0" in records[0].message
+    assert records[-1].message.endswith("total=12 omitted=2")
 
 
 class _FailingCatalog:
@@ -330,6 +418,7 @@ async def _seed(
 async def test_complete_generation_drains_gateway_and_commits_before_publish(
     catalog_runtime,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     catalog, system_events = catalog_runtime
     gateway = _FakeGateway(
@@ -345,6 +434,14 @@ async def test_complete_generation_drains_gateway_and_commits_before_publish(
         clock_ms=lambda: 100,
         generation_factory=lambda: "sync-1",
     )
+    threaded_functions: list[str] = []
+    original_to_thread = asyncio.to_thread
+
+    async def recording_to_thread(function, /, *args, **kwargs):
+        threaded_functions.append(function.__name__)
+        return await original_to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(sync_module.asyncio, "to_thread", recording_to_thread)
 
     with caplog.at_level(logging.INFO, logger="predmarket.catalog.sync"):
         result = await task.run_once()
@@ -360,6 +457,33 @@ async def test_complete_generation_drains_gateway_and_commits_before_publish(
         and "markets_persisted=2" in record.getMessage()
         for record in caplog.records
     )
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        message.startswith("sync_started sync_generation=sync-1")
+        for message in messages
+    )
+    for stage in (
+        "events_fetch",
+        "markets_fetch",
+        "catalog_load",
+        "settlement_refresh",
+        "catalog_prepare",
+        "catalog_persist",
+    ):
+        assert any(
+            message.startswith(
+                f"sync_stage_started sync_generation=sync-1 stage={stage}"
+            )
+            for message in messages
+        )
+        assert any(
+            message.startswith(
+                f"sync_stage_completed sync_generation=sync-1 stage={stage}"
+            )
+            and "elapsed_ms=" in message
+            for message in messages
+        )
+    assert "_prepare_complete" in threaded_functions
     assert gateway.event_calls == gateway.market_calls == 1
     assert [change.change_type for change in queue.items] == [
         MarketChangeType.MARKET_ADDED,
@@ -406,6 +530,107 @@ async def test_complete_generation_accepts_orphan_markets_and_empty_events(
     assert [(change.change_type, change.event_id, change.market_id) for change in queue.items] == [
         (MarketChangeType.MARKET_ADDED, None, "market-orphan")
     ]
+
+
+async def test_prepare_complete_missing_events_is_linear() -> None:
+    event_count = 20_000
+    market_count = 10_000
+    events = tuple(
+        replace(_event(()), id=f"event-{index}")
+        for index in range(event_count)
+    )
+    snapshots = tuple(
+        replace(
+            _snapshot(f"market-{index}"),
+            market=replace(
+                _snapshot(f"market-{index}").market,
+                event_id="event-0",
+            ),
+        )
+        for index in range(market_count)
+    )
+    previous = CatalogSnapshot(
+        events=events,
+        markets=tuple(item.market for item in snapshots),
+        tokens=tuple(token for item in snapshots for token in item.tokens),
+    )
+
+    prepared = await asyncio.wait_for(
+        asyncio.to_thread(
+            sync_module._prepare_complete,
+            events=(),
+            snapshots=(),
+            previous=previous,
+            generation="sync-linear",
+            occurred_at=100,
+            published_market_ids=frozenset(),
+        ),
+        timeout=1.5,
+    )
+
+    assert len(prepared.events) == event_count
+    assert len(prepared.markets) == market_count
+
+
+def test_prepare_complete_only_selects_semantic_changes_for_upsert() -> None:
+    old_snapshot = _snapshot("market-1", generation="sync-old")
+    previous = CatalogSnapshot(
+        events=(_event(("market-1",), generation="sync-old"),),
+        markets=(old_snapshot.market,),
+        tokens=old_snapshot.tokens,
+    )
+
+    unchanged = sync_module._prepare_complete(
+        events=(_event(("market-1",)),),
+        snapshots=(_snapshot("market-1"),),
+        previous=previous,
+        generation="sync-new",
+        occurred_at=20,
+        published_market_ids=frozenset(),
+    )
+    changed = sync_module._prepare_complete(
+        events=(_event(("market-1",)),),
+        snapshots=(_snapshot("market-1", question="Changed?"),),
+        previous=previous,
+        generation="sync-new",
+        occurred_at=20,
+        published_market_ids=frozenset(),
+    )
+
+    assert unchanged.event_upserts == ()
+    assert unchanged.market_upserts == ()
+    assert unchanged.token_upserts == ()
+    assert tuple(market.id for market in changed.market_upserts) == ("market-1",)
+
+
+async def test_complete_generation_detaches_market_when_parent_event_is_missing(
+    catalog_runtime, caplog: pytest.LogCaptureFixture,
+) -> None:
+    catalog, system_events = catalog_runtime
+    snapshot = _snapshot("market-missing-parent")
+    snapshot = replace(
+        snapshot,
+        market=replace(snapshot.market, event_id="event-not-returned"),
+    )
+    task = SyncMarketTask(
+        gateway=_FakeGateway(events=(), markets=(snapshot,)),
+        catalog=catalog,
+        changes=_RecordingQueue(catalog),
+        system_events=system_events,
+        clock_ms=lambda: 105,
+        generation_factory=lambda: "sync-missing-parent",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="predmarket.catalog.sync"):
+        result = await task.run_once()
+
+    assert result.complete is True
+    stored_market = await catalog.get_market("market-missing-parent")
+    assert stored_market is not None
+    assert stored_market.event_id is None
+    assert stored_market.sync_generation_complete is True
+    assert any("event-not-returned" in warning for warning in result.warnings)
+    assert "sync_market_parent_missing" in caplog.text
 
 
 async def test_incomplete_generation_persists_orphan_market_snapshot(

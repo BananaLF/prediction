@@ -4,13 +4,16 @@ database:
   writer_queue_capacity: 1000
 
 polymarket:
-  sync_interval_seconds: 30
+  sync_interval_seconds: 1800
   request_timeout_seconds: 10
   reconnect_max_seconds: 60
   fee_schedule_max_age_seconds: 300
 
 runtime:
   market_change_queue_capacity: 10000
+  watch_market_limit: 50
+  watch_minimum_end_horizon_seconds: 1800
+  market_stream_queue_capacity: 65536
 
 strategy:
   bankroll: "1000"
@@ -20,6 +23,7 @@ strategy:
   safety_buffer_rate: "0.0025"
   conversion_cost: "0"
   maximum_book_age_ms: 1000
+  exchange_clock_skew_warning_ms: 100
   maximum_leg_skew_ms: 250
 
 signal:

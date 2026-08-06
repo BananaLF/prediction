@@ -9,7 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from predmarket.app import Supervisor, _SignalManagerRouter, _SubscriptionGenerationSource
+from predmarket.app import (
+    Supervisor,
+    _ApplicationContextSource,
+    _SignalManagerRouter,
+    _SubscriptionGenerationSource,
+)
 from predmarket.config import AppConfig, DatabaseConfig, NotificationConfig
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
@@ -24,7 +29,11 @@ from predmarket.domain.signal import (
     StrategyType,
 )
 from predmarket.notification.notifier import Notifier
-from predmarket.persistence.repositories import CatalogRepository, SignalRepository
+from predmarket.persistence.repositories import (
+    CatalogRepository,
+    RelationRepository,
+    SignalRepository,
+)
 from predmarket.persistence.schema import initialize_database
 from predmarket.persistence.writer import DatabaseWriter
 from predmarket.watch.cache import OrderBookCache
@@ -199,6 +208,103 @@ def _config(tmp_path: Path) -> AppConfig:
     )
 
 
+@pytest.mark.asyncio
+async def test_application_context_source_materializes_async_targets(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    initialize_database(config.database.path)
+    writer = DatabaseWriter(config.database.path)
+    await writer.start()
+    try:
+        catalog = CatalogRepository(config.database.path, writer)
+        market = Market(
+            id="market-context",
+            event_id="event-context",
+            condition_id="condition-context",
+            question="Context market?",
+            status=MarketStatus.ACTIVE,
+            active=True,
+            accepting_orders=True,
+            enable_orderbook=True,
+            sync_generation="sync-context",
+            sync_generation_complete=True,
+            tick_size=Decimal("0.01"),
+            minimum_order_size=Decimal("1"),
+        )
+        tokens = (
+            Token(
+                id="token-context-yes",
+                market_id=market.id,
+                outcome="YES",
+                position=0,
+                sync_generation="sync-context",
+                sync_generation_complete=True,
+            ),
+            Token(
+                id="token-context-no",
+                market_id=market.id,
+                outcome="NO",
+                position=1,
+                sync_generation="sync-context",
+                sync_generation_complete=True,
+            ),
+        )
+        await catalog.save_catalog(
+            events=(
+                Event(
+                    id="event-context",
+                    title="Context event",
+                    status=MarketStatus.ACTIVE,
+                    market_ids=(market.id,),
+                    sync_generation="sync-context",
+                    sync_generation_complete=True,
+                ),
+            ),
+            markets=(market,),
+            tokens=tokens,
+        )
+        source = _ApplicationContextSource(
+            config=config,
+            catalog=catalog,
+            relations=RelationRepository(config.database.path, writer),
+            signals=SignalRepository(config.database.path, writer),
+            clock_ms=lambda: 1_000,
+        )
+        books = tuple(
+            OrderBook(
+                market_id=market.id,
+                token_id=token.id,
+                bids=(OrderBookLevel(Decimal("0.40"), Decimal("3")),),
+                asks=(OrderBookLevel(Decimal("0.50"), Decimal("4")),),
+                subscription_generation=1,
+                book_hash=f"hash-{token.id}",
+                exchange_timestamp=900,
+                received_timestamp=950,
+                tick_size=Decimal("0.01"),
+                minimum_order_size=Decimal("1"),
+            )
+            for token in tokens
+        )
+
+        targets_by_token = await source.contexts_for_batch(
+            tuple(token.id for token in tokens),
+            books,
+        )
+        targets = targets_by_token[tokens[0].id]
+
+        assert tuple(target.opportunity_key for target in targets) == (
+            "BINARY_UNDERPRICED:market-context",
+            "BINARY_OVERPRICED:market-context",
+        )
+        assert tuple(target.opportunity_key for target in targets_by_token[tokens[1].id]) == (
+            "BINARY_UNDERPRICED:market-context",
+            "BINARY_OVERPRICED:market-context",
+        )
+    finally:
+        await writer.close()
+
+
 class _FailingNotifier:
     async def notify(self, **_: object) -> None:
         raise RuntimeError("notifier unavailable")
@@ -228,8 +334,12 @@ async def test_supervisor_syncs_before_watch_and_terminates_after_watch_crash(
     assert calls[-1] == "watch-close"
     assert output.getvalue() == ""
     assert "runtime_starting" in caplog.text
+    assert "runtime_build_started" in caplog.text
+    assert "runtime_built elapsed_ms=" in caplog.text
     assert "component_initialized component=database" in caplog.text
     assert "component_initialized component=watch_task" in caplog.text
+    assert "component_starting component=watch_bootstrap" in caplog.text
+    assert "component_started component=watch_bootstrap elapsed_ms=" in caplog.text
     assert "component_started component=watch_task" in caplog.text
     assert "component_started component=sync_task" in caplog.text
     assert "runtime_started" in caplog.text
@@ -511,6 +621,43 @@ async def test_supervisor_reports_pre_notifier_database_failures_to_terminal(
 
 
 @pytest.mark.asyncio
+async def test_supervisor_closes_partial_runtime_when_watch_construction_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer_close_calls = 0
+    original_writer_close = DatabaseWriter.close
+
+    async def track_writer_close(writer: DatabaseWriter) -> None:
+        nonlocal writer_close_calls
+        writer_close_calls += 1
+        await original_writer_close(writer)
+
+    class _Gateway:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    def fail_watch_construction(**_: object) -> _Watch:
+        raise RuntimeError("watch construction failed")
+
+    monkeypatch.setattr("predmarket.app.DatabaseWriter.close", track_writer_close)
+    gateway = _Gateway()
+    supervisor = Supervisor(
+        _config(tmp_path),
+        gateway=gateway,
+        sync_task_factory=lambda **_: _Sync([]),
+        watch_task_factory=fail_watch_construction,
+    )
+
+    assert await supervisor.run() == 1
+    assert writer_close_calls == 1
+    assert gateway.close_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_router_revalidates_generation_source_before_database_commit(tmp_path: Path) -> None:
     database_path = tmp_path / "signals.sqlite3"
     writer = DatabaseWriter(database_path)
@@ -520,18 +667,27 @@ async def test_router_revalidates_generation_source_before_database_commit(tmp_p
         router = _SignalManagerRouter(
             SignalRepository(database_path, writer),
             Notifier(terminal=StringIO()),
-            lambda: 1,
             subscription_generation=source,
         )
         decision = _persisted_open_signal()[3]
         with pytest.raises(ValueError, match="subscription generation is unavailable"):
-            await router.apply(decision, "BINARY_UNDERPRICED:market-1", None)
+            await router.apply(
+                decision,
+                "BINARY_UNDERPRICED:market-1",
+                None,
+                observed_at=1,
+            )
         cache = OrderBookCache()
         cache.begin_resync(generation=2, token_ids=("token-1",))
         cache.apply_snapshot((replace(decision.evidence[0], subscription_generation=2),))
         source.bind(cache)
         with pytest.raises(ValueError, match="stale subscription generation"):
-            await router.apply(decision, "BINARY_UNDERPRICED:market-1", None)
+            await router.apply(
+                decision,
+                "BINARY_UNDERPRICED:market-1",
+                None,
+                observed_at=1,
+            )
     finally:
         await writer.close()
 
@@ -631,7 +787,6 @@ async def test_router_closes_persisted_signal_after_restart_without_evaluation_c
         restarted_router = _SignalManagerRouter(
             signals,
             Notifier(terminal=StringIO()),
-            lambda: 2,
         )
 
         await restarted_router.close_for_tokens(
@@ -640,6 +795,7 @@ async def test_router_closes_persisted_signal_after_restart_without_evaluation_c
                 reason_code=DecisionReason.MARKET_CLOSED,
                 context={"detail": "initial sync made every token unwatchable"},
             ),
+            observed_at=2,
         )
 
         assert await signals.find_open_signal_id("BINARY_UNDERPRICED:market-1") is None

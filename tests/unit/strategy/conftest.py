@@ -20,6 +20,7 @@ def strategy_config_factory():
             "safety_buffer_rate": Decimal("0"),
             "conversion_cost": Decimal("0"),
             "maximum_book_age_ms": 1000,
+            "exchange_clock_skew_warning_ms": 100,
             "maximum_leg_skew_ms": 250,
         }
         values.update(overrides)
@@ -195,6 +196,7 @@ def context_factory(fee_factory, strategy_config_factory):
         changed_token_id: str | None = None,
         fees=None,
         evaluated_at: int = 1_000,
+        fee_schedule_evaluated_at: int = 1_000,
         configuration=None,
         fee_max_age_seconds: int | None = 10,
         supported_neg_risk_types: tuple[str, ...] = ("STANDARD",),
@@ -211,6 +213,7 @@ def context_factory(fee_factory, strategy_config_factory):
             orderbooks=tuple(orderbooks),
             fee_schedules=fees,
             evaluated_at=evaluated_at,
+            fee_schedule_evaluated_at=fee_schedule_evaluated_at,
             configuration=configuration or strategy_config_factory(),
             events=tuple(events),
             fee_schedule_max_age_seconds=fee_max_age_seconds,
