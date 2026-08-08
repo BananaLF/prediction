@@ -21,6 +21,7 @@ from predmarket.domain.signal import (
     StrategyType,
 )
 from predmarket.notification.notifier import Notifier, macos_desktop_notification
+from predmarket.persistence.catalog_migration import recover_v4_switch
 from predmarket.persistence.integrity import check_database_startup
 from predmarket.persistence.repositories import (
     CatalogSnapshot,
@@ -162,7 +163,8 @@ class Supervisor:
         self,
     ) -> tuple[DatabaseWriter, Any, Notifier, Any, Any]:
         # Initialize before the integrity read and before constructing the SDK
-        # boundary, so the v3 ten-table schema is an invariant of every run.
+        # boundary, so the current schema is an invariant of every run.
+        recover_v4_switch(self._config.database.path)
         initialize_database(self._config.database.path)
         check_database_startup(self._config.database.path)
         _LOGGER.info("component_initialized component=database")

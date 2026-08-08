@@ -1136,7 +1136,8 @@ def initialize_database(path: Path) -> None:
             return
         if version in {1, 2, 3}:
             raise ValueError(
-                f"database schema version {version} requires explicit migration to v4"
+                f"database schema version {version} requires explicit migration to v4; "
+                "run predmarket migrate --to 4 --database PATH"
             )
         raise ValueError(
             f"unsupported database schema version {version}; expected {SCHEMA_VERSION}"

@@ -354,6 +354,24 @@ def test_initialize_database_accepts_an_existing_schema_v4(tmp_path: Path) -> No
         )
 
 
+def test_initialize_database_rejects_v3_with_explicit_upgrade_command(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            "BEGIN IMMEDIATE;\n"
+            + SCHEMA_V3
+            + "\nPRAGMA user_version = 3;\nCOMMIT;\n"
+        )
+    original_bytes = database_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"predmarket migrate --to 4"):
+        initialize_database(database_path)
+
+    assert database_path.read_bytes() == original_bytes
+
+
 def test_initialize_database_rolls_back_a_partially_failing_schema_script(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

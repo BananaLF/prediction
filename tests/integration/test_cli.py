@@ -11,7 +11,7 @@ import pytest
 import yaml
 
 from predmarket.cli import _build_parser, _configure_logging, main
-from predmarket.persistence.schema import initialize_database
+from predmarket.persistence.schema import SCHEMA_V3, initialize_database
 
 
 def _config(tmp_path: Path, database_path: Path) -> Path:
@@ -81,6 +81,51 @@ def test_cli_has_service_inspection_migration_and_relation_commands() -> None:
     assert {"trade", "order", "wallet", "auth", "login"}.isdisjoint(
         action.choices
     )
+
+
+def test_migrate_v4_uses_an_automatic_backup_and_reports_it(tmp_path: Path) -> None:
+    database_path = tmp_path / "catalog.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            "BEGIN IMMEDIATE;\n"
+            + SCHEMA_V3
+            + "\nPRAGMA user_version = 3;\nCOMMIT;\n"
+        )
+
+    output = StringIO()
+    assert main(
+        ["migrate", "--to", "4", "--database", str(database_path)],
+        stdout=output,
+    ) == 0
+
+    payload = json.loads(output.getvalue())
+    backup = Path(payload["backup"])
+    assert payload == {
+        "backup": str(backup),
+        "database": str(database_path),
+        "schema_version": 4,
+    }
+    assert backup.exists()
+    assert backup.match("*.pre-v4.sqlite3")
+
+
+def test_migrate_cli_validates_backup_by_target(tmp_path: Path) -> None:
+    database_path = tmp_path / "catalog.sqlite3"
+
+    with pytest.raises(SystemExit):
+        main(["migrate", "--to", "2", "--database", str(database_path)])
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "migrate",
+                "--to",
+                "4",
+                "--database",
+                str(database_path),
+                "--backup",
+                str(tmp_path / "manual.sqlite3"),
+            ]
+        )
 
 
 def test_doctor_returns_zero_for_a_healthy_database(tmp_path: Path) -> None:

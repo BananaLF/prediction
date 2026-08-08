@@ -46,15 +46,20 @@ def main(
     clock = now_ms or (lambda: time.time_ns() // 1_000_000)
 
     if arguments.command == "migrate":
-        migrate_database(
+        if arguments.target_version == 2 and arguments.backup is None:
+            parser.error("--backup is required when --to 2")
+        if arguments.target_version == 4 and arguments.backup is not None:
+            parser.error("--backup must not be used when --to 4")
+        result = migrate_database(
             arguments.database,
             arguments.backup,
             target_version=arguments.target_version,
         )
+        backup = arguments.backup if result is None else result.backup
         _write_json(
             output,
             {
-                "backup": str(arguments.backup),
+                "backup": str(backup),
                 "database": str(arguments.database),
                 "schema_version": arguments.target_version,
             },
@@ -197,7 +202,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     migrate.add_argument("--to", dest="target_version", type=int, required=True)
     migrate.add_argument("--database", type=Path, required=True)
-    migrate.add_argument("--backup", type=Path, required=True)
+    migrate.add_argument("--backup", type=Path)
     doctor = commands.add_parser(
         "doctor",
         help="check database structure and persisted data without modifying it",
