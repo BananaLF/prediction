@@ -1006,3 +1006,52 @@
 - 后台同步：第八轮完整同步于 09:42:15 异步启动，检查点时仍在分页抓取；Watch 同期持续消费、恢复和评估，没有被同步阻塞。
 - 无信号直接原因：本区间最佳实际收益率为 `-0.00369826`，低于要求的 `0.00750000`，差约 1.12 个百分点；没有证据表明信号被同步、订阅、评估或 SQLite 阻塞。
 - 数据库证据：`arbitrage_signals=2` 且均为启动前已有的 `CLOSED`，`signal_revisions=4`、最大 `observed_at=1785828290572`，`PRAGMA quick_check=ok`。继续保持进程运行，等待本轮新 revision 和对应 `signal_transition`。
+
+## 第一阶段运行时协调实施与 30 分钟复验（2026-08-08）
+
+### 实施结果
+
+- 完整 catalog 同步改为每代一个 `CATALOG_RECONCILED` 控制消息；catalog 提交同时写入 `CATALOG_RECONCILIATION_READY`，队列接纳后幂等写入 `MARKET_CHANGE_PUBLISHED`，下次同步会在远端抓取前重发尚未接纳的 ready 记录。逐市场 semantic delta 仅保留为诊断统计，旧的逐市场控制消息处理仍兼容。
+- Watch 收到聚合消息后只加载一次已提交 catalog、计算一次订阅范围，并批量协调全部 open signal；关闭原因按 `EVENT_SETTLED`、`MARKET_CLOSED`、`ORDERBOOK_INVALID` 分类，最终写入继续使用 CAS 防止并发陈旧状态覆盖。
+- 评估围栏从全局 cache revision 收窄为目标实际依赖的 token revisions，同时保留 generation barrier、失效即 fail-closed，以及最终检查和 signal 写入之间的 operation lock。
+- 队列统计改为记录实际 overflow 检测时间、容量、high-water mark 和累计 admission/drop/backpressure 计数，并按聚合时间窗最多上报一次；关键 catalog 控制消息仍不可丢弃。
+
+### 有效观测方法与完整性边界
+
+在隔离 worktree 中复制基线数据库后，以 worktree 源码优先级启动只读外部 observer：
+
+```bash
+env PYTHONPATH=/Users/lifei/workspace/earn_money_from_prediction/.worktrees/phase1-runtime-reconciliation \
+  /Users/lifei/workspace/earn_money_from_prediction/.venv/bin/predmarket \
+  --config config/default.yaml run --log-level INFO
+```
+
+- 有效日志：`/private/tmp/phase1-runtime-observer-valid-2026-08-08.log`；运行区间为 `2026-08-08 00:25:32.968` 至 `00:55:55.310`，超过 30 分钟，随后通过 `Ctrl-C` 正常退出，退出码为 0。
+- 第一次尝试未显式设置 `PYTHONPATH`，共享 editable entrypoint 因而载入主 worktree 的旧源码。该次结果从比较中排除；它只写入隔离副本，未修改主数据库，副本和日志分别保留在 `/private/tmp/phase1-invalid-observer-data/predmarket-v1.sqlite3` 与 `/private/tmp/phase1-runtime-observer-2026-08-08.log`，便于审计。
+
+### 30 分钟测量结果
+
+- generation `sync-ea587f9947824a2f987d34cf0965830c` 看到 136,471 个市场、272,942 个 token，持久化 223,244 个市场行，semantic changes 为 143,435；同步耗时 467,899ms。
+- 该 generation 只产生 1 条 `CATALOG_RECONCILIATION_READY`、1 条 `MARKET_CHANGE_PUBLISHED` 和 1 个队列控制消息，三者共享 change id `sync-ea587f9947824a2f987d34cf0965830c:CATALOG_RECONCILED:catalog`。同期还新增 1 条 `SETTLEMENT_REFRESH_CURSOR` 和 1 条 `SYNC_MARKET_SKIPPED`，`system_events` 总计只增长 4 行；历史 `MARKET_CHANGE_QUEUE_OVERFLOW` 计数保持 7,376，没有新增 overflow 或 drop/backpressure 日志。
+- 队列从空队列开始，本轮仅接纳上述 1 个聚合控制，因此该比较区间的 high-water mark 为 1，远低于容量 10,000。当前非 overflow 路径不会在退出时额外输出 metrics 行；该值由空队列起点和唯一一次 `put` 推导，并非独立 shutdown telemetry 样本。
+- Watch 完成 2 次 bulk signal reconciliation（启动时一次、catalog 换代一次），输出 168 条完整 `watch_evaluation_summary`。`arbitrage_signals/signal_revisions/signal_legs` 始终为 `2/4/12`，open signal 为 0，`watch_signal_mutation_skipped=0`，未发现陈旧 signal 写入。
+- 初始完整评估为 100 tokens、200 generated targets、100 targets、0 persisted signals。区间内最佳实际收益率为 `-0.00697156`（约 `-0.697156%`），低于要求的 `+0.75%`，差约 1.447156 个百分点，因此没有新信号符合门槛。
+- 共记录 1,410 次主动中止，其中 919 次发生在 strategy 前、491 次发生在 strategy 后、0 次发生在 batch context 后；这些中止均对应目标所依赖 token 的 revision 推进，不再由无关 token 的全局 revision 变化触发。
+- 运行结束后 `PRAGMA quick_check=ok`。doctor 仍只有 `EVENT_MARKETS_MISMATCH` 与 `RISK_FORMULA_INVALID` 两类既有 finding；隔离副本分别涉及 9 个 event 和既有 2 条 signal revision，主工作区当时基线为相同两种 finding code（catalog 快照已随时间变化，故不作逐行相等声明），没有新增 finding 类别。
+
+### 未达标项与剩余风险
+
+- 系统事件增长已从逐市场风暴降为每代 O(1)，队列也没有发生 overflow；但有效观测期间 WAL 峰值仍达到 762,397,792 bytes（约 727 MiB），与此前约 716 MB 的峰值相比没有实质下降，因此“WAL 明显变小”验收项未通过。
+- WAL 在完整 catalog 原子持久化期间增长并随后维持高位；同步前约 5 分钟时 WAL 仅 1,738,672 bytes。现有证据把剩余放大源收窄到既有的大型 catalog 写事务，而不是本阶段已经消除的逐市场 system-event 发布风暴。
+- 下一阶段应单独设计 catalog 的增量/分块落库、generation 元数据与 checkpoint 边界，并验证原子可见性和崩溃恢复语义；本阶段不在缺少设计与失败测试的情况下猜测性拆分事务。
+
+### 最终代码验证
+
+```bash
+/Users/lifei/workspace/earn_money_from_prediction/.venv/bin/pytest -q
+git diff --check
+git status --short
+```
+
+- 全量测试结果：`657 passed, 1 skipped`，无失败；2,782 条 warning 均来自 Python 3.14 下 `pytest-asyncio` 已弃用的 event-loop policy API。
+- `git diff --check` 通过。变更保留在隔离分支 `codex/phase1-runtime-reconciliation`，未 commit、push 或 deploy。

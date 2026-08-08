@@ -184,39 +184,187 @@ class SignalManager:
         *,
         observed_at: int,
     ) -> tuple[str, ...]:
-        """Close persisted OPEN signals whose legs are absent from the catalog."""
+        """Compatibility wrapper for catalog-aware open-signal reconciliation."""
+
+        return await self.reconcile_open_signals(
+            active_token_ids,
+            observed_at=observed_at,
+        )
+
+    async def reconcile_open_signals(
+        self,
+        active_token_ids: Sequence[str],
+        *,
+        catalog_generation: str | None = None,
+        observed_at: int | None,
+    ) -> tuple[str, ...]:
+        """Close OPEN signals that conflict with one committed catalog view."""
 
         active = frozenset(active_token_ids)
-        if type(observed_at) is not int or observed_at < 0:
-            raise ValueError("observed_at must be a non-negative integer")
+        if any(
+            not isinstance(token_id, str) or not token_id
+            for token_id in active
+        ):
+            raise ValueError("active_token_ids must contain non-empty strings")
+        if observed_at is not None and (
+            type(observed_at) is not int or observed_at < 0
+        ):
+            raise ValueError("observed_at must be a non-negative integer or None")
+        if catalog_generation is not None and (
+            not isinstance(catalog_generation, str) or not catalog_generation
+        ):
+            raise ValueError("catalog_generation must be a non-empty string or None")
         rows = await _read_all(
             self._repository._path,  # noqa: SLF001
             """
-            SELECT DISTINCT l.token_id
+            SELECT s.opportunity_key, s.latest_revision,
+                   l.token_id, l.market_id,
+                   t.id, t.sync_generation_complete,
+                   m.id, m.status, m.active, m.accepting_orders,
+                   m.enable_orderbook, m.sync_generation_complete,
+                   e.id, e.status, e.sync_generation_complete
             FROM arbitrage_signals AS s
             JOIN signal_legs AS l ON l.signal_id = s.id AND l.revision = s.latest_revision
+            LEFT JOIN tokens AS t
+                ON t.id = l.token_id AND t.market_id = l.market_id
+            LEFT JOIN markets AS m ON m.id = l.market_id
+            LEFT JOIN events AS e ON e.id = m.event_id
             WHERE s.status = 'OPEN'
+            ORDER BY s.opened_at, s.id, l.position
             """,
             (),
         )
-        unavailable = tuple(
-            sorted(
-                {str(row[0]) for row in rows if str(row[0]) not in active},
-                key=lambda value: value.encode("utf-8"),
+        grouped: dict[tuple[str, int], list[tuple[Any, ...]]] = {}
+        for row in rows:
+            grouped.setdefault((str(row[0]), int(row[1])), []).append(tuple(row))
+
+        closed: list[str] = []
+        for (opportunity_key, revision), legs in grouped.items():
+            reason = _catalog_reconciliation_reason(legs, active)
+            if reason is None:
+                continue
+            token_ids = tuple(
+                sorted(
+                    {
+                        str(row[2])
+                        for row in legs
+                        if row[2] is not None
+                    },
+                    key=lambda value: value.encode("utf-8"),
+                )
             )
-        )
-        if not unavailable:
-            return ()
-        return await self.close_for_tokens(
-            unavailable,
-            NotEvaluable(
-                reason_code=DecisionReason.MARKET_CLOSED,
+            decision = NotEvaluable(
+                reason_code=reason,
                 context={
-                    "detail": "startup catalog recovery found an unwatchable signal leg",
-                    "token_ids": unavailable,
+                    "detail": "catalog_reconciliation",
+                    "token_ids": token_ids,
                 },
-            ),
-            observed_at=observed_at,
+            )
+            signal_id = await self._apply_catalog_reconciliation(
+                decision,
+                opportunity_key,
+                revision,
+                catalog_generation=catalog_generation,
+                observed_at=observed_at,
+            )
+            if signal_id is not None:
+                closed.append(signal_id)
+        return tuple(closed)
+
+    async def _apply_catalog_reconciliation(
+        self,
+        decision: NotEvaluable,
+        opportunity_key: str,
+        expected_revision: int,
+        *,
+        catalog_generation: str | None,
+        observed_at: int | None,
+    ) -> str | None:
+        async with self._apply_lock:
+            try:
+                result = await self._repository._writer.execute(  # noqa: SLF001
+                    lambda connection: self._apply_catalog_reconciliation_transaction(
+                        connection,
+                        decision=decision,
+                        opportunity_key=opportunity_key,
+                        expected_revision=expected_revision,
+                        catalog_generation=catalog_generation,
+                        observed_at=observed_at,
+                    )
+                )
+            except SignalRevisionConflict:
+                return None
+            if result is not None:
+                await self._notify_after_commit(result)
+            return None if result is None else result.signal_id
+
+    async def _apply_catalog_reconciliation_transaction(
+        self,
+        connection: aiosqlite.Connection,
+        *,
+        decision: NotEvaluable,
+        opportunity_key: str,
+        expected_revision: int,
+        catalog_generation: str | None,
+        observed_at: int | None,
+    ) -> SignalNotification | None:
+        if catalog_generation is not None:
+            cursor = await connection.execute(
+                """
+                SELECT COUNT(DISTINCT sync_generation),
+                       MIN(sync_generation_complete),
+                       MIN(sync_generation)
+                FROM (
+                    SELECT sync_generation, sync_generation_complete FROM events
+                    UNION ALL
+                    SELECT sync_generation, sync_generation_complete FROM markets
+                    UNION ALL
+                    SELECT sync_generation, sync_generation_complete FROM tokens
+                )
+                """
+            )
+            row = await cursor.fetchone()
+            if (
+                row is None
+                or int(row[0]) != 1
+                or not bool(row[1])
+                or str(row[2]) != catalog_generation
+            ):
+                _LOGGER.info(
+                    "signal_catalog_reconciliation_skipped opportunity_key=%s "
+                    "expected_catalog_generation=%s actual_catalog_generation=%s",
+                    opportunity_key,
+                    catalog_generation,
+                    None if row is None else row[2],
+                )
+                return None
+
+        resolved_observed_at = observed_at
+        if resolved_observed_at is None:
+            cursor = await connection.execute(
+                """
+                SELECT r.observed_at
+                FROM arbitrage_signals AS s
+                JOIN signal_revisions AS r
+                  ON r.signal_id = s.id AND r.revision = s.latest_revision
+                WHERE s.opportunity_key = ?
+                  AND s.status = 'OPEN'
+                  AND s.latest_revision = ?
+                ORDER BY s.opened_at, s.id
+                LIMIT 1
+                """,
+                (opportunity_key, expected_revision),
+            )
+            revision_row = await cursor.fetchone()
+            if revision_row is None:
+                return None
+            resolved_observed_at = int(revision_row[0])
+        return await self._apply_transaction(
+            connection,
+            decision=decision,
+            opportunity_key=opportunity_key,
+            expected_revision=expected_revision,
+            observed_at=resolved_observed_at,
         )
 
     async def _current_expected_revision(self, opportunity_key: str) -> int | None:
@@ -682,6 +830,38 @@ def _canonical_ids(values: Sequence[str]) -> tuple[str, ...]:
     if not values or any(not isinstance(value, str) or not value for value in values):
         raise ValueError("market_ids must contain non-empty strings")
     return tuple(sorted(set(values), key=lambda value: value.encode("utf-8")))
+
+
+def _catalog_reconciliation_reason(
+    legs: Sequence[tuple[Any, ...]],
+    active_token_ids: frozenset[str],
+) -> DecisionReason | None:
+    if any(
+        row[7] == MarketStatus.RESOLVED.value
+        or row[13] == MarketStatus.RESOLVED.value
+        for row in legs
+    ):
+        return DecisionReason.EVENT_SETTLED
+    if any(
+        row[6] is None
+        or row[12] is None
+        or row[7] != MarketStatus.ACTIVE.value
+        or not bool(row[8])
+        or not bool(row[9])
+        or not bool(row[10])
+        or not bool(row[11])
+        or row[13] != MarketStatus.ACTIVE.value
+        or not bool(row[14])
+        or (row[2] is not None and (row[4] is None or not bool(row[5])))
+        for row in legs
+    ):
+        return DecisionReason.MARKET_CLOSED
+    if any(
+        row[2] is not None and str(row[2]) not in active_token_ids
+        for row in legs
+    ):
+        return DecisionReason.ORDERBOOK_INVALID
+    return None
 
 
 def _canonical_market_ids_json(decision: OpportunityPresent) -> str:

@@ -347,7 +347,7 @@ def _persisted_open_signal() -> tuple[Event, Market, Token, OpportunityPresent]:
     "change_type",
     (MarketChangeType.MARKET_DEACTIVATED, MarketChangeType.EVENT_SETTLED),
 )
-async def test_queued_control_change_without_market_watermark_skips_persisted_signal_mutation(
+async def test_queued_control_change_without_market_watermark_does_not_reclose_signal(
     tmp_path: Path,
     change_type: MarketChangeType,
     caplog: pytest.LogCaptureFixture,
@@ -421,7 +421,18 @@ async def test_queued_control_change_without_market_watermark_skips_persisted_si
             await asyncio.wait_for(changes.join(), timeout=0.1)
             assert await signals.find_open_signal_id(
                 "BINARY_UNDERPRICED:market-1"
-            ) == "persisted-signal"
+            ) is None
+            with sqlite3.connect(database_path) as connection:
+                signal_row = connection.execute(
+                    "SELECT status, latest_revision, close_reason, closed_at "
+                    "FROM arbitrage_signals WHERE id = 'persisted-signal'"
+                ).fetchone()
+                observed_times = connection.execute(
+                    "SELECT observed_at FROM signal_revisions "
+                    "WHERE signal_id = 'persisted-signal' ORDER BY revision"
+                ).fetchall()
+            assert signal_row == ("CLOSED", 2, "MARKET_CLOSED", 1)
+            assert observed_times == [(1,), (1,)]
             assert any(
                 record.getMessage().startswith("watch_signal_mutation_skipped ")
                 and "operation=close_for_tokens" in record.getMessage()
@@ -437,7 +448,7 @@ async def test_queued_control_change_without_market_watermark_skips_persisted_si
 
 
 @pytest.mark.asyncio
-async def test_start_without_market_watermark_skips_unwatchable_signal_mutation(
+async def test_start_without_market_watermark_reuses_latest_signal_time(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -492,10 +503,23 @@ async def test_start_without_market_watermark_skips_unwatchable_signal_mutation(
         assert watch.active_token_ids == ()
         assert await signals.find_open_signal_id(
             "BINARY_UNDERPRICED:market-1"
-        ) == "persisted-signal"
+        ) is None
+        with sqlite3.connect(database_path) as connection:
+            signal_row = connection.execute(
+                "SELECT status, latest_revision, close_reason, closed_at "
+                "FROM arbitrage_signals WHERE id = 'persisted-signal'"
+            ).fetchone()
+            observed_times = connection.execute(
+                "SELECT observed_at FROM signal_revisions "
+                "WHERE signal_id = 'persisted-signal' ORDER BY revision"
+            ).fetchall()
+        assert signal_row == ("CLOSED", 2, "MARKET_CLOSED", 1)
+        assert observed_times == [(1,), (1,)]
         assert any(
-            record.getMessage().startswith("watch_signal_mutation_skipped ")
-            and "operation=close_unwatchable_for_active_tokens" in record.getMessage()
+            record.getMessage().startswith(
+                "watch_signal_reconciliation_using_latest_signal_time "
+            )
+            and "operation=reconcile_open_signals" in record.getMessage()
             and "generation=0" in record.getMessage()
             and "market_time=None" in record.getMessage()
             for record in caplog.records

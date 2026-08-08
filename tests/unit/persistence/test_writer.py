@@ -12,6 +12,7 @@ import pytest
 
 import predmarket.persistence.repositories as repositories_module
 import predmarket.persistence.writer as writer_module
+from predmarket.catalog.changes import MarketChange, MarketChangeType
 from predmarket.catalog.relations import semantic_evidence_digest
 from predmarket.domain.fees import FeeModel, FeeSchedule
 from predmarket.domain.market import Event, Market, MarketStatus, Token
@@ -1029,6 +1030,60 @@ async def test_complete_catalog_save_does_not_overwrite_newer_watch_refresh(
     assert stored.tokens == (
         replace(refreshed_token, sync_generation="sync-2"),
     )
+
+
+async def test_complete_catalog_save_stores_one_pending_reconciliation(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    catalog = CatalogRepository(database_path, writer)
+    system_events = SystemEventRepository(database_path, writer)
+    reconciliation = MarketChange(
+        change_id="sync-2:CATALOG_RECONCILED:catalog",
+        change_type=MarketChangeType.CATALOG_RECONCILED,
+        event_id=None,
+        market_id=None,
+        token_ids=(),
+        occurred_at=20,
+        critical=True,
+    )
+    try:
+        for _ in range(2):
+            await catalog.save_complete_catalog(
+                generation="sync-2",
+                updated_at=20,
+                events=(),
+                markets=(),
+                tokens=(),
+                reconciliation_change=reconciliation,
+                reconciliation_market_ids=("market-2", "market-1"),
+            )
+
+        pending = await system_events.list_pending_catalog_reconciliations()
+        rows = await system_events.read_after(0)
+        assert pending == (
+            repositories_module.PendingCatalogReconciliation(
+                change=reconciliation,
+                market_ids=("market-1", "market-2"),
+            ),
+        )
+        assert [row["event_type"] for row in rows] == [
+            "CATALOG_RECONCILIATION_READY"
+        ]
+
+        await system_events.record_market_change_published(
+            reconciliation,
+            market_ids=("market-1", "market-2"),
+        )
+
+        assert await system_events.list_pending_catalog_reconciliations() == ()
+        assert await system_events.list_published_market_ids() == frozenset(
+            {"market-1", "market-2"}
+        )
+    finally:
+        await writer.close()
 
 
 async def test_catalog_load_order_uses_existing_primary_key_indexes(

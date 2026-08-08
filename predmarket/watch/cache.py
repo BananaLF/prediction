@@ -22,6 +22,14 @@ class CacheInvalidatedError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class TokenRevisionSnapshot:
+    """Immutable token revisions captured from one valid cache generation."""
+
+    generation: int
+    revisions: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class OrderBookDelta:
     """One canonical SDK price change with its opaque post-book hash."""
 
@@ -65,6 +73,7 @@ class OrderBookCache:
         self._revision = 0
         self._expected_token_ids: tuple[str, ...] = ()
         self._books: dict[str, OrderBook] = {}
+        self._token_revisions: dict[str, int] = {}
         self._invalid_reason: str | None = "not_initialized"
 
     @property
@@ -97,6 +106,7 @@ class OrderBookCache:
         self._last_sequence = 0
         self._expected_token_ids = normalized
         self._books.clear()
+        self._token_revisions.clear()
         self._state = CacheState.RESYNCING
         self._invalid_reason = None
 
@@ -128,6 +138,7 @@ class OrderBookCache:
             self._fail_closed(str(error))
 
         self._books = by_token
+        self._token_revisions = {token_id: 1 for token_id in by_token}
         self._state = CacheState.VALID
         self._invalid_reason = None
         self._revision += 1
@@ -157,6 +168,10 @@ class OrderBookCache:
         if book == current:
             return False
         self._books = {**self._books, book.token_id: book}
+        self._token_revisions = {
+            **self._token_revisions,
+            book.token_id: self._token_revisions[book.token_id] + 1,
+        }
         self._revision += 1
         return True
 
@@ -203,6 +218,7 @@ class OrderBookCache:
 
         candidates = dict(self._books)
         applied = False
+        applied_token_ids: set[str] = set()
         for token_id, token_deltas in grouped.items():
             before = self._books[token_id]
             if exchange_timestamp < before.exchange_timestamp:
@@ -292,9 +308,14 @@ class OrderBookCache:
                     self._fail_closed("book hash mismatch")
             candidates[token_id] = candidate
             applied = True
+            applied_token_ids.add(token_id)
 
         if applied:
             self._books = candidates
+            self._token_revisions = {
+                token_id: revision + (1 if token_id in applied_token_ids else 0)
+                for token_id, revision in self._token_revisions.items()
+            }
             self._revision += 1
         self._last_sequence = sequence
         return applied
@@ -309,8 +330,40 @@ class OrderBookCache:
         self._state = CacheState.INVALID
         self._invalid_reason = reason
         self._books.clear()
+        self._token_revisions.clear()
         self._expected_token_ids = ()
         return True
+
+    def snapshot_token_revisions(self) -> TokenRevisionSnapshot:
+        if self._state is not CacheState.VALID:
+            raise RuntimeError("token revisions require a valid cache")
+        return TokenRevisionSnapshot(
+            generation=self._generation,
+            revisions=tuple(
+                (token_id, self._token_revisions[token_id])
+                for token_id in sorted(self._token_revisions, key=_utf8)
+            ),
+        )
+
+    def token_revisions_match(
+        self,
+        snapshot: TokenRevisionSnapshot,
+        token_ids: Sequence[str],
+    ) -> bool:
+        if not isinstance(snapshot, TokenRevisionSnapshot):
+            raise TypeError("snapshot must be a TokenRevisionSnapshot")
+        normalized = _token_ids(token_ids)
+        if (
+            self._state is not CacheState.VALID
+            or self._generation != snapshot.generation
+        ):
+            return False
+        expected = dict(snapshot.revisions)
+        return all(
+            token_id in expected
+            and self._token_revisions.get(token_id) == expected[token_id]
+            for token_id in normalized
+        )
 
     def view(self) -> tuple[OrderBook, ...]:
         if self._state is not CacheState.VALID:
@@ -326,6 +379,7 @@ class OrderBookCache:
         self._state = CacheState.INVALID
         self._invalid_reason = reason
         self._books.clear()
+        self._token_revisions.clear()
         self._expected_token_ids = ()
         raise CacheInvalidatedError(reason)
 

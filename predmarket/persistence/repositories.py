@@ -48,6 +48,12 @@ class CatalogSnapshot:
     tokens: tuple[Token, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class PendingCatalogReconciliation:
+    change: MarketChange
+    market_ids: tuple[str, ...]
+
+
 class CatalogRepository:
     def __init__(self, path: Path, writer: DatabaseWriter) -> None:
         self._path = Path(path)
@@ -172,6 +178,8 @@ class CatalogRepository:
         events: Sequence[Event],
         markets: Sequence[Market],
         tokens: Sequence[Token],
+        reconciliation_change: MarketChange | None = None,
+        reconciliation_market_ids: Sequence[str] = (),
     ) -> None:
         """Atomically advance a complete catalog and upsert semantic changes."""
 
@@ -182,6 +190,28 @@ class CatalogRepository:
         materialized_events = _typed_tuple(events, Event, "events")
         materialized_markets = _typed_tuple(markets, Market, "markets")
         materialized_tokens = _typed_tuple(tokens, Token, "tokens")
+        if reconciliation_change is not None:
+            if not isinstance(reconciliation_change, MarketChange):
+                raise TypeError("reconciliation_change must be a MarketChange")
+            if (
+                reconciliation_change.change_type
+                is not MarketChangeType.CATALOG_RECONCILED
+            ):
+                raise ValueError(
+                    "reconciliation_change must be CATALOG_RECONCILED"
+                )
+            if reconciliation_change.change_id.rsplit(":", 2)[0] != generation:
+                raise ValueError(
+                    "reconciliation_change must belong to the requested generation"
+                )
+        elif reconciliation_market_ids:
+            raise ValueError(
+                "reconciliation_market_ids require reconciliation_change"
+            )
+        encoded_reconciliation_market_ids = _encode_ids(
+            reconciliation_market_ids,
+            allow_empty=True,
+        )
         for field_name, entities in (
             ("events", materialized_events),
             ("markets", materialized_markets),
@@ -244,6 +274,39 @@ class CatalogRepository:
                     stage,
                     len(entities),
                     int((time.monotonic() - stage_started_at) * 1_000),
+                )
+            if reconciliation_change is not None:
+                reconciliation_details = _encode_json_object(
+                    {
+                        "change_id": reconciliation_change.change_id,
+                        "change_type": reconciliation_change.change_type.value,
+                        "critical": reconciliation_change.critical,
+                        "event_id": reconciliation_change.event_id,
+                        "market_id": reconciliation_change.market_id,
+                        "market_ids": json.loads(encoded_reconciliation_market_ids),
+                        "sync_generation": generation,
+                        "token_ids": reconciliation_change.token_ids,
+                    }
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO system_events (
+                        component, severity, event_type, message,
+                        details_json, occurred_at
+                    )
+                    SELECT 'SYNC', 'INFO', 'CATALOG_RECONCILIATION_READY', ?, ?, ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM system_events
+                        WHERE event_type = 'CATALOG_RECONCILIATION_READY'
+                          AND json_extract(details_json, '$.change_id') = ?
+                    )
+                    """,
+                    (
+                        f"Catalog reconciliation {reconciliation_change.change_id} ready",
+                        reconciliation_details,
+                        reconciliation_change.occurred_at,
+                        reconciliation_change.change_id,
+                    ),
                 )
             _LOGGER.info(
                 "catalog_complete_save_command_completed sync_generation=%s "
@@ -810,6 +873,7 @@ class SystemEventRepository:
         active = change.change_type in {
             MarketChangeType.MARKET_ADDED,
             MarketChangeType.MARKET_UPDATED,
+            MarketChangeType.CATALOG_RECONCILED,
         }
         if change.market_id is not None:
             affected_market_ids = (change.market_id,)
@@ -817,7 +881,14 @@ class SystemEventRepository:
             if market_ids is None:
                 raise ValueError("event-wide publication requires market_ids")
             affected_market_ids = tuple(market_ids)
-        encoded_market_ids = json.loads(_encode_ids(affected_market_ids))
+        encoded_market_ids = json.loads(
+            _encode_ids(
+                affected_market_ids,
+                allow_empty=(
+                    change.change_type is MarketChangeType.CATALOG_RECONCILED
+                ),
+            )
+        )
         details = _encode_json_object(
             {
                 "active": active,
@@ -826,6 +897,9 @@ class SystemEventRepository:
                 "event_id": change.event_id,
                 "market_id": change.market_id,
                 "market_ids": encoded_market_ids,
+                "replace_active": (
+                    change.change_type is MarketChangeType.CATALOG_RECONCILED
+                ),
                 "sync_generation": change.change_id.rsplit(":", 2)[0],
                 "token_ids": change.token_ids,
             }
@@ -863,6 +937,44 @@ class SystemEventRepository:
 
         return await self._writer.execute(command)
 
+    async def list_pending_catalog_reconciliations(
+        self,
+    ) -> tuple[PendingCatalogReconciliation, ...]:
+        rows = await _fetch_all(
+            self._path,
+            """
+            SELECT ready.details_json, ready.occurred_at
+            FROM system_events AS ready
+            WHERE ready.event_type = 'CATALOG_RECONCILIATION_READY'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM system_events AS published
+                  WHERE published.event_type = 'MARKET_CHANGE_PUBLISHED'
+                    AND json_extract(published.details_json, '$.change_id') =
+                        json_extract(ready.details_json, '$.change_id')
+              )
+            ORDER BY ready.id
+            """,
+        )
+        pending: list[PendingCatalogReconciliation] = []
+        for row in rows:
+            details = json.loads(row["details_json"])
+            pending.append(
+                PendingCatalogReconciliation(
+                    change=MarketChange(
+                        change_id=details["change_id"],
+                        change_type=MarketChangeType(details["change_type"]),
+                        event_id=details.get("event_id"),
+                        market_id=details.get("market_id"),
+                        token_ids=tuple(details.get("token_ids", ())),
+                        occurred_at=int(row["occurred_at"]),
+                        critical=details.get("critical", False),
+                    ),
+                    market_ids=tuple(details.get("market_ids", ())),
+                )
+            )
+        return tuple(pending)
+
     async def list_published_market_ids(self) -> frozenset[str]:
         rows = await _fetch_all(
             self._path,
@@ -881,6 +993,8 @@ class SystemEventRepository:
                 affected = [details["market_id"]]
             if not isinstance(affected, list):
                 continue
+            if details.get("replace_active") is True:
+                active_market_ids.clear()
             is_active = details.get("active", True)
             for market_id in affected:
                 if not isinstance(market_id, str) or not market_id:
