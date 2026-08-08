@@ -11,7 +11,7 @@ import sqlite3
 from predmarket.domain.decimal import decode_decimal, encode_decimal
 from predmarket.domain.fees import FeeSchedule
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TARGET_SCHEMA_VERSION = 4
 
 
@@ -1075,7 +1075,7 @@ def _migrate_v2_to_v3(database_path: Path) -> None:
             assert isinstance(index_sql, str)
             connection.execute(index_sql)
 
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 3")
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -1128,34 +1128,20 @@ def create_v4_database(path: Path) -> None:
 
 
 def initialize_database(path: Path) -> None:
-    """Create schema v3 or migrate an existing schema v2 database to v3."""
+    """Create or accept schema v4; older schemas require explicit migration."""
     database_path = Path(path)
     if database_path.exists() and database_path.stat().st_size > 0:
         version = _read_existing_version(database_path)
         if version == SCHEMA_VERSION:
             return
-        if version == 2:
-            _migrate_v2_to_v3(database_path)
-            return
+        if version in {1, 2, 3}:
+            raise ValueError(
+                f"database schema version {version} requires explicit migration to v4"
+            )
         raise ValueError(
             f"unsupported database schema version {version}; expected {SCHEMA_VERSION}"
         )
-
-    database_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database_path)
-    try:
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            _execute_sql_script(connection, SCHEMA_V3)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-    finally:
-        connection.close()
+    create_v4_database(database_path)
 
 
 def _read_existing_version(path: Path) -> int:

@@ -36,6 +36,7 @@ from predmarket.persistence.catalog_generations import (
     CatalogGenerationCoordinator,
     GenerationInput,
     catalog_input_digest,
+    write_runtime_catalog,
 )
 from predmarket.persistence.writer import DatabaseWriter
 
@@ -78,101 +79,12 @@ class CatalogRepository:
         materialized_tokens = _typed_tuple(tokens, Token, "tokens")
 
         async def command(connection: aiosqlite.Connection) -> None:
-            affected_event_ids = {event.id for event in materialized_events}
-            affected_event_ids.update(
-                market.event_id
-                for market in materialized_markets
-                if market.event_id is not None
-            )
-            await connection.execute(
-                """
-                CREATE TEMP TABLE IF NOT EXISTS _catalog_incoming_markets (
-                    id TEXT PRIMARY KEY
-                )
-                """
-            )
-            await connection.execute("DELETE FROM _catalog_incoming_markets")
-            if materialized_markets:
-                await connection.executemany(
-                    "INSERT INTO _catalog_incoming_markets (id) VALUES (?)",
-                    ((market.id,) for market in materialized_markets),
-                )
-                cursor = await connection.execute(
-                    """
-                    SELECT DISTINCT markets.event_id
-                    FROM markets
-                    JOIN _catalog_incoming_markets AS incoming
-                      ON incoming.id = markets.id
-                    WHERE markets.event_id IS NOT NULL
-                    """
-                )
-                affected_event_ids.update(row[0] for row in await cursor.fetchall())
-
-            if materialized_events:
-                await connection.executemany(
-                    _UPSERT_EVENT,
-                    (_event_values(event) for event in materialized_events),
-                )
-            if materialized_markets:
-                await connection.executemany(
-                    _UPSERT_MARKET,
-                    (_market_values(market) for market in materialized_markets),
-                )
-            if materialized_tokens:
-                await connection.executemany(
-                    _UPSERT_TOKEN,
-                    (_token_values(token) for token in materialized_tokens),
-                )
-
-            await connection.execute(
-                """
-                CREATE TEMP TABLE IF NOT EXISTS _catalog_affected_events (
-                    id TEXT PRIMARY KEY
-                )
-                """
-            )
-            await connection.execute("DELETE FROM _catalog_affected_events")
-            sorted_event_ids = tuple(
-                sorted(affected_event_ids, key=lambda value: value.encode("utf-8"))
-            )
-            if not sorted_event_ids:
-                return
-            await connection.executemany(
-                "INSERT INTO _catalog_affected_events (id) VALUES (?)",
-                ((event_id,) for event_id in sorted_event_ids),
-            )
-            cursor = await connection.execute(
-                """
-                SELECT affected.id
-                FROM _catalog_affected_events AS affected
-                LEFT JOIN events ON events.id = affected.id
-                WHERE events.id IS NULL
-                ORDER BY CAST(affected.id AS BLOB)
-                LIMIT 1
-                """
-            )
-            missing_event = await cursor.fetchone()
-            if missing_event is not None:
-                raise ValueError(f"event {missing_event[0]!r} does not exist")
-
-            cursor = await connection.execute(
-                """
-                SELECT affected.id, markets.id
-                FROM _catalog_affected_events AS affected
-                LEFT JOIN markets ON markets.event_id = affected.id
-                ORDER BY CAST(affected.id AS BLOB), CAST(markets.id AS BLOB)
-                """
-            )
-            market_ids_by_event = {event_id: [] for event_id in sorted_event_ids}
-            for event_id, market_id in await cursor.fetchall():
-                if market_id is not None:
-                    market_ids_by_event[event_id].append(market_id)
-            await connection.executemany(
-                "UPDATE events SET market_ids_json = ? WHERE id = ?",
-                (
-                    (_encode_ids(market_ids_by_event[event_id], allow_empty=True), event_id)
-                    for event_id in sorted_event_ids
-                ),
+            await write_runtime_catalog(
+                connection,
+                events=materialized_events,
+                markets=materialized_markets,
+                tokens=materialized_tokens,
+                changed_at=int(time.time()),
             )
 
         await self._writer.execute(command)
@@ -405,8 +317,11 @@ class CatalogRepository:
         _require_type(event, Event, "event")
 
         async def command(connection: aiosqlite.Connection) -> None:
-            await connection.execute(_UPSERT_EVENT, _event_values(event))
-            await _rebuild_event_market_ids(connection, event.id)
+            await write_runtime_catalog(
+                connection,
+                events=(event,),
+                changed_at=int(time.time()),
+            )
 
         await self._writer.execute(command)
 
@@ -414,33 +329,25 @@ class CatalogRepository:
         _require_type(market, Market, "market")
 
         async def command(connection: aiosqlite.Connection) -> None:
-            cursor = await connection.execute(
-                "SELECT event_id FROM markets WHERE id = ?",
-                (market.id,),
+            await write_runtime_catalog(
+                connection,
+                markets=(market,),
+                changed_at=int(time.time()),
             )
-            row = await cursor.fetchone()
-            old_event_id = None if row is None else row[0]
-            if market.event_id is not None:
-                cursor = await connection.execute(
-                    "SELECT 1 FROM events WHERE id = ?",
-                    (market.event_id,),
-                )
-                if await cursor.fetchone() is None:
-                    raise ValueError(f"event {market.event_id!r} does not exist")
-            await connection.execute(_UPSERT_MARKET, _market_values(market))
-            for event_id in sorted(
-                {value for value in (old_event_id, market.event_id) if value is not None},
-                key=lambda value: value.encode("utf-8"),
-            ):
-                await _rebuild_event_market_ids(connection, event_id)
 
         await self._writer.execute(command)
 
     async def save_token(self, token: Token) -> None:
         _require_type(token, Token, "token")
-        await self._writer.execute(
-            lambda connection: connection.execute(_UPSERT_TOKEN, _token_values(token))
-        )
+
+        async def command(connection: aiosqlite.Connection) -> None:
+            await write_runtime_catalog(
+                connection,
+                tokens=(token,),
+                changed_at=int(time.time()),
+            )
+
+        await self._writer.execute(command)
 
     async def get_event(self, event_id: str) -> Event | None:
         row = await _fetch_one(self._path, "SELECT * FROM events WHERE id = ?", (event_id,))

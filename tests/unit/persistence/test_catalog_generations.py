@@ -18,6 +18,8 @@ from predmarket.persistence.catalog_generations import (
     CatalogGenerationCoordinator,
     CatalogSyncAborted,
     GenerationInput,
+    RebaseResult,
+    write_runtime_catalog,
 )
 from predmarket.persistence.schema import GenerationStatus, create_v4_database
 from predmarket.persistence.repositories import PendingCatalogReconciliation
@@ -863,3 +865,278 @@ async def test_activate_rejects_runtime_revision_change(tmp_path: Path) -> None:
         assert connection.execute(
             "SELECT active_generation_id FROM catalog_state WHERE id = 1"
         ).fetchone() == (1,)
+
+
+async def _activate_related_generation(
+    database_path: Path,
+    *,
+    generation: str,
+    updated_at: int,
+) -> tuple[CatalogGenerationCoordinator, GenerationInput]:
+    value = _related_generation_input(generation=generation)
+    value = replace(
+        value,
+        updated_at=updated_at,
+        events=tuple(
+            replace(
+                event,
+                sync_generation=generation,
+                updated_at=updated_at,
+            )
+            for event in value.events
+        ),
+        markets=tuple(
+            replace(
+                market,
+                sync_generation=generation,
+                updated_at=updated_at,
+            )
+            for market in value.markets
+        ),
+        tokens=tuple(
+            replace(
+                token,
+                sync_generation=generation,
+                updated_at=updated_at,
+            )
+            for token in value.tokens
+        ),
+        input_digest=f"digest-{generation}",
+    )
+    coordinator = CatalogGenerationCoordinator(_CatalogTestWriter(database_path))
+    staged = await coordinator.stage(value)
+    validation = await coordinator.validate_candidate(staged)
+    await coordinator.activate(validation, None)
+    return coordinator, value
+
+
+async def test_runtime_write_journals_winner_and_ignores_older_input(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    _coordinator, active = await _activate_related_generation(
+        database_path,
+        generation="sync-active",
+        updated_at=10,
+    )
+    writer = _CatalogTestWriter(database_path)
+    newer = replace(active.markets[0], question="Watch newer", updated_at=20)
+    older = replace(active.markets[0], question="Watch stale", updated_at=9)
+    equal = replace(active.markets[0], question="Watch equal wins", updated_at=20)
+
+    await writer.execute(
+        lambda connection: write_runtime_catalog(
+            connection,
+            markets=(newer,),
+            changed_at=20,
+        )
+    )
+    await writer.execute(
+        lambda connection: write_runtime_catalog(
+            connection,
+            markets=(older,),
+            changed_at=21,
+        )
+    )
+    await writer.execute(
+        lambda connection: write_runtime_catalog(
+            connection,
+            markets=(equal,),
+            changed_at=22,
+        )
+    )
+
+    with _connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT question, updated_at FROM markets WHERE id = 'market-1'"
+        ).fetchone() == ("Watch equal wins", 20)
+        assert connection.execute(
+            "SELECT runtime_revision FROM catalog_state WHERE id = 1"
+        ).fetchone() == (2,)
+        assert connection.execute(
+            """
+            SELECT runtime_revision, entity_type, entity_id, updated_at, changed_at
+            FROM catalog_runtime_changes
+            """
+        ).fetchall() == [
+            (1, "MARKET", "market-1", 20, 20),
+            (2, "MARKET", "market-1", 20, 22),
+        ]
+
+
+@pytest.mark.parametrize(
+    ("watch_updated_at", "expected_question", "copied_markets"),
+    [
+        (30, "Watch newest", 1),
+        (20, "Candidate market", 0),
+    ],
+)
+async def test_activate_rebases_only_newer_runtime_versions_after_cas_conflict(
+    tmp_path: Path,
+    watch_updated_at: int,
+    expected_question: str,
+    copied_markets: int,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    _coordinator, active = await _activate_related_generation(
+        database_path,
+        generation="sync-active",
+        updated_at=10,
+    )
+    candidate = replace(
+        active,
+        sync_generation="sync-candidate",
+        updated_at=20,
+        events=tuple(
+            replace(
+                event,
+                title="Candidate event",
+                sync_generation="sync-candidate",
+                updated_at=20,
+            )
+            for event in active.events
+        ),
+        markets=tuple(
+            replace(
+                market,
+                question="Candidate market",
+                sync_generation="sync-candidate",
+                updated_at=20,
+            )
+            for market in active.markets
+        ),
+        tokens=tuple(
+            replace(
+                token,
+                sync_generation="sync-candidate",
+                updated_at=20,
+            )
+            for token in active.tokens
+        ),
+        input_digest="digest-sync-candidate",
+    )
+    writer = _CatalogTestWriter(database_path)
+    coordinator = CatalogGenerationCoordinator(writer)
+    staged = await coordinator.stage(candidate)
+    validation = await coordinator.validate_candidate(staged)
+    watch_market = replace(
+        active.markets[0],
+        question="Watch newest",
+        updated_at=watch_updated_at,
+    )
+    await writer.execute(
+        lambda connection: write_runtime_catalog(
+            connection,
+            markets=(watch_market,),
+            changed_at=watch_updated_at,
+        )
+    )
+
+    rebased, result = await coordinator.rebase(validation)
+
+    assert result == RebaseResult(
+        generation_id=staged.id,
+        from_revision=0,
+        through_revision=1,
+        copied_events=0,
+        copied_markets=copied_markets,
+        copied_tokens=0,
+    )
+    assert rebased.validated_runtime_revision == 1
+    await coordinator.activate(rebased, None)
+    with _connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT title FROM events WHERE id = 'event-1'"
+        ).fetchone() == ("Candidate event",)
+        assert connection.execute(
+            "SELECT question FROM markets WHERE id = 'market-1'"
+        ).fetchone() == (expected_question,)
+        assert connection.execute(
+            "SELECT rebased_runtime_revision FROM catalog_generations WHERE id = ?",
+            (staged.id,),
+        ).fetchone() == (1,)
+
+
+async def test_activate_retries_and_replays_only_new_journal_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    _coordinator, active = await _activate_related_generation(
+        database_path,
+        generation="sync-active",
+        updated_at=10,
+    )
+    candidate = replace(
+        active,
+        sync_generation="sync-candidate",
+        updated_at=20,
+        events=tuple(
+            replace(event, sync_generation="sync-candidate", updated_at=20)
+            for event in active.events
+        ),
+        markets=tuple(
+            replace(market, sync_generation="sync-candidate", updated_at=20)
+            for market in active.markets
+        ),
+        tokens=tuple(
+            replace(token, sync_generation="sync-candidate", updated_at=20)
+            for token in active.tokens
+        ),
+        input_digest="digest-sync-candidate",
+    )
+    writer = _CatalogTestWriter(database_path)
+    coordinator = CatalogGenerationCoordinator(writer)
+    staged = await coordinator.stage(candidate)
+    validation = await coordinator.validate_candidate(staged)
+    first_watch = replace(
+        active.markets[0], question="Watch revision 1", updated_at=30
+    )
+    second_watch = replace(
+        active.markets[0], question="Watch revision 2", updated_at=40
+    )
+    await writer.execute(
+        lambda connection: write_runtime_catalog(
+            connection,
+            markets=(first_watch,),
+            changed_at=30,
+        )
+    )
+
+    original_rebase = coordinator.rebase
+    results: list[RebaseResult] = []
+
+    async def rebase_with_one_concurrent_write(
+        stale: CandidateValidation,
+    ) -> tuple[CandidateValidation, RebaseResult]:
+        rebased, result = await original_rebase(stale)
+        results.append(result)
+        if len(results) == 1:
+            await writer.execute(
+                lambda connection: write_runtime_catalog(
+                    connection,
+                    markets=(second_watch,),
+                    changed_at=40,
+                )
+            )
+        return rebased, result
+
+    monkeypatch.setattr(coordinator, "rebase", rebase_with_one_concurrent_write)
+
+    await coordinator.activate(validation, None)
+
+    assert [(result.from_revision, result.through_revision) for result in results] == [
+        (0, 1),
+        (1, 2),
+    ]
+    with _connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT question FROM markets WHERE id = 'market-1'"
+        ).fetchone() == ("Watch revision 2",)
+        assert connection.execute(
+            "SELECT rebased_runtime_revision FROM catalog_generations WHERE id = ?",
+            (staged.id,),
+        ).fetchone() == (2,)

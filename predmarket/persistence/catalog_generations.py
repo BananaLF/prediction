@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from decimal import Decimal
 from enum import Enum
 import hashlib
@@ -134,6 +134,16 @@ class CandidateValidation:
 
 
 @dataclass(frozen=True, slots=True)
+class RebaseResult:
+    generation_id: int
+    from_revision: int
+    through_revision: int
+    copied_events: int
+    copied_markets: int
+    copied_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
 class _EntityPlan:
     kind: str
     values: tuple[_Entity, ...]
@@ -152,6 +162,7 @@ class CatalogGenerationCoordinator:
         wal_policy: WalPolicy = WalPolicy(),
         initial_wal_amplification: float = 1.0,
         max_pause_checkpoints: int = 3,
+        max_activation_rebases: int = 3,
         clock: Callable[[], int] = lambda: int(time.time()),
         database_path: Path | None = None,
     ) -> None:
@@ -166,11 +177,14 @@ class CatalogGenerationCoordinator:
             raise ValueError("initial_wal_amplification must be positive")
         if type(max_pause_checkpoints) is not int or max_pause_checkpoints <= 0:
             raise ValueError("max_pause_checkpoints must be a positive integer")
+        if type(max_activation_rebases) is not int or max_activation_rebases <= 0:
+            raise ValueError("max_activation_rebases must be a positive integer")
         self._writer = writer
         self._batch_limits = batch_limits
         self._wal_policy = wal_policy
         self._wal_amplification = float(initial_wal_amplification)
         self._max_pause_checkpoints = max_pause_checkpoints
+        self._max_activation_rebases = max_activation_rebases
         self._clock = clock
         inferred_path = getattr(writer, "path", None)
         if database_path is None and inferred_path is None:
@@ -301,10 +315,25 @@ class CatalogGenerationCoordinator:
         validation: CandidateValidation,
         reconciliation: PendingCatalogReconciliation | None,
     ) -> None:
-        """CAS-activate a frozen candidate and its unique ready outbox."""
+        """CAS-activate a candidate, rebasing bounded runtime conflicts."""
 
         if not isinstance(validation, CandidateValidation):
             raise TypeError("validation must be CandidateValidation")
+        current = validation
+        for attempt in range(self._max_activation_rebases + 1):
+            try:
+                await self._activate_once(current, reconciliation)
+                return
+            except CatalogActivationConflict:
+                if attempt >= self._max_activation_rebases:
+                    raise
+                current, _result = await self.rebase(current)
+
+    async def _activate_once(
+        self,
+        validation: CandidateValidation,
+        reconciliation: PendingCatalogReconciliation | None,
+    ) -> None:
         prepared_reconciliation = _prepare_reconciliation(reconciliation)
         now = self._clock()
 
@@ -390,6 +419,164 @@ class CatalogGenerationCoordinator:
                 )
 
         await self._writer.execute(command)
+
+    async def rebase(
+        self,
+        validation: CandidateValidation,
+    ) -> tuple[CandidateValidation, RebaseResult]:
+        """Replay winning runtime changes and revalidate the candidate."""
+
+        if not isinstance(validation, CandidateValidation):
+            raise TypeError("validation must be CandidateValidation")
+        now = self._clock()
+
+        async def command(
+            connection: aiosqlite.Connection,
+        ) -> tuple[CandidateValidation, RebaseResult]:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                """
+                SELECT generations.sync_generation,
+                       generations.base_generation_id,
+                       generations.rebased_runtime_revision,
+                       generations.status,
+                       state.active_generation_id,
+                       state.runtime_revision
+                FROM catalog_generations AS generations
+                JOIN catalog_state AS state ON state.id = 1
+                WHERE generations.id = ?
+                """,
+                (validation.generation_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None or row["status"] != "STAGING":
+                raise CatalogActivationConflict(
+                    "candidate generation is missing or no longer staging"
+                )
+            base_generation_id = int(row["base_generation_id"])
+            if int(row["active_generation_id"]) != base_generation_id:
+                raise CatalogActivationConflict(
+                    "active generation changed before candidate rebase"
+                )
+            from_revision = validation.validated_runtime_revision
+            persisted_revision = row["rebased_runtime_revision"]
+            if persisted_revision is not None:
+                from_revision = max(from_revision, int(persisted_revision))
+            through_revision = int(row["runtime_revision"])
+            if through_revision < from_revision:
+                raise CatalogActivationConflict("runtime revision moved backwards")
+
+            cursor = await connection.execute(
+                """
+                SELECT entity_type, entity_id, MAX(runtime_revision)
+                FROM catalog_runtime_changes
+                WHERE runtime_revision > ? AND runtime_revision <= ?
+                GROUP BY entity_type, entity_id
+                ORDER BY entity_type, CAST(entity_id AS BLOB)
+                """,
+                (from_revision, through_revision),
+            )
+            changes = list(await cursor.fetchall())
+            if through_revision > from_revision and not changes:
+                raise CatalogActivationConflict(
+                    "runtime revision changed without catalog journal entries"
+                )
+
+            sync_generation = str(row["sync_generation"])
+            active_sync_generation = await _generation_sync_name(
+                connection,
+                base_generation_id,
+            )
+            active = await _load_effective_entities(
+                connection,
+                generation_id=-1,
+                base_generation_id=base_generation_id,
+                sync_generation=active_sync_generation,
+            )
+            staged = await _load_staged_entities(
+                connection,
+                generation_id=validation.generation_id,
+                sync_generation=sync_generation,
+            )
+            active_maps = tuple({entity.id: entity for entity in values} for values in active)
+            staged_maps = tuple({entity.id: entity for entity in values} for values in staged)
+            kind_index = {"EVENT": 0, "MARKET": 1, "TOKEN": 2}
+            copied = [0, 0, 0]
+            for change in changes:
+                index = kind_index[str(change["entity_type"])]
+                entity_id = str(change["entity_id"])
+                active_entity = active_maps[index].get(entity_id)
+                staged_entity = staged_maps[index].get(entity_id)
+                if active_entity is None:
+                    raise CatalogActivationConflict(
+                        f"journal entity {entity_id!r} is absent from active catalog"
+                    )
+                if staged_entity is None or (
+                    active_entity.updated_at > staged_entity.updated_at
+                ):
+                    await _upsert_entity(
+                        connection,
+                        validation.generation_id,
+                        replace(
+                            active_entity,
+                            sync_generation=sync_generation,
+                            sync_generation_complete=True,
+                        ),
+                    )
+                    copied[index] += 1
+
+            effective = await _load_effective_entities(
+                connection,
+                generation_id=validation.generation_id,
+                base_generation_id=base_generation_id,
+                sync_generation=sync_generation,
+            )
+            _validate_effective_constraints(*effective)
+            rebased = CandidateValidation(
+                generation_id=validation.generation_id,
+                event_count=len(effective[0]),
+                market_count=len(effective[1]),
+                token_count=len(effective[2]),
+                snapshot_digest=_snapshot_digest(*effective),
+                validated_runtime_revision=through_revision,
+            )
+            cursor = await connection.execute(
+                """
+                UPDATE catalog_generations
+                SET candidate_event_count = ?, candidate_market_count = ?,
+                    candidate_token_count = ?, candidate_snapshot_digest = ?,
+                    validated_at = ?, rebased_runtime_revision = ?
+                WHERE id = ? AND status = 'STAGING'
+                """,
+                (
+                    rebased.event_count,
+                    rebased.market_count,
+                    rebased.token_count,
+                    rebased.snapshot_digest,
+                    now,
+                    through_revision,
+                    validation.generation_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise CatalogActivationConflict(
+                    "candidate generation changed during rebase"
+                )
+            result = RebaseResult(
+                generation_id=validation.generation_id,
+                from_revision=from_revision,
+                through_revision=through_revision,
+                copied_events=copied[0],
+                copied_markets=copied[1],
+                copied_tokens=copied[2],
+            )
+            return rebased, result
+
+        try:
+            return await self._writer.execute(command)
+        except CatalogConstraintError as error:
+            await self._abort_generation(validation.generation_id, str(error))
+            raise
 
     async def _read_candidate_validation(
         self,
@@ -654,6 +841,174 @@ class CatalogGenerationCoordinator:
         await self._writer.execute(command)
 
 
+async def write_runtime_catalog(
+    connection: aiosqlite.Connection,
+    *,
+    events: Sequence[Event] = (),
+    markets: Sequence[Market] = (),
+    tokens: Sequence[Token] = (),
+    changed_at: int,
+) -> int | None:
+    """Apply winning runtime versions and journal one atomic catalog revision."""
+
+    if type(changed_at) is not int or changed_at < 0:
+        raise ValueError("changed_at must be a non-negative integer")
+    materialized: tuple[tuple[_Entity, ...], ...] = (
+        tuple(events),
+        tuple(markets),
+        tuple(tokens),
+    )
+    for label, values, expected_type in zip(
+        ("events", "markets", "tokens"),
+        materialized,
+        (Event, Market, Token),
+        strict=True,
+    ):
+        if any(not isinstance(value, expected_type) for value in values):
+            raise TypeError(f"{label} must contain only {expected_type.__name__}")
+        identifiers = tuple(value.id for value in values)
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError(f"{label} contains duplicate IDs")
+
+    connection.row_factory = aiosqlite.Row
+    cursor = await connection.execute(
+        """
+        SELECT state.active_generation_id, state.runtime_revision,
+               generations.sync_generation
+        FROM catalog_state AS state
+        JOIN catalog_generations AS generations
+          ON generations.id = state.active_generation_id
+        WHERE state.id = 1 AND generations.status = 'COMMITTED'
+        """
+    )
+    state = await cursor.fetchone()
+    if state is None:
+        raise CatalogGenerationError("active catalog generation is missing")
+    generation_id = int(state["active_generation_id"])
+    runtime_revision = int(state["runtime_revision"])
+    sync_generation = str(state["sync_generation"])
+    current = await _load_effective_entities(
+        connection,
+        generation_id=-1,
+        base_generation_id=generation_id,
+        sync_generation=sync_generation,
+    )
+    current_maps = tuple({entity.id: entity for entity in values} for values in current)
+    prospective_maps = tuple(dict(values) for values in current_maps)
+
+    for index, values in enumerate(materialized):
+        for entity in values:
+            normalized = replace(
+                entity,
+                sync_generation=sync_generation,
+                sync_generation_complete=True,
+            )
+            existing = prospective_maps[index].get(entity.id)
+            if existing is None or normalized.updated_at >= existing.updated_at:
+                prospective_maps[index][entity.id] = normalized
+
+    market_ids_by_event: dict[str, list[str]] = {
+        event_id: [] for event_id in prospective_maps[0]
+    }
+    for market in prospective_maps[1].values():
+        if market.event_id in market_ids_by_event:
+            market_ids_by_event[market.event_id].append(market.id)
+    for event_id, event in tuple(prospective_maps[0].items()):
+        prospective_maps[0][event_id] = replace(
+            event,
+            market_ids=tuple(
+                sorted(
+                    market_ids_by_event[event_id],
+                    key=lambda value: value.encode("utf-8"),
+                )
+            ),
+        )
+
+    prospective = tuple(
+        tuple(
+            values[entity_id]
+            for entity_id in sorted(values, key=lambda value: value.encode("utf-8"))
+        )
+        for values in prospective_maps
+    )
+    _validate_effective_constraints(*prospective)
+    changed = tuple(
+        tuple(
+            entity
+            for entity in values
+            if (
+                entity.id not in current_maps[index]
+                or _canonical_payload(entity)
+                != _canonical_payload(current_maps[index][entity.id])
+            )
+        )
+        for index, values in enumerate(prospective)
+    )
+    if not any(changed):
+        return None
+
+    for values in changed:
+        for entity in values:
+            if isinstance(entity, Market):
+                await connection.execute(
+                    """
+                    INSERT INTO catalog_market_ids (id, event_id, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET event_id = excluded.event_id
+                    """,
+                    (entity.id, entity.event_id, entity.created_at),
+                )
+            elif isinstance(entity, Token):
+                await connection.execute(
+                    """
+                    INSERT INTO catalog_token_ids (id, market_id, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET market_id = excluded.market_id
+                    """,
+                    (entity.id, entity.market_id, entity.created_at),
+                )
+            await _upsert_entity(connection, generation_id, entity)
+
+    next_revision = runtime_revision + 1
+    cursor = await connection.execute(
+        """
+        UPDATE catalog_state SET runtime_revision = ?
+        WHERE id = 1 AND active_generation_id = ? AND runtime_revision = ?
+        """,
+        (next_revision, generation_id, runtime_revision),
+    )
+    if cursor.rowcount != 1:
+        raise CatalogActivationConflict(
+            "active generation or runtime revision changed during runtime write"
+        )
+    for entity_type, values in zip(
+        ("EVENT", "MARKET", "TOKEN"),
+        changed,
+        strict=True,
+    ):
+        if values:
+            await connection.executemany(
+                """
+                INSERT INTO catalog_runtime_changes (
+                    runtime_revision, entity_type, entity_id,
+                    generation_id, updated_at, changed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        next_revision,
+                        entity_type,
+                        entity.id,
+                        generation_id,
+                        entity.updated_at,
+                        changed_at,
+                    )
+                    for entity in values
+                ),
+            )
+    return next_revision
+
+
 def catalog_input_digest(
     *,
     sync_generation: str,
@@ -720,6 +1075,20 @@ async def _load_staged_entities(
             )
         ),
     )
+
+
+async def _generation_sync_name(
+    connection: aiosqlite.Connection,
+    generation_id: int,
+) -> str:
+    cursor = await connection.execute(
+        "SELECT sync_generation FROM catalog_generations WHERE id = ?",
+        (generation_id,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        raise CatalogGenerationError(f"catalog generation {generation_id} is missing")
+    return str(row[0])
 
 
 async def _load_effective_entities(
