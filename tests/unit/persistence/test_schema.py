@@ -7,7 +7,12 @@ import pytest
 
 import predmarket.persistence.schema as schema_module
 from predmarket.domain.signal import DecisionReason
-from predmarket.persistence.schema import SCHEMA_V2, initialize_database
+from predmarket.persistence.schema import (
+    SCHEMA_V2,
+    TARGET_SCHEMA_VERSION,
+    create_v4_database,
+    initialize_database,
+)
 
 
 PROJECT_TABLES = {
@@ -23,11 +28,85 @@ PROJECT_TABLES = {
     "tokens",
 }
 
+V4_CATALOG_TABLES = {
+    "catalog_event_ids",
+    "catalog_generations",
+    "catalog_market_ids",
+    "catalog_runtime_changes",
+    "catalog_state",
+    "catalog_token_ids",
+    "event_versions",
+    "market_versions",
+    "token_versions",
+}
+
 
 def _connect(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
+
+
+def test_create_v4_database_creates_generation_schema(tmp_path: Path) -> None:
+    database_path = tmp_path / "market.db"
+
+    create_v4_database(database_path)
+
+    with _connect(database_path) as connection:
+        objects = dict(
+            connection.execute(
+                "SELECT name, type FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"
+            )
+        )
+        assert V4_CATALOG_TABLES <= objects.keys()
+        assert {objects[name] for name in V4_CATALOG_TABLES} == {"table"}
+        assert objects["events"] == "view"
+        assert objects["markets"] == "view"
+        assert objects["tokens"] == "view"
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            TARGET_SCHEMA_VERSION,
+        )
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+def test_v4_catalog_views_preserve_v3_columns_and_downstream_identity_fks(
+    tmp_path: Path,
+) -> None:
+    v3_path = tmp_path / "v3.db"
+    v4_path = tmp_path / "v4.db"
+    initialize_database(v3_path)
+    create_v4_database(v4_path)
+
+    with _connect(v3_path) as v3_connection, _connect(v4_path) as v4_connection:
+        for catalog_name in ("events", "markets", "tokens"):
+            v3_columns = [
+                row[1]
+                for row in v3_connection.execute(f"PRAGMA table_info({catalog_name})")
+            ]
+            v4_columns = [
+                row[1]
+                for row in v4_connection.execute(f"PRAGMA table_info({catalog_name})")
+            ]
+            assert v4_columns == v3_columns
+
+        relation_targets = {
+            row[2]
+            for row in v4_connection.execute("PRAGMA foreign_key_list(relations)")
+        }
+        signal_leg_targets = {
+            row[2]
+            for row in v4_connection.execute("PRAGMA foreign_key_list(signal_legs)")
+        }
+        snapshot_targets = {
+            row[2]
+            for row in v4_connection.execute(
+                "PRAGMA foreign_key_list(orderbook_snapshots)"
+            )
+        }
+        assert "catalog_market_ids" in relation_targets
+        assert {"catalog_market_ids", "catalog_token_ids"} <= signal_leg_targets
+        assert {"catalog_market_ids", "catalog_token_ids"} <= snapshot_targets
 
 
 def _create_schema_v2_database(path: Path) -> None:
