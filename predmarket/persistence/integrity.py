@@ -17,16 +17,23 @@ from predmarket.persistence.schema import SCHEMA_VERSION
 
 _PROJECT_TABLES = {
     "arbitrage_signals",
-    "events",
-    "markets",
+    "catalog_event_ids",
+    "catalog_generations",
+    "catalog_market_ids",
+    "catalog_runtime_changes",
+    "catalog_state",
+    "catalog_token_ids",
+    "event_versions",
+    "market_versions",
     "orderbook_levels",
     "orderbook_snapshots",
     "relations",
     "signal_legs",
     "signal_revisions",
     "system_events",
-    "tokens",
+    "token_versions",
 }
+_PROJECT_VIEWS = {"events", "markets", "tokens"}
 
 _CATEGORY_NAMES = (
     "schema",
@@ -34,6 +41,7 @@ _CATEGORY_NAMES = (
     "json_payloads",
     "decimals",
     "revisions",
+    "catalog",
 )
 _CODE_CATEGORIES = {
     "SCHEMA_VERSION_MISMATCH": "schema",
@@ -50,6 +58,12 @@ _CODE_CATEGORIES = {
     "LATEST_REVISION_MISMATCH": "revisions",
     "REVISION_PAYLOAD_INVALID": "revisions",
     "EVIDENCE_IDENTITY_MISMATCH": "revisions",
+    "CATALOG_ACTIVE_GENERATION_INVALID": "catalog",
+    "CATALOG_MULTIPLE_STAGING": "catalog",
+    "CATALOG_CANDIDATE_INVALID": "catalog",
+    "CATALOG_JOURNAL_BACKLOG": "catalog",
+    "CATALOG_CLEANUP_BACKLOG": "catalog",
+    "MIGRATION_MARKER_INCOMPLETE": "catalog",
 }
 _DECIMAL_KEY_COLUMNS = {
     "markets": ("id",),
@@ -97,6 +111,7 @@ class _IntegrityCollector:
         code: str,
         *,
         record: dict[str, object] | None = None,
+        severity: Literal["error", "warning"] = "error",
     ) -> None:
         category = _CODE_CATEGORIES[code]
         finding = self._findings.get(code)
@@ -104,7 +119,7 @@ class _IntegrityCollector:
             self._findings[code] = _IntegrityFinding(
                 code=code,
                 category=category,
-                severity="error",
+                severity=severity,
                 records=() if record is None else (dict(record),),
             )
             return
@@ -213,7 +228,13 @@ def database_diagnostics(path: Path) -> dict[str, object]:
             "watchable_tokens": 0,
         }
         generations: list[dict[str, object]] = []
-        if {"events", "markets", "tokens"}.issubset(tables):
+        views = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'view'"
+            )
+        }
+        if _PROJECT_VIEWS.issubset(views):
             counts["orphan_markets"] = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM markets WHERE event_id IS NULL"
@@ -286,7 +307,7 @@ def database_diagnostics(path: Path) -> dict[str, object]:
 
 
 def check_database_integrity(path: Path) -> None:
-    """Raise with stable violation codes when a schema-v3 database is unsafe."""
+    """Raise with stable violation codes when a schema-v4 database is unsafe."""
     collector = _collect_database_findings(path, include_semantic=True)
     if collector.violations:
         raise DatabaseIntegrityError(collector.violations)
@@ -364,10 +385,17 @@ def _collect_database_findings(
                 """
             )
         }
-        if tables != _PROJECT_TABLES:
+        views = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'view'"
+            )
+        }
+        if tables != _PROJECT_TABLES or not _PROJECT_VIEWS.issubset(views):
             _add(collector, "SCHEMA_INVALID")
         elif include_semantic and schema_version_valid:
             try:
+                _check_catalog_generations(connection, collector)
                 _check_id_arrays(connection, collector)
                 _check_json_payloads(connection, collector)
                 _check_decimals(connection, collector)
@@ -377,6 +405,8 @@ def _collect_database_findings(
                 _add(collector, "SCHEMA_INVALID")
     finally:
         connection.close()
+    if include_semantic:
+        _check_migration_marker(database_path, collector)
     return collector
 
 
@@ -399,6 +429,213 @@ def _connect_read_only(path: Path) -> sqlite3.Connection:
 
 def _database_sidecars(path: Path) -> tuple[Path, Path]:
     return Path(f"{path}-wal"), Path(f"{path}-shm")
+
+
+def _check_catalog_generations(
+    connection: sqlite3.Connection,
+    violations: list[str] | _IntegrityCollector,
+) -> None:
+    active = connection.execute(
+        """
+        SELECT state.active_generation_id, generations.status
+        FROM catalog_state AS state
+        LEFT JOIN catalog_generations AS generations
+          ON generations.id = state.active_generation_id
+        WHERE state.id = 1
+        """
+    ).fetchone()
+    if active is None or active[1] != "COMMITTED":
+        _add(
+            violations,
+            "CATALOG_ACTIVE_GENERATION_INVALID",
+            record={
+                "active_generation_id": None if active is None else active[0],
+                "status": None if active is None else active[1],
+            },
+        )
+        return
+
+    staging_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM catalog_generations WHERE status = 'STAGING'"
+        ).fetchone()[0]
+    )
+    if staging_count > 1:
+        _add(
+            violations,
+            "CATALOG_MULTIPLE_STAGING",
+            record={"count": staging_count},
+        )
+
+    for generation in connection.execute(
+        "SELECT * FROM catalog_generations WHERE status = 'STAGING' ORDER BY id"
+    ):
+        invalid_fields: list[str] = []
+        for kind in ("event", "market", "token"):
+            planned = int(generation[f"planned_{kind}_count"])
+            written = int(generation[f"written_{kind}_count"])
+            written_digest = generation[f"written_{kind}_digest"]
+            cursor = generation[f"{kind}_cursor"]
+            if written > planned:
+                invalid_fields.append(f"written_{kind}_count")
+            if written == 0 and cursor is not None:
+                invalid_fields.append(f"{kind}_cursor")
+            if written > 0 and (cursor is None or written_digest is None):
+                invalid_fields.append(f"written_{kind}_progress")
+            if written == planned and written_digest != generation[f"planned_{kind}_digest"]:
+                invalid_fields.append(f"written_{kind}_digest")
+
+        candidate_values = (
+            generation["candidate_event_count"],
+            generation["candidate_market_count"],
+            generation["candidate_token_count"],
+            generation["candidate_snapshot_digest"],
+        )
+        candidate_present = [value is not None for value in candidate_values]
+        if any(candidate_present) != all(candidate_present):
+            invalid_fields.append("candidate_fields")
+        elif all(candidate_present):
+            digest = str(generation["candidate_snapshot_digest"])
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                invalid_fields.append("candidate_snapshot_digest")
+            if generation["validated_at"] is None:
+                invalid_fields.append("validated_at")
+            for kind, table in (
+                ("event", "event_versions"),
+                ("market", "market_versions"),
+                ("token", "token_versions"),
+            ):
+                actual = int(
+                    connection.execute(
+                        f"""
+                        SELECT COUNT(*) FROM (
+                            SELECT entity_id FROM {table}
+                            WHERE generation_id = ?
+                            UNION
+                            SELECT versions.entity_id
+                            FROM {table} AS versions
+                            JOIN catalog_generations AS committed
+                              ON committed.id = versions.generation_id
+                             AND committed.status = 'COMMITTED'
+                            WHERE versions.generation_id <= ?
+                        )
+                        """,
+                        (generation["id"], generation["base_generation_id"]),
+                    ).fetchone()[0]
+                )
+                if actual != generation[f"candidate_{kind}_count"]:
+                    invalid_fields.append(f"candidate_{kind}_count")
+        if invalid_fields:
+            _add(
+                violations,
+                "CATALOG_CANDIDATE_INVALID",
+                record={
+                    "generation_id": generation["id"],
+                    "fields": sorted(set(invalid_fields)),
+                },
+            )
+
+    state = connection.execute(
+        "SELECT active_generation_id, runtime_revision FROM catalog_state WHERE id = 1"
+    ).fetchone()
+    assert state is not None
+    journal_boundary = int(
+        connection.execute(
+            """
+            SELECT COALESCE(MIN(base_runtime_revision), ?)
+            FROM catalog_generations WHERE status = 'STAGING'
+            """,
+            (state["runtime_revision"],),
+        ).fetchone()[0]
+    )
+    journal_backlog = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM catalog_runtime_changes WHERE runtime_revision <= ?",
+            (journal_boundary,),
+        ).fetchone()[0]
+    )
+    if journal_backlog:
+        _add(
+            violations,
+            "CATALOG_JOURNAL_BACKLOG",
+            record={"rows": journal_backlog, "through_revision": journal_boundary},
+            severity="warning",
+        )
+
+    reclaimable = _count_reclaimable_versions(
+        connection,
+        active_generation_id=int(state["active_generation_id"]),
+    )
+    if reclaimable:
+        page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+        freelist_count = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+        _add(
+            violations,
+            "CATALOG_CLEANUP_BACKLOG",
+            record={
+                "logical_reclaimable_versions": reclaimable,
+                "page_count": page_count,
+                "freelist_count": freelist_count,
+            },
+            severity="warning",
+        )
+
+
+def _count_reclaimable_versions(
+    connection: sqlite3.Connection,
+    *,
+    active_generation_id: int,
+) -> int:
+    total = 0
+    for table in ("event_versions", "market_versions", "token_versions"):
+        total += int(
+            connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {table} AS versions
+                JOIN catalog_generations AS generation
+                  ON generation.id = versions.generation_id
+                WHERE generation.status = 'ABORTED'
+                   OR (
+                        generation.status = 'COMMITTED'
+                        AND versions.generation_id <= ?
+                        AND versions.generation_id < (
+                            SELECT MAX(candidate.generation_id)
+                            FROM {table} AS candidate
+                            JOIN catalog_generations AS candidate_generation
+                              ON candidate_generation.id = candidate.generation_id
+                             AND candidate_generation.status = 'COMMITTED'
+                            WHERE candidate.entity_id = versions.entity_id
+                              AND candidate.generation_id <= ?
+                        )
+                   )
+                """,
+                (active_generation_id, active_generation_id),
+            ).fetchone()[0]
+        )
+    return total
+
+
+def _check_migration_marker(
+    database_path: Path,
+    violations: list[str] | _IntegrityCollector,
+) -> None:
+    marker = database_path.with_name(f".{database_path.name}.v4-migration.json")
+    if not marker.exists():
+        return
+    try:
+        payload = json.loads(marker.read_text())
+        stage = payload.get("stage") if isinstance(payload, dict) else None
+    except (OSError, json.JSONDecodeError):
+        stage = None
+    if stage != "COMPLETE":
+        _add(
+            violations,
+            "MIGRATION_MARKER_INCOMPLETE",
+            record={"marker": str(marker), "stage": stage},
+        )
 
 
 def _check_id_arrays(
@@ -878,8 +1115,9 @@ def _add(
     code: str,
     *,
     record: dict[str, object] | None = None,
+    severity: Literal["error", "warning"] = "error",
 ) -> None:
     if isinstance(violations, _IntegrityCollector):
-        violations.add(code, record=record)
+        violations.add(code, record=record, severity=severity)
     elif code not in violations:
         violations.append(code)

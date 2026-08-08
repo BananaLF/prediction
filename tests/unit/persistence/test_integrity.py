@@ -16,47 +16,110 @@ from predmarket.persistence.integrity import (
 from predmarket.persistence.schema import initialize_database
 
 
+def _insert_event(
+    connection: sqlite3.Connection,
+    *,
+    event_id: str,
+    market_ids_json: str = "[]",
+) -> None:
+    connection.execute(
+        "INSERT INTO catalog_event_ids (id) VALUES (?)",
+        (event_id,),
+    )
+    connection.execute(
+        """
+        INSERT INTO event_versions (
+            entity_id, generation_id, title, status, neg_risk,
+            neg_risk_complete, neg_risk_conversion_supported,
+            market_ids_json, created_at, updated_at
+        ) VALUES (?, 1, 'Event', 'ACTIVE', 0, 0, 0, ?, 1, 1)
+        """,
+        (event_id, market_ids_json),
+    )
+
+
+def _insert_market(
+    connection: sqlite3.Connection,
+    *,
+    market_id: str,
+    condition_id: str,
+    event_id: str | None,
+) -> None:
+    connection.execute(
+        "INSERT INTO catalog_market_ids (id, event_id) VALUES (?, ?)",
+        (market_id, event_id),
+    )
+    connection.execute(
+        """
+        INSERT INTO market_versions (
+            entity_id, generation_id, condition_id, question, status,
+            active, accepting_orders, enable_orderbook, neg_risk,
+            neg_risk_member_complete, tick_size, minimum_order_size,
+            created_at, updated_at
+        ) VALUES (?, 1, ?, 'Question?', 'ACTIVE', 1, 1, 1, 0, 0,
+                  '0.01', '1', 1, 1)
+        """,
+        (market_id, condition_id),
+    )
+
+
+def _insert_token(
+    connection: sqlite3.Connection,
+    *,
+    token_id: str,
+    market_id: str,
+    position: int,
+    fee_schedule_json: str | None = None,
+) -> None:
+    connection.execute(
+        "INSERT INTO catalog_token_ids (id, market_id) VALUES (?, ?)",
+        (token_id, market_id),
+    )
+    connection.execute(
+        """
+        INSERT INTO token_versions (
+            entity_id, generation_id, outcome, position, fee_schedule_json,
+            fee_updated_at, created_at, updated_at
+        ) VALUES (?, 1, ?, ?, ?, ?, 1, 1)
+        """,
+        (
+            token_id,
+            "YES" if position == 0 else "NO",
+            position,
+            fee_schedule_json,
+            1 if fee_schedule_json is not None else None,
+        ),
+    )
+
+
 def _seed_valid_database(path: Path) -> None:
     initialize_database(path)
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(
-            """
-            INSERT INTO events (
-                id, title, status, neg_risk, neg_risk_complete,
-                neg_risk_conversion_supported, market_ids_json,
-                sync_generation, sync_generation_complete, created_at, updated_at
-            ) VALUES ('event-1', 'Event', 'ACTIVE', 0, 0, 0,
-                      '["market-1","market-2"]', 'sync-1', 1, 1, 1)
-            """
+        _insert_event(
+            connection,
+            event_id="event-1",
+            market_ids_json='["market-1","market-2"]',
         )
         for market_id, condition_id in (
             ("market-1", "condition-1"),
             ("market-2", "condition-2"),
         ):
-            connection.execute(
-                """
-                INSERT INTO markets (
-                    id, event_id, condition_id, question, status, active,
-                    accepting_orders, enable_orderbook, neg_risk,
-                    neg_risk_member_complete, sync_generation,
-                    sync_generation_complete, tick_size, minimum_order_size,
-                    created_at, updated_at
-                ) VALUES (?, 'event-1', ?, 'Question?', 'ACTIVE', 1, 1, 1, 0, 0,
-                          'sync-1', 1, '0.01', '1', 1, 1)
-                """,
-                (market_id, condition_id),
+            _insert_market(
+                connection,
+                market_id=market_id,
+                condition_id=condition_id,
+                event_id="event-1",
             )
-        connection.execute(
-            """
-            INSERT INTO tokens (
-                id, market_id, outcome, position, fee_schedule_json,
-                fee_updated_at, sync_generation, sync_generation_complete,
-                created_at, updated_at
-            ) VALUES ('token-1', 'market-1', 'YES', 0,
-                      '{"enabled":true,"model":"FLAT","parameters":{"rate":"0.01"},"source":"sdk","updated_at":1}',
-                      1, 'sync-1', 1, 1, 1)
-            """
+        _insert_token(
+            connection,
+            token_id="token-1",
+            market_id="market-1",
+            position=0,
+            fee_schedule_json=(
+                '{"enabled":true,"model":"FLAT","parameters":'
+                '{"rate":"0.01"},"source":"sdk","updated_at":1}'
+            ),
         )
         connection.execute(
             """
@@ -139,7 +202,7 @@ def _assert_violation(path: Path, code: str) -> None:
     assert code in captured.value.violations
 
 
-def test_integrity_accepts_a_valid_schema_v3_database(tmp_path: Path) -> None:
+def test_integrity_accepts_a_valid_schema_v4_database(tmp_path: Path) -> None:
     database_path = tmp_path / "market.db"
     _seed_valid_database(database_path)
 
@@ -154,6 +217,7 @@ def test_startup_check_skips_full_semantic_scans(
     _seed_valid_database(database_path)
 
     for name in (
+        "_check_catalog_generations",
         "_check_id_arrays",
         "_check_json_payloads",
         "_check_decimals",
@@ -182,6 +246,119 @@ def test_doctor_reports_a_healthy_database(tmp_path: Path) -> None:
     assert payload["status"] == "ok"
     assert payload["summary"] == {"errors": 0, "warnings": 0}
     assert payload["findings"] == []
+
+
+def test_doctor_reports_v4_generation_and_cleanup_anomalies(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        committed = connection.execute(
+            """
+            INSERT INTO catalog_generations (
+                sync_generation, input_digest, base_generation_id,
+                base_runtime_revision, status, created_at, activated_at
+            ) VALUES ('committed-2', 'digest-2', 1, 0, 'COMMITTED', 2, 2)
+            """
+        ).lastrowid
+        assert committed is not None
+        connection.execute(
+            """
+            INSERT INTO event_versions (
+                entity_id, generation_id, title, status, neg_risk,
+                neg_risk_complete, neg_risk_conversion_supported,
+                market_ids_json, created_at, updated_at
+            ) VALUES ('event-1', ?, 'New event', 'ACTIVE', 0, 0, 0,
+                      '["market-1","market-2"]', 1, 2)
+            """,
+            (committed,),
+        )
+        staging = connection.execute(
+            """
+            INSERT INTO catalog_generations (
+                sync_generation, input_digest, base_generation_id,
+                base_runtime_revision, planned_event_count,
+                written_event_count, candidate_event_count,
+                status, created_at
+            ) VALUES ('staging-3', 'digest-3', ?, 1, 0, 1, 1,
+                      'STAGING', 3)
+            """,
+            (committed,),
+        ).lastrowid
+        assert staging is not None
+        connection.execute(
+            "UPDATE catalog_state SET active_generation_id = ?, runtime_revision = 1 "
+            "WHERE id = 1",
+            (committed,),
+        )
+        connection.execute(
+            """
+            INSERT INTO catalog_runtime_changes (
+                runtime_revision, entity_type, entity_id, generation_id,
+                updated_at, changed_at
+            ) VALUES (1, 'EVENT', 'event-1', ?, 2, 2)
+            """,
+            (committed,),
+        )
+
+    marker = database_path.with_name(f".{database_path.name}.v4-migration.json")
+    marker.write_text('{"stage":"BUILDING"}')
+
+    payload = run_database_doctor(database_path).to_payload()
+    findings = {finding["code"]: finding for finding in payload["findings"]}
+
+    assert {
+        "CATALOG_CANDIDATE_INVALID",
+        "CATALOG_CLEANUP_BACKLOG",
+        "CATALOG_JOURNAL_BACKLOG",
+        "MIGRATION_MARKER_INCOMPLETE",
+    }.issubset(findings)
+    cleanup = findings["CATALOG_CLEANUP_BACKLOG"]["records"][0]
+    assert cleanup["logical_reclaimable_versions"] >= 1
+    assert cleanup["page_count"] >= 1
+    assert cleanup["freelist_count"] >= 0
+
+
+def test_doctor_reports_an_invalid_active_generation_pointer(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+    _corrupt(
+        database_path,
+        "UPDATE catalog_state SET active_generation_id = 999 WHERE id = 1",
+        foreign_keys=False,
+    )
+
+    payload = run_database_doctor(database_path).to_payload()
+
+    assert "CATALOG_ACTIVE_GENERATION_INVALID" in {
+        finding["code"] for finding in payload["findings"]
+    }
+
+
+def test_doctor_reports_multiple_staging_generations(tmp_path: Path) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP INDEX catalog_generations_one_staging_idx")
+        connection.executemany(
+            """
+            INSERT INTO catalog_generations (
+                sync_generation, input_digest, base_generation_id,
+                base_runtime_revision, status, created_at
+            ) VALUES (?, ?, 1, 0, 'STAGING', ?)
+            """,
+            (("staging-2", "digest-2", 2), ("staging-3", "digest-3", 3)),
+        )
+
+    payload = run_database_doctor(database_path).to_payload()
+
+    assert "CATALOG_MULTIPLE_STAGING" in {
+        finding["code"] for finding in payload["findings"]
+    }
 
 
 def test_doctor_orders_findings_and_json_safe_records() -> None:
@@ -224,7 +401,7 @@ def test_doctor_reports_structural_findings_after_version_mismatch(
     _seed_valid_database(database_path)
     with sqlite3.connect(database_path) as connection:
         connection.execute("PRAGMA user_version = 1")
-        connection.execute("DROP TABLE events")
+        connection.execute("DROP VIEW events")
 
     payload = run_database_doctor(database_path).to_payload()
 
@@ -241,7 +418,8 @@ def test_doctor_reports_affected_records_for_semantic_findings(
     _seed_valid_database(database_path)
     _corrupt(
         database_path,
-        "UPDATE events SET market_ids_json = '[\"market-1\"]' WHERE id = 'event-1'",
+        "UPDATE event_versions SET market_ids_json = '[\"market-1\"]' "
+        "WHERE entity_id = 'event-1' AND generation_id = 1",
     )
 
     report = run_database_doctor(database_path)
@@ -268,13 +446,13 @@ def test_doctor_returns_unavailable_for_a_missing_database(tmp_path: Path) -> No
     assert payload["error"]["code"] == "DATABASE_UNAVAILABLE"
 
 
-def test_integrity_reports_stable_error_for_incomplete_schema_v3(
+def test_integrity_reports_stable_error_for_incomplete_schema_v4(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "market.db"
     with sqlite3.connect(database_path) as connection:
         connection.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 3")
+        connection.execute("PRAGMA user_version = 4")
 
     _assert_violation(database_path, "SCHEMA_INVALID")
 
@@ -298,7 +476,12 @@ def test_integrity_rejects_invalid_id_arrays(
     _seed_valid_database(database_path)
     _corrupt(
         database_path,
-        f"UPDATE {table} SET market_ids_json = ? WHERE id = ?",
+        (
+            "UPDATE event_versions SET market_ids_json = ? "
+            "WHERE entity_id = ? AND generation_id = 1"
+            if table == "events"
+            else f"UPDATE {table} SET market_ids_json = ? WHERE id = ?"
+        ),
         (invalid_json, "event-1" if table == "events" else "signal-1"),
         ignore_checks=True,
     )
@@ -315,15 +498,7 @@ def test_integrity_accepts_an_event_without_markets(tmp_path: Path) -> None:
     database_path = tmp_path / "market.db"
     initialize_database(database_path)
     with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            """
-            INSERT INTO events (
-                id, title, status, neg_risk, neg_risk_complete,
-                neg_risk_conversion_supported, market_ids_json,
-                sync_generation, sync_generation_complete, created_at, updated_at
-            ) VALUES ('event-empty', 'Event', 'ACTIVE', 0, 0, 0, '[]', 'sync-1', 1, 1, 1)
-            """
-        )
+        _insert_event(connection, event_id="event-empty")
 
     check_database_integrity(database_path)
 
@@ -333,7 +508,8 @@ def test_integrity_rejects_event_market_dual_write_mismatch(tmp_path: Path) -> N
     _seed_valid_database(database_path)
     _corrupt(
         database_path,
-        "UPDATE events SET market_ids_json = '[\"market-1\"]' WHERE id = 'event-1'",
+        "UPDATE event_versions SET market_ids_json = '[\"market-1\"]' "
+        "WHERE entity_id = 'event-1' AND generation_id = 1",
     )
 
     _assert_violation(database_path, "EVENT_MARKETS_MISMATCH")
@@ -358,7 +534,8 @@ def test_integrity_rejects_dangling_signal_market_id(tmp_path: Path) -> None:
     ("sql", "code"),
     [
         (
-            "UPDATE markets SET tick_size = '0.010' WHERE id = 'market-1'",
+            "UPDATE market_versions SET tick_size = '0.010' "
+            "WHERE entity_id = 'market-1' AND generation_id = 1",
             "DECIMAL_INVALID",
         ),
         (
@@ -366,9 +543,10 @@ def test_integrity_rejects_dangling_signal_market_id(tmp_path: Path) -> None:
             "DECIMAL_INVALID",
         ),
         (
-            "UPDATE tokens SET fee_schedule_json = "
+            "UPDATE token_versions SET fee_schedule_json = "
             "'{\"enabled\":true,\"model\":\"FLAT\",\"parameters\":{\"rate\":\"1e-2\"},"
-            "\"source\":\"sdk\",\"updated_at\":1}' WHERE id = 'token-1'",
+            "\"source\":\"sdk\",\"updated_at\":1}' "
+            "WHERE entity_id = 'token-1' AND generation_id = 1",
             "DECIMAL_INVALID",
         ),
     ],
@@ -436,15 +614,14 @@ def test_integrity_rejects_evidence_for_a_different_token_than_trade_leg(
 ) -> None:
     database_path = tmp_path / "market.db"
     _seed_valid_database(database_path)
-    _corrupt(
-        database_path,
-        """
-        INSERT INTO tokens (
-            id, market_id, outcome, position, sync_generation,
-            sync_generation_complete, created_at, updated_at
-        ) VALUES ('token-2', 'market-1', 'NO', 1, 'sync-1', 1, 1, 1)
-        """
-    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        _insert_token(
+            connection,
+            token_id="token-2",
+            market_id="market-1",
+            position=1,
+        )
     _corrupt(
         database_path,
         """
@@ -482,15 +659,14 @@ def test_integrity_accepts_multiple_matching_trade_and_snapshot_identities(
 ) -> None:
     database_path = tmp_path / "market.db"
     _seed_valid_database(database_path)
-    _corrupt(
-        database_path,
-        """
-        INSERT INTO tokens (
-            id, market_id, outcome, position, sync_generation,
-            sync_generation_complete, created_at, updated_at
-        ) VALUES ('token-2', 'market-1', 'NO', 1, 'sync-1', 1, 1, 1)
-        """
-    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        _insert_token(
+            connection,
+            token_id="token-2",
+            market_id="market-1",
+            position=1,
+        )
     _corrupt(
         database_path,
         """

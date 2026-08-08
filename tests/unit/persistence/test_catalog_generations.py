@@ -15,8 +15,10 @@ from predmarket.persistence.catalog_generations import (
     CatalogActivationConflict,
     CatalogBatchLimits,
     CatalogConstraintError,
+    CatalogGenerationError,
     CatalogGenerationCoordinator,
     CatalogSyncAborted,
+    CleanupResult,
     GenerationInput,
     RebaseResult,
     write_runtime_catalog,
@@ -72,6 +74,23 @@ def _insert_event_version(
         ) VALUES (?, ?, ?, 'ACTIVE', 0, 0, 0, '[]', 1, 1)
         """,
         (event_id, generation_id, title),
+    )
+
+
+def _insert_runtime_change(
+    connection: sqlite3.Connection,
+    *,
+    revision: int,
+    generation_id: int,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO catalog_runtime_changes (
+            runtime_revision, entity_type, entity_id, generation_id,
+            updated_at, changed_at
+        ) VALUES (?, 'EVENT', 'event-1', ?, ?, ?)
+        """,
+        (revision, generation_id, revision, revision),
     )
 
 
@@ -1145,3 +1164,163 @@ async def test_activate_retries_and_replays_only_new_journal_rows(
             "SELECT rebased_runtime_revision FROM catalog_generations WHERE id = ?",
             (staged.id,),
         ).fetchone() == (2,)
+
+
+async def test_cleanup_preserves_visible_and_staging_versions_and_rebase_journal(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    with _connect(database_path) as connection:
+        committed = _insert_generation(
+            connection,
+            sync_generation="sync-committed",
+            status=GenerationStatus.COMMITTED,
+        )
+        aborted = _insert_generation(
+            connection,
+            sync_generation="sync-aborted",
+            status=GenerationStatus.ABORTED,
+        )
+        staging = _insert_generation(
+            connection,
+            sync_generation="sync-staging",
+            status=GenerationStatus.STAGING,
+        )
+        connection.execute(
+            "UPDATE catalog_generations SET base_runtime_revision = 1 WHERE id = ?",
+            (staging,),
+        )
+        for generation_id, title in (
+            (1, "Old"),
+            (committed, "Visible"),
+            (aborted, "Aborted"),
+            (staging, "Staging"),
+        ):
+            _insert_event_version(
+                connection,
+                event_id="event-1",
+                generation_id=generation_id,
+                title=title,
+            )
+        connection.execute(
+            "UPDATE catalog_state SET active_generation_id = ?, runtime_revision = 3 "
+            "WHERE id = 1",
+            (committed,),
+        )
+        for revision in (1, 2, 3):
+            _insert_runtime_change(
+                connection,
+                revision=revision,
+                generation_id=committed,
+            )
+
+    result = await CatalogGenerationCoordinator(
+        _CatalogTestWriter(database_path)
+    ).cleanup(max_rows=10)
+
+    assert result == CleanupResult(
+        deleted_versions=2,
+        deleted_journal_rows=1,
+        remaining_versions=0,
+        remaining_journal_rows=0,
+    )
+    with _connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT generation_id FROM event_versions WHERE entity_id = 'event-1' "
+            "ORDER BY generation_id"
+        ).fetchall() == [(committed,), (staging,)]
+        assert connection.execute(
+            "SELECT runtime_revision FROM catalog_runtime_changes "
+            "ORDER BY runtime_revision"
+        ).fetchall() == [(2,), (3,)]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM catalog_generations"
+        ).fetchone() == (4,)
+
+
+async def test_cleanup_uses_a_persistent_keyset_cursor_and_row_bound(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    with _connect(database_path) as connection:
+        committed = _insert_generation(
+            connection,
+            sync_generation="sync-committed",
+            status=GenerationStatus.COMMITTED,
+        )
+        aborted = _insert_generation(
+            connection,
+            sync_generation="sync-aborted",
+            status=GenerationStatus.ABORTED,
+        )
+        for generation_id, event_id in (
+            (1, "event-1"),
+            (committed, "event-1"),
+            (aborted, "event-1"),
+            (aborted, "event-2"),
+        ):
+            _insert_event_version(
+                connection,
+                event_id=event_id,
+                generation_id=generation_id,
+                title=f"{event_id}-{generation_id}",
+            )
+        connection.execute(
+            "UPDATE catalog_state SET active_generation_id = ? WHERE id = 1",
+            (committed,),
+        )
+
+    coordinator = CatalogGenerationCoordinator(_CatalogTestWriter(database_path))
+    first = await coordinator.cleanup(max_rows=1)
+    with _connect(database_path) as connection:
+        cursor_after_first = connection.execute(
+            """
+            SELECT cleanup_entity_type, cleanup_entity_id, cleanup_generation_id
+            FROM catalog_state WHERE id = 1
+            """
+        ).fetchone()
+    failing_writer = _CatalogTestWriter(database_path, fail_transaction=1)
+    with pytest.raises(RuntimeError, match="injected writer failure"):
+        await CatalogGenerationCoordinator(failing_writer).cleanup(max_rows=1)
+    with _connect(database_path) as connection:
+        assert connection.execute(
+            """
+            SELECT cleanup_entity_type, cleanup_entity_id, cleanup_generation_id
+            FROM catalog_state WHERE id = 1
+            """
+        ).fetchone() == cursor_after_first
+
+    second = await coordinator.cleanup(max_rows=1)
+    third = await coordinator.cleanup(max_rows=1)
+
+    assert first == CleanupResult(1, 0, 2, 0)
+    assert cursor_after_first[0] == "EVENT"
+    assert cursor_after_first[1] is not None
+    assert cursor_after_first[2] is not None
+    assert second.deleted_versions == 1
+    assert third == CleanupResult(1, 0, 0, 0)
+    with _connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT generation_id FROM event_versions WHERE entity_id = 'event-1'"
+        ).fetchall() == [(committed,)]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM event_versions WHERE entity_id = 'event-2'"
+        ).fetchone() == (0,)
+
+
+async def test_cleanup_refuses_to_start_above_the_wal_preflight_threshold(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    writer = _CatalogTestWriter(
+        database_path,
+        checkpoint_wal_bytes=(16 * 1024 * 1024,),
+    )
+
+    with pytest.raises(CatalogGenerationError, match="cleanup WAL preflight"):
+        await CatalogGenerationCoordinator(writer).cleanup()
+
+    assert writer.transaction_count == 0

@@ -156,6 +156,14 @@ class RebaseResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CleanupResult:
+    deleted_versions: int
+    deleted_journal_rows: int
+    remaining_versions: int
+    remaining_journal_rows: int
+
+
+@dataclass(frozen=True, slots=True)
 class _EntityPlan:
     kind: str
     values: tuple[_Entity, ...]
@@ -365,6 +373,196 @@ class CatalogGenerationCoordinator:
                 if attempt >= self._max_activation_rebases:
                     raise
                 current, _result = await self.rebase(current)
+
+    async def cleanup(self, *, max_rows: int = 8_000) -> CleanupResult:
+        """Delete one recoverable batch of dominated payload and journal rows."""
+
+        if type(max_rows) is not int or not 0 < max_rows <= 8_000:
+            raise ValueError("max_rows must be an integer between 1 and 8000")
+        preflight = await self._writer.checkpoint(CheckpointMode.TRUNCATE)
+        if preflight.wal_bytes >= self._wal_policy.preflight_bytes:
+            raise CatalogGenerationError(
+                "catalog cleanup WAL preflight could not reclaim below the safety "
+                "threshold"
+            )
+        now = self._clock()
+
+        async def command(connection: aiosqlite.Connection) -> CleanupResult:
+            state_cursor = await connection.execute(
+                """
+                SELECT active_generation_id, runtime_revision,
+                       cleanup_entity_type, cleanup_entity_id,
+                       cleanup_generation_id
+                FROM catalog_state WHERE id = 1
+                """
+            )
+            state = await state_cursor.fetchone()
+            if state is None:
+                raise CatalogGenerationError("catalog state singleton is missing")
+            active_generation_id = int(state[0])
+            runtime_revision = int(state[1])
+            cursor_kind = state[2]
+            cursor_entity_id = state[3]
+            cursor_generation_id = state[4]
+            kinds = (
+                ("EVENT", "event_versions"),
+                ("MARKET", "market_versions"),
+                ("TOKEN", "token_versions"),
+            )
+            start_index = next(
+                (
+                    index
+                    for index, (kind, _table) in enumerate(kinds)
+                    if kind == cursor_kind
+                ),
+                0,
+            )
+            remaining_budget = max_rows
+            deleted_versions = 0
+            last_cursor: tuple[str, str, int] | None = None
+            completed_version_cycle = True
+
+            for index in range(start_index, len(kinds)):
+                kind, table = kinds[index]
+                after_entity = cursor_entity_id if kind == cursor_kind else None
+                after_generation = (
+                    int(cursor_generation_id)
+                    if kind == cursor_kind and cursor_generation_id is not None
+                    else None
+                )
+                selected = await _select_cleanup_versions(
+                    connection,
+                    table=table,
+                    active_generation_id=active_generation_id,
+                    after_entity=after_entity,
+                    after_generation=after_generation,
+                    limit=remaining_budget,
+                )
+                if selected:
+                    await connection.executemany(
+                        f"DELETE FROM {table} "
+                        "WHERE entity_id = ? AND generation_id = ?",
+                        selected,
+                    )
+                    deleted_versions += len(selected)
+                    remaining_budget -= len(selected)
+                    entity_id, generation_id = selected[-1]
+                    last_cursor = (kind, entity_id, generation_id)
+                if remaining_budget == 0:
+                    completed_version_cycle = False
+                    break
+
+            deleted_journal_rows = 0
+            if completed_version_cycle and remaining_budget:
+                boundary_cursor = await connection.execute(
+                    """
+                    SELECT COALESCE(
+                        MIN(base_runtime_revision),
+                        ?
+                    )
+                    FROM catalog_generations
+                    WHERE status = 'STAGING'
+                    """,
+                    (runtime_revision,),
+                )
+                boundary_row = await boundary_cursor.fetchone()
+                journal_boundary = int(boundary_row[0])
+                journal_cursor = await connection.execute(
+                    """
+                    SELECT runtime_revision, entity_type, entity_id
+                    FROM catalog_runtime_changes
+                    WHERE runtime_revision <= ?
+                    ORDER BY runtime_revision, entity_type,
+                             CAST(entity_id AS BLOB)
+                    LIMIT ?
+                    """,
+                    (journal_boundary, remaining_budget),
+                )
+                journal_rows = [tuple(row) for row in await journal_cursor.fetchall()]
+                if journal_rows:
+                    await connection.executemany(
+                        """
+                        DELETE FROM catalog_runtime_changes
+                        WHERE runtime_revision = ? AND entity_type = ? AND entity_id = ?
+                        """,
+                        journal_rows,
+                    )
+                    deleted_journal_rows = len(journal_rows)
+
+            if completed_version_cycle:
+                await connection.execute(
+                    """
+                    UPDATE catalog_state
+                    SET cleanup_entity_type = NULL,
+                        cleanup_entity_id = NULL,
+                        cleanup_generation_id = NULL,
+                        last_checkpoint_at = ?
+                    WHERE id = 1
+                    """,
+                    (now,),
+                )
+            elif last_cursor is not None:
+                await connection.execute(
+                    """
+                    UPDATE catalog_state
+                    SET cleanup_entity_type = ?, cleanup_entity_id = ?,
+                        cleanup_generation_id = ?, last_checkpoint_at = ?
+                    WHERE id = 1
+                    """,
+                    (*last_cursor, now),
+                )
+
+            remaining_versions = await _count_cleanup_versions(
+                connection,
+                active_generation_id=active_generation_id,
+            )
+            staging_cursor = await connection.execute(
+                """
+                SELECT COALESCE(MIN(base_runtime_revision), ?)
+                FROM catalog_generations WHERE status = 'STAGING'
+                """,
+                (runtime_revision,),
+            )
+            staging_row = await staging_cursor.fetchone()
+            remaining_journal_cursor = await connection.execute(
+                """
+                SELECT COUNT(*) FROM catalog_runtime_changes
+                WHERE runtime_revision <= ?
+                """,
+                (int(staging_row[0]),),
+            )
+            remaining_journal_row = await remaining_journal_cursor.fetchone()
+            return CleanupResult(
+                deleted_versions=deleted_versions,
+                deleted_journal_rows=deleted_journal_rows,
+                remaining_versions=remaining_versions,
+                remaining_journal_rows=int(remaining_journal_row[0]),
+            )
+
+        result = await self._writer.execute(command)
+        checkpoint = await self._writer.checkpoint(CheckpointMode.PASSIVE)
+        action = decide_wal_action(
+            wal_bytes=checkpoint.wal_bytes,
+            predicted_delta=0,
+            policy=self._wal_policy,
+        )
+        if action in {WalAction.PAUSE_AND_CHECKPOINT, WalAction.ABORT}:
+            await self._reclaim_cleanup_wal(checkpoint.wal_bytes)
+        return result
+
+    async def _reclaim_cleanup_wal(self, wal_peak_bytes: int) -> None:
+        for _ in range(self._max_pause_checkpoints):
+            checkpoint = await self._writer.checkpoint(CheckpointMode.RESTART)
+            wal_peak_bytes = max(wal_peak_bytes, checkpoint.wal_bytes)
+            await asyncio.sleep(0)
+            if checkpoint.wal_bytes < self._wal_policy.pause_bytes:
+                return
+            if checkpoint.wal_bytes >= self._wal_policy.abort_bytes:
+                break
+        raise CatalogGenerationError(
+            "catalog cleanup WAL pause could not be cleared "
+            f"(peak_bytes={wal_peak_bytes})"
+        )
 
     async def _activate_once(
         self,
@@ -1124,6 +1322,95 @@ async def _load_staged_entities(
             )
         ),
     )
+
+
+async def _select_cleanup_versions(
+    connection: aiosqlite.Connection,
+    *,
+    table: str,
+    active_generation_id: int,
+    after_entity: str | None,
+    after_generation: int | None,
+    limit: int,
+) -> list[tuple[str, int]]:
+    cursor_filter = ""
+    parameters: list[object] = [active_generation_id, active_generation_id]
+    if after_entity is not None and after_generation is not None:
+        cursor_filter = """
+          AND (
+              CAST(versions.entity_id AS BLOB) > CAST(? AS BLOB)
+              OR (
+                  versions.entity_id = ?
+                  AND versions.generation_id > ?
+              )
+          )
+        """
+        parameters.extend((after_entity, after_entity, after_generation))
+    parameters.append(limit)
+    cursor = await connection.execute(
+        f"""
+        SELECT versions.entity_id, versions.generation_id
+        FROM {table} AS versions
+        JOIN catalog_generations AS generation
+          ON generation.id = versions.generation_id
+        WHERE (
+            generation.status = 'ABORTED'
+            OR (
+                generation.status = 'COMMITTED'
+                AND versions.generation_id <= ?
+                AND versions.generation_id < (
+                    SELECT MAX(candidate.generation_id)
+                    FROM {table} AS candidate
+                    JOIN catalog_generations AS candidate_generation
+                      ON candidate_generation.id = candidate.generation_id
+                     AND candidate_generation.status = 'COMMITTED'
+                    WHERE candidate.entity_id = versions.entity_id
+                      AND candidate.generation_id <= ?
+                )
+            )
+        )
+        {cursor_filter}
+        ORDER BY CAST(versions.entity_id AS BLOB), versions.generation_id
+        LIMIT ?
+        """,
+        parameters,
+    )
+    return [(str(row[0]), int(row[1])) for row in await cursor.fetchall()]
+
+
+async def _count_cleanup_versions(
+    connection: aiosqlite.Connection,
+    *,
+    active_generation_id: int,
+) -> int:
+    total = 0
+    for table in ("event_versions", "market_versions", "token_versions"):
+        cursor = await connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {table} AS versions
+            JOIN catalog_generations AS generation
+              ON generation.id = versions.generation_id
+            WHERE generation.status = 'ABORTED'
+               OR (
+                    generation.status = 'COMMITTED'
+                    AND versions.generation_id <= ?
+                    AND versions.generation_id < (
+                        SELECT MAX(candidate.generation_id)
+                        FROM {table} AS candidate
+                        JOIN catalog_generations AS candidate_generation
+                          ON candidate_generation.id = candidate.generation_id
+                         AND candidate_generation.status = 'COMMITTED'
+                        WHERE candidate.entity_id = versions.entity_id
+                          AND candidate.generation_id <= ?
+                    )
+               )
+            """,
+            (active_generation_id, active_generation_id),
+        )
+        row = await cursor.fetchone()
+        total += int(row[0])
+    return total
 
 
 async def _generation_sync_name(
