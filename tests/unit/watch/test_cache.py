@@ -116,6 +116,62 @@ def test_revision_does_not_change_for_rejected_or_resync_state_changes() -> None
     assert cache.revision == baseline_revision
 
 
+def test_token_revision_snapshot_tracks_only_changed_full_book() -> None:
+    cache = _valid_cache()
+    snapshot = cache.snapshot_token_revisions()
+
+    assert snapshot.generation == 1
+    assert snapshot.revisions == (("token-a", 1), ("token-b", 1))
+    with pytest.raises(FrozenInstanceError):
+        snapshot.generation = 2  # type: ignore[misc]
+
+    current = cache.get("token-a")
+    assert current is not None
+    assert cache.apply_book(
+        replace(
+            current,
+            book_hash="token-a-new",
+            exchange_timestamp=101,
+        )
+    ) is True
+
+    assert cache.token_revisions_match(snapshot, ("token-b",)) is True
+    assert cache.token_revisions_match(snapshot, ("token-a",)) is False
+
+
+def test_multi_token_delta_advances_each_changed_token_revision() -> None:
+    cache = _valid_cache()
+    snapshot = cache.snapshot_token_revisions()
+
+    assert cache.apply_delta(
+        (
+            OrderBookDelta("token-a", "BUY", "0.41", "7", "post-a"),
+            OrderBookDelta("token-b", "BUY", "0.41", "8", "post-b"),
+        ),
+        generation=1,
+        sequence=1,
+        exchange_timestamp=102,
+        received_timestamp=103,
+    ) is True
+
+    assert cache.token_revisions_match(snapshot, ("token-a",)) is False
+    assert cache.token_revisions_match(snapshot, ("token-b",)) is False
+
+
+def test_token_revision_snapshot_fails_closed_after_invalidation_or_generation_change() -> None:
+    cache = _valid_cache()
+    snapshot = cache.snapshot_token_revisions()
+
+    assert cache.invalidate(generation=1, reason="rotate") is True
+    assert cache.token_revisions_match(snapshot, ("token-a",)) is False
+    cache.begin_resync(generation=2, token_ids=("token-a", "token-b"))
+    cache.apply_snapshot(
+        (_book("token-a", generation=2), _book("token-b", generation=2))
+    )
+
+    assert cache.token_revisions_match(snapshot, ("token-a",)) is False
+
+
 def test_complete_snapshot_becomes_valid_sorted_immutable_view() -> None:
     # Catches partial/mutable REST baselines escaping the recovery barrier.
     cache = OrderBookCache()

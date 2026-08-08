@@ -15,6 +15,11 @@ from predmarket.app import (
     _SignalManagerRouter,
     _SubscriptionGenerationSource,
 )
+from predmarket.catalog.changes import (
+    MarketChange,
+    MarketChangeOverflow,
+    MarketChangeType,
+)
 from predmarket.config import AppConfig, DatabaseConfig, NotificationConfig
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
@@ -206,6 +211,59 @@ def _config(tmp_path: Path) -> AppConfig:
             desktop_enabled=False,
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_supervisor_records_queue_overflow_at_detection_time(
+    tmp_path: Path,
+) -> None:
+    events = _Events()
+    supervisor = Supervisor(_config(tmp_path), clock_ms=lambda: 999)
+    incoming = MarketChange(
+        change_id="incoming",
+        change_type=MarketChangeType.MARKET_UPDATED,
+        event_id="event-1",
+        market_id="market-1",
+        token_ids=("token-1",),
+        occurred_at=123,
+    )
+    overflow = MarketChangeOverflow(
+        incoming=incoming,
+        dropped=incoming,
+        detected_at=999,
+        queue_size=4,
+        capacity=4,
+        high_water_mark=4,
+        overflow_count=7,
+        dropped_count=5,
+        evicted_count=1,
+        backpressured_count=1,
+    )
+
+    await supervisor._record_overflow(events, overflow)
+
+    assert events.entries == [
+        {
+            "component": "SUPERVISOR",
+            "severity": "ERROR",
+            "event_type": "MARKET_CHANGE_QUEUE_OVERFLOW",
+            "message": "Market-change queue entered degraded mode",
+            "occurred_at": 999,
+            "details": {
+                "incoming_change_id": "incoming",
+                "evicted_change_id": None,
+                "dropped_change_id": "incoming",
+                "backpressured": False,
+                "queue_size": 4,
+                "capacity": 4,
+                "high_water_mark": 4,
+                "overflow_count": 7,
+                "dropped_count": 5,
+                "evicted_count": 1,
+                "backpressured_count": 1,
+            },
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -198,6 +198,7 @@ class Supervisor:
                     system_events, overflow
                 ),
                 notify=lambda overflow: self._notify_overflow(notifier, overflow),
+                clock_ms=self._clock_ms,
             )
             _LOGGER.info("component_initialized component=market_change_queue")
             gateway = self._provided_gateway
@@ -329,12 +330,19 @@ class Supervisor:
             severity="ERROR",
             event_type="MARKET_CHANGE_QUEUE_OVERFLOW",
             message="Market-change queue entered degraded mode",
-            occurred_at=overflow.incoming.occurred_at,
+            occurred_at=overflow.detected_at,
             details={
                 "incoming_change_id": overflow.incoming.change_id,
                 "evicted_change_id": None if overflow.evicted is None else overflow.evicted.change_id,
                 "dropped_change_id": None if overflow.dropped is None else overflow.dropped.change_id,
                 "backpressured": overflow.backpressured,
+                "queue_size": overflow.queue_size,
+                "capacity": overflow.capacity,
+                "high_water_mark": overflow.high_water_mark,
+                "overflow_count": overflow.overflow_count,
+                "dropped_count": overflow.dropped_count,
+                "evicted_count": overflow.evicted_count,
+                "backpressured_count": overflow.backpressured_count,
             },
         )
 
@@ -344,7 +352,16 @@ class Supervisor:
         await notifier.notify(
             event_type="MARKET_CHANGE_QUEUE_OVERFLOW",
             message="Market-change queue entered degraded mode",
-            details={"incoming_change_id": overflow.incoming.change_id},
+            details={
+                "incoming_change_id": overflow.incoming.change_id,
+                "queue_size": overflow.queue_size,
+                "capacity": overflow.capacity,
+                "high_water_mark": overflow.high_water_mark,
+                "overflow_count": overflow.overflow_count,
+                "dropped_count": overflow.dropped_count,
+                "evicted_count": overflow.evicted_count,
+                "backpressured_count": overflow.backpressured_count,
+            },
         )
 
 
@@ -652,6 +669,19 @@ class _SignalManagerRouter:
     ) -> None:
         await self._closure_manager.close_unwatchable_for_active_tokens(
             active_token_ids,
+            observed_at=observed_at,
+        )
+
+    async def reconcile_open_signals(
+        self,
+        active_token_ids: tuple[str, ...],
+        *,
+        catalog_generation: str | None = None,
+        observed_at: int | None,
+    ) -> tuple[str, ...]:
+        return await self._closure_manager.reconcile_open_signals(
+            active_token_ids,
+            catalog_generation=catalog_generation,
             observed_at=observed_at,
         )
 

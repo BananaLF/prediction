@@ -486,14 +486,103 @@ async def test_complete_generation_drains_gateway_and_commits_before_publish(
     assert "_prepare_complete" in threaded_functions
     assert gateway.event_calls == gateway.market_calls == 1
     assert [change.change_type for change in queue.items] == [
-        MarketChangeType.MARKET_ADDED,
-        MarketChangeType.MARKET_ADDED,
+        MarketChangeType.CATALOG_RECONCILED
     ]
     stored = await catalog.load_catalog()
     assert all(event.sync_generation == "sync-1" for event in stored.events)
     assert all(event.sync_generation_complete for event in stored.events)
     assert all(market.sync_generation_complete for market in stored.markets)
     assert all(token.sync_generation_complete for token in stored.tokens)
+
+
+async def test_complete_generation_publishes_one_reconciliation_control(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    await _seed(catalog, ("market-old",))
+    queue = _RecordingQueue(catalog)
+    task = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-1", "market-2")),),
+            markets=(_snapshot("market-1"), _snapshot("market-2")),
+            refreshed={"market-old": RuntimeError("not resolved")},
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 101,
+        generation_factory=lambda: "sync-aggregate",
+    )
+
+    result = await task.run_once()
+
+    assert result.changes_published == 1
+    assert result.changes_dropped == 0
+    assert len(queue.items) == 1
+    assert queue.items[0] == MarketChange(
+        change_id="sync-aggregate:CATALOG_RECONCILED:catalog",
+        change_type=MarketChangeType.CATALOG_RECONCILED,
+        event_id=None,
+        market_id=None,
+        token_ids=(),
+        occurred_at=101,
+        critical=True,
+    )
+    rows = await system_events.read_after(0)
+    assert [row["event_type"] for row in rows].count(
+        "CATALOG_RECONCILIATION_READY"
+    ) == 1
+    assert [row["event_type"] for row in rows].count(
+        "MARKET_CHANGE_PUBLISHED"
+    ) == 1
+
+
+async def test_pending_reconciliation_is_republished_before_remote_fetch(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    pending_change = MarketChange(
+        change_id="sync-pending:CATALOG_RECONCILED:catalog",
+        change_type=MarketChangeType.CATALOG_RECONCILED,
+        event_id=None,
+        market_id=None,
+        token_ids=(),
+        occurred_at=99,
+        critical=True,
+    )
+    await catalog.save_complete_catalog(
+        generation="sync-pending",
+        updated_at=99,
+        events=(),
+        markets=(),
+        tokens=(),
+        reconciliation_change=pending_change,
+        reconciliation_market_ids=(),
+    )
+    queue = _RecordingQueue()
+
+    class _OrderingGateway(_FakeGateway):
+        async def list_active_events(self) -> tuple[Event, ...]:
+            assert queue.items == [pending_change]
+            return await super().list_active_events()
+
+    task = SyncMarketTask(
+        gateway=_OrderingGateway(
+            events=RuntimeError("stop after recovery"),
+            markets=(),
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 102,
+        generation_factory=lambda: "sync-next",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is False
+    assert queue.items == [pending_change]
+    assert await system_events.list_pending_catalog_reconciliations() == ()
 
 
 async def test_complete_generation_accepts_orphan_markets_and_empty_events(
@@ -527,9 +616,10 @@ async def test_complete_generation_accepts_orphan_markets_and_empty_events(
     assert stored_event.market_ids == ()
     assert stored_market is not None
     assert stored_market.event_id is None
-    assert [(change.change_type, change.event_id, change.market_id) for change in queue.items] == [
-        (MarketChangeType.MARKET_ADDED, None, "market-orphan")
-    ]
+    assert [
+        (change.change_type, change.event_id, change.market_id)
+        for change in queue.items
+    ] == [(MarketChangeType.CATALOG_RECONCILED, None, None)]
 
 
 async def test_prepare_complete_missing_events_is_linear() -> None:
@@ -693,9 +783,11 @@ async def test_complete_generation_deactivates_only_missing_market(
     assert missing.accepting_orders is False
     assert missing.enable_orderbook is False
     assert [change.change_type for change in queue.items] == [
-        MarketChangeType.MARKET_DEACTIVATED
+        MarketChangeType.CATALOG_RECONCILED
     ]
-    assert queue.items[0].market_id == "market-2"
+    assert await system_events.list_published_market_ids() == frozenset(
+        {"market-1"}
+    )
 
 
 async def test_malformed_new_market_is_skipped_without_blocking_generation(
@@ -771,12 +863,12 @@ async def test_malformed_existing_market_is_retained_but_deactivated(
     assert retained.accepting_orders is False
     assert retained.enable_orderbook is False
     assert [change.change_type for change in queue.items] == [
-        MarketChangeType.MARKET_DEACTIVATED
+        MarketChangeType.CATALOG_RECONCILED
     ]
-    assert queue.items[0].market_id == "market-old"
+    assert await system_events.list_published_market_ids() == frozenset()
 
 
-async def test_all_authoritatively_resolved_event_markets_publish_event_settled(
+async def test_all_authoritatively_resolved_event_markets_reconcile_settlement(
     catalog_runtime,
 ) -> None:
     catalog, system_events = catalog_runtime
@@ -816,7 +908,7 @@ async def test_all_authoritatively_resolved_event_markets_publish_event_settled(
     assert event.resolved_at == 600
     assert gateway.refresh_calls == ["market-1", "market-2"]
     assert [change.change_type for change in queue.items] == [
-        MarketChangeType.EVENT_SETTLED
+        MarketChangeType.CATALOG_RECONCILED
     ]
 
 
@@ -880,13 +972,9 @@ async def test_missing_event_is_not_guessed_settled_without_all_resolved_proof(
     assert event is not None
     assert event.status is MarketStatus.CLOSED
     assert event.resolved_at is None
-    assert MarketChangeType.EVENT_SETTLED not in {
-        change.change_type for change in queue.items
-    }
-    assert all(
-        change.change_type is MarketChangeType.MARKET_DEACTIVATED
-        for change in queue.items
-    )
+    assert [change.change_type for change in queue.items] == [
+        MarketChangeType.CATALOG_RECONCILED
+    ]
 
 
 async def test_missing_market_refresh_still_active_makes_generation_incomplete(
@@ -969,7 +1057,7 @@ async def test_closed_unresolved_market_is_refreshed_until_later_resolution(
     assert (await second.run_once()).complete is True
     assert gateway.refresh_calls == ["market-1"]
     assert [item.change_type for item in queue.items] == [
-        MarketChangeType.EVENT_SETTLED
+        MarketChangeType.CATALOG_RECONCILED
     ]
 
 
@@ -999,7 +1087,9 @@ async def test_complete_generation_rebuilds_stale_event_market_members(
     stored = await catalog.get_market("market-1")
     assert stored is not None
     assert stored.sync_generation_complete is True
-    assert [change.market_id for change in queue.items] == ["market-1"]
+    assert [change.change_type for change in queue.items] == [
+        MarketChangeType.CATALOG_RECONCILED
+    ]
 
 
 async def test_incomplete_generation_never_creates_complete_neg_risk_proof(
@@ -1187,8 +1277,17 @@ async def test_repeated_complete_generation_is_an_idempotent_upsert(
     second = await task.run_once()
 
     assert first.complete is second.complete is True
-    assert [change.change_type for change in queue.items] == [
-        MarketChangeType.MARKET_ADDED
+    assert [
+        (change.change_type, change.change_id) for change in queue.items
+    ] == [
+        (
+            MarketChangeType.CATALOG_RECONCILED,
+            "sync-1:CATALOG_RECONCILED:catalog",
+        ),
+        (
+            MarketChangeType.CATALOG_RECONCILED,
+            "sync-2:CATALOG_RECONCILED:catalog",
+        ),
     ]
     stored = await catalog.load_catalog()
     assert len(stored.events) == 1
@@ -1230,7 +1329,7 @@ async def test_complete_after_new_incomplete_replays_added_after_restart(
 
     assert (await recovered.run_once()).complete is True
     assert [(item.change_type, item.market_id) for item in queue.items] == [
-        (MarketChangeType.MARKET_ADDED, "market-1")
+        (MarketChangeType.CATALOG_RECONCILED, None)
     ]
 
 
@@ -1252,7 +1351,10 @@ async def test_complete_after_existing_incomplete_replays_critical_update(
         generation_factory=lambda: "sync-first-complete",
     )
     assert (await first.run_once()).complete is True
-    assert first_queue.items[0].change_type is MarketChangeType.MARKET_ADDED
+    assert (
+        first_queue.items[0].change_type
+        is MarketChangeType.CATALOG_RECONCILED
+    )
 
     changed = _snapshot("market-1", question="Changed?")
     incomplete = SyncMarketTask(
@@ -1283,11 +1385,11 @@ async def test_complete_after_existing_incomplete_replays_critical_update(
 
     assert (await recovered.run_once()).complete is True
     assert len(queue.items) == 1
-    assert queue.items[0].change_type is MarketChangeType.MARKET_UPDATED
+    assert queue.items[0].change_type is MarketChangeType.CATALOG_RECONCILED
     assert queue.items[0].critical is True
 
 
-async def test_dropped_added_is_not_recorded_as_publication_baseline(
+async def test_dropped_reconciliation_is_republished_before_next_generation(
     catalog_runtime,
 ) -> None:
     catalog, system_events = catalog_runtime
@@ -1306,18 +1408,22 @@ async def test_dropped_added_is_not_recorded_as_publication_baseline(
     result = await dropped.run_once()
     assert result.changes_dropped == 1
 
+    replay_queue = _RecordingQueue()
     incomplete = SyncMarketTask(
         gateway=_FakeGateway(
             events=(_event(("market-1",)),),
             markets=(snapshot, object()),
         ),
         catalog=catalog,
-        changes=_RecordingQueue(),
+        changes=replay_queue,
         system_events=system_events,
         clock_ms=lambda: 470,
         generation_factory=lambda: "sync-after-drop-incomplete",
     )
     assert (await incomplete.run_once()).complete is False
+    assert [item.change_id for item in replay_queue.items] == [
+        "sync-dropped:CATALOG_RECONCILED:catalog"
+    ]
 
     queue = _RecordingQueue()
     recovered = SyncMarketTask(
@@ -1333,7 +1439,9 @@ async def test_dropped_added_is_not_recorded_as_publication_baseline(
     )
     await recovered.run_once()
 
-    assert queue.items[0].change_type is MarketChangeType.MARKET_ADDED
+    assert [item.change_id for item in queue.items] == [
+        "sync-after-drop-complete:CATALOG_RECONCILED:catalog"
+    ]
 
 
 async def test_publication_marker_is_idempotent_by_change_identity(
@@ -1382,13 +1490,12 @@ async def test_marker_failure_degrades_but_does_not_skip_later_critical_control(
     assert result.degraded is True
     assert result.publication_marker_failures == 1
     assert [item.change_type for item in queue.items] == [
-        MarketChangeType.MARKET_ADDED,
-        MarketChangeType.MARKET_DEACTIVATED,
+        MarketChangeType.CATALOG_RECONCILED,
     ]
     events = await real_system_events.read_after(0)
     degraded = [event for event in events if event["event_type"] == "SYSTEM_DEGRADED"]
     assert len(degraded) == 1
-    assert degraded[0]["details"]["failed_change_id"].endswith("market-1")
+    assert degraded[0]["details"]["failed_change_id"].endswith("catalog")
 
 
 async def test_degraded_report_runs_only_after_later_critical_control_admission(
@@ -1415,8 +1522,7 @@ async def test_degraded_report_runs_only_after_later_critical_control_admission(
     await asyncio.wait_for(controlled_events.report_started.wait(), timeout=1)
 
     assert [item.change_type for item in queue.items] == [
-        MarketChangeType.MARKET_ADDED,
-        MarketChangeType.MARKET_DEACTIVATED,
+        MarketChangeType.CATALOG_RECONCILED,
     ]
     assert run.done() is False
     controlled_events.release_report.set()
@@ -1459,6 +1565,7 @@ async def test_slow_real_writer_marker_is_not_false_degradation(
         assert slow_system_events.active_writer_commands == 0
         events = await real_system_events.read_after(0)
         assert [event["event_type"] for event in events] == [
+            "CATALOG_RECONCILIATION_READY",
             "MARKET_CHANGE_PUBLISHED"
         ]
     finally:
@@ -1508,6 +1615,7 @@ async def test_cancelled_sync_drains_accepted_real_writer_marker(
         after = await real_system_events.read_after(0)
         assert after == before
         assert [event["event_type"] for event in after] == [
+            "CATALOG_RECONCILIATION_READY",
             "MARKET_CHANGE_PUBLISHED"
         ]
     finally:
@@ -1545,8 +1653,7 @@ async def test_real_writer_marker_failure_degrades_after_critical_admissions(
         ).run_once()
 
         assert [item.change_type for item in queue.items] == [
-            MarketChangeType.MARKET_ADDED,
-            MarketChangeType.MARKET_DEACTIVATED,
+            MarketChangeType.CATALOG_RECONCILED,
         ]
         assert result.degraded is True
         assert result.publication_marker_failures == 1
@@ -1615,7 +1722,7 @@ async def test_deactivated_publication_baseline_reactivation_replays_added(
     )
     await recovered.run_once()
 
-    assert queue.items[0].change_type is MarketChangeType.MARKET_ADDED
+    assert queue.items[0].change_type is MarketChangeType.CATALOG_RECONCILED
 
 
 async def test_settlement_refresh_budget_uses_persistent_fair_cursor(
@@ -1687,10 +1794,9 @@ async def test_settlement_refresh_timeout_is_fail_closed_and_bounded(
     assert result.complete is True
     assert gateway.refresh_calls == ["market-1"]
     assert (await catalog.get_event("event-1")).status is MarketStatus.CLOSED  # type: ignore[union-attr]
-    assert all(
-        item.change_type is MarketChangeType.MARKET_DEACTIVATED
-        for item in queue.items
-    )
+    assert [item.change_type for item in queue.items] == [
+        MarketChangeType.CATALOG_RECONCILED
+    ]
 
 
 async def test_cursor_failure_degrades_and_keeps_in_process_fair_progress(

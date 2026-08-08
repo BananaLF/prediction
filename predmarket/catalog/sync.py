@@ -158,6 +158,7 @@ class SyncMarketTask:
     async def run_once(self) -> SyncResult:
         sync_started_at = time.monotonic()
         _LOGGER.info("正在开始执行第一次扫描")
+        await self._republish_pending_reconciliations()
         occurred_at = self._now()
         generation = self._new_generation()
         _LOGGER.info("sync_started sync_generation=%s", generation)
@@ -411,6 +412,19 @@ class SyncMarketTask:
             len(prepared.changes),
             int((time.monotonic() - stage_started_at) * 1_000),
         )
+        reconciliation = MarketChange(
+            change_id=f"{generation}:CATALOG_RECONCILED:catalog",
+            change_type=MarketChangeType.CATALOG_RECONCILED,
+            event_id=None,
+            market_id=None,
+            token_ids=(),
+            occurred_at=occurred_at,
+            critical=True,
+        )
+        watchable_market_ids = _watchable_market_ids(
+            prepared.markets,
+            prepared.tokens,
+        )
         # One writer transaction completes before any Watch-visible change.
         stage_started_at = time.monotonic()
         _LOGGER.info(
@@ -426,6 +440,8 @@ class SyncMarketTask:
                 events=prepared.event_upserts,
                 markets=prepared.market_upserts,
                 tokens=prepared.token_upserts,
+                reconciliation_change=reconciliation,
+                reconciliation_market_ids=watchable_market_ids,
             )
         else:
             await self._catalog.save_catalog(
@@ -443,49 +459,26 @@ class SyncMarketTask:
             int((time.monotonic() - stage_started_at) * 1_000),
         )
         markets_persisted = len(prepared.markets)
-        published = 0
-        capacity = getattr(self._changes, "maxsize", None)
-        delivery_changes, coalesced = _changes_for_delivery(
-            prepared.changes,
-            capacity=capacity if type(capacity) is int else None,
-        )
-        dropped = coalesced
-        if coalesced:
-            _LOGGER.warning(
-                "sync_market_changes_coalesced sync_generation=%s total=%d "
-                "delivered=%d coalesced=%d queue_capacity=%d",
+        if prepared.changes:
+            _LOGGER.info(
+                "sync_market_changes_reconciled sync_generation=%s "
+                "semantic_changes=%d controls=1",
                 generation,
                 len(prepared.changes),
-                len(delivery_changes),
-                coalesced,
-                capacity,
             )
-        admitted: list[tuple[MarketChange, tuple[str, ...]]] = []
-        for change in delivery_changes:
-            if await self._changes.put(change):
-                published += 1
-                if change.market_id is not None:
-                    affected_market_ids = (change.market_id,)
-                else:
-                    affected_market_ids = tuple(
-                        market.id
-                        for market in prepared.markets
-                        if market.event_id == change.event_id
-                    )
-                admitted.append((change, affected_market_ids))
-            else:
-                dropped += 1
-
         marker_errors: list[str] = []
         failed_change_ids: list[str] = []
-        for change, affected_market_ids in admitted:
+        admitted = await self._changes.put(reconciliation)
+        published = 1 if admitted else 0
+        dropped = 0 if admitted else 1
+        if admitted:
             marker_error = await self._record_publication_marker(
-                change=change,
-                market_ids=affected_market_ids,
+                change=reconciliation,
+                market_ids=watchable_market_ids,
             )
             if marker_error is not None:
                 marker_errors.append(marker_error)
-                failed_change_ids.append(change.change_id)
+                failed_change_ids.append(reconciliation.change_id)
 
         cursor_error = await self._advance_refresh_cursor(
             generation=generation,
@@ -553,6 +546,23 @@ class SyncMarketTask:
                 + orphan_warnings
             ),
         )
+
+    async def _republish_pending_reconciliations(self) -> None:
+        pending = await self._system_events.list_pending_catalog_reconciliations()
+        for item in pending:
+            if not await self._changes.put(item.change):
+                continue
+            marker_error = await self._record_publication_marker(
+                change=item.change,
+                market_ids=item.market_ids,
+            )
+            if marker_error is not None:
+                await self._report_degraded(
+                    occurred_at=self._now(),
+                    errors=(marker_error,),
+                    failed_change_ids=(item.change.change_id,),
+                    cursor_persistence_failed=False,
+                )
 
     async def _record_publication_marker(
         self,
@@ -1488,6 +1498,18 @@ def _watchable(market: Market) -> bool:
         and market.accepting_orders
         and market.enable_orderbook
         and market.resolved_at is None
+    )
+
+
+def _watchable_market_ids(
+    markets: Sequence[Market],
+    tokens: Sequence[Token],
+) -> tuple[str, ...]:
+    market_ids_with_tokens = {token.market_id for token in tokens}
+    return tuple(
+        market.id
+        for market in sorted(markets, key=lambda item: _utf8(item.id))
+        if _watchable(market) and market.id in market_ids_with_tokens
     )
 
 

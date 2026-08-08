@@ -8,6 +8,7 @@ import sqlite3
 
 import pytest
 
+import predmarket.signals.manager as manager_module
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.domain.orderbook import OrderBook, OrderBookLevel
 from predmarket.domain.signal import (
@@ -256,6 +257,230 @@ async def test_signal_manager_closure_apis_preserve_observed_at(tmp_path: Path) 
         ("close-by-token", 120),
         ("close-unwatchable", 140),
     ]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_open_signals_classifies_catalog_state_in_one_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer, catalog, _signals, manager = await _open_manager(tmp_path)
+    base_event, base_market, base_token = _catalog()
+    identities = (
+        ("settled", "event-settled", "market-settled", "token-settled"),
+        ("closed", "event-closed", "market-closed", "token-closed"),
+        ("unselected", "event-unselected", "market-unselected", "token-unselected"),
+        ("selected", "event-selected", "market-selected", "token-selected"),
+    )
+    active_events = tuple(
+        replace(
+            base_event,
+            id=event_id,
+            market_ids=(market_id,),
+        )
+        for _, event_id, market_id, _ in identities
+    )
+    active_markets = tuple(
+        replace(
+            base_market,
+            id=market_id,
+            event_id=event_id,
+            condition_id=f"condition-{name}",
+        )
+        for name, event_id, market_id, _ in identities
+    )
+    tokens = tuple(
+        replace(base_token, id=token_id, market_id=market_id)
+        for _, _, market_id, token_id in identities
+    )
+    try:
+        await catalog.save_catalog(
+            events=active_events,
+            markets=active_markets,
+            tokens=tokens,
+        )
+        signal_ids = {}
+        for name, _, market_id, token_id in identities:
+            signal_id = await manager.apply(
+                _present(market_id=market_id, token_id=token_id),
+                f"reconcile-{name}",
+                None,
+                observed_at=100,
+            )
+            assert signal_id is not None
+            signal_ids[name] = signal_id
+
+        reconciled_events = tuple(
+            replace(
+                event,
+                status=(
+                    MarketStatus.RESOLVED
+                    if event.id == "event-settled"
+                    else MarketStatus.ACTIVE
+                ),
+                resolved_at=(200 if event.id == "event-settled" else None),
+            )
+            for event in active_events
+        )
+        reconciled_markets = tuple(
+            replace(
+                market,
+                status=(
+                    MarketStatus.CLOSED
+                    if market.id in {"market-settled", "market-closed"}
+                    else MarketStatus.ACTIVE
+                ),
+                active=market.id not in {"market-settled", "market-closed"},
+                accepting_orders=market.id
+                not in {"market-settled", "market-closed"},
+                enable_orderbook=market.id
+                not in {"market-settled", "market-closed"},
+                resolved_at=(200 if market.id == "market-settled" else None),
+            )
+            for market in active_markets
+        )
+        await catalog.save_catalog(
+            events=reconciled_events,
+            markets=reconciled_markets,
+            tokens=tokens,
+        )
+
+        read_count = 0
+        real_read_all = manager_module._read_all
+
+        async def counted_read_all(*args, **kwargs):
+            nonlocal read_count
+            read_count += 1
+            return await real_read_all(*args, **kwargs)
+
+        monkeypatch.setattr(manager_module, "_read_all", counted_read_all)
+        closed = await manager.reconcile_open_signals(
+            ("token-selected",),
+            catalog_generation="sync-1",
+            observed_at=210,
+        )
+
+        assert read_count == 1
+        assert set(closed) == {
+            signal_ids["settled"],
+            signal_ids["closed"],
+            signal_ids["unselected"],
+        }
+    finally:
+        await writer.close()
+
+    with sqlite3.connect(tmp_path / "signals.db") as connection:
+        rows = connection.execute(
+            "SELECT opportunity_key, status, close_reason "
+            "FROM arbitrage_signals WHERE opportunity_key LIKE 'reconcile-%' "
+            "ORDER BY opportunity_key"
+        ).fetchall()
+    assert rows == [
+        ("reconcile-closed", "CLOSED", DecisionReason.MARKET_CLOSED.value),
+        ("reconcile-selected", "OPEN", None),
+        ("reconcile-settled", "CLOSED", DecisionReason.EVENT_SETTLED.value),
+        (
+            "reconcile-unselected",
+            "CLOSED",
+            DecisionReason.ORDERBOOK_INVALID.value,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_open_signals_skips_closure_after_catalog_generation_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer, catalog, _signals, manager = await _open_manager(tmp_path)
+    event, market, token = _catalog()
+    try:
+        signal_id = await manager.apply(
+            _present(), "generation-race", None, observed_at=100
+        )
+        assert signal_id is not None
+
+        real_read_all = manager_module._read_all
+
+        async def advance_catalog_after_read(*args, **kwargs):
+            rows = await real_read_all(*args, **kwargs)
+            await catalog.save_complete_catalog(
+                generation="sync-2",
+                updated_at=200,
+                events=(
+                    replace(
+                        event,
+                        sync_generation="sync-2",
+                        updated_at=200,
+                    ),
+                ),
+                markets=(
+                    replace(
+                        market,
+                        sync_generation="sync-2",
+                        updated_at=200,
+                    ),
+                ),
+                tokens=(
+                    replace(
+                        token,
+                        sync_generation="sync-2",
+                        updated_at=200,
+                    ),
+                ),
+            )
+            return rows
+
+        monkeypatch.setattr(
+            manager_module,
+            "_read_all",
+            advance_catalog_after_read,
+        )
+
+        closed = await manager.reconcile_open_signals(
+            (),
+            catalog_generation="sync-1",
+            observed_at=210,
+        )
+        assert closed == ()
+    finally:
+        await writer.close()
+
+    with sqlite3.connect(tmp_path / "signals.db") as connection:
+        row = connection.execute(
+            "SELECT status, latest_revision, close_reason "
+            "FROM arbitrage_signals WHERE opportunity_key = 'generation-race'"
+        ).fetchone()
+    assert row == ("OPEN", 1, None)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_open_signals_without_market_time_reuses_latest_signal_time(
+    tmp_path: Path,
+) -> None:
+    writer, _catalog_repository, _signals, manager = await _open_manager(tmp_path)
+    try:
+        signal_id = await manager.apply(
+            _present(), "catalog-only-closure", None, observed_at=100
+        )
+        assert signal_id is not None
+
+        closed = await manager.reconcile_open_signals(
+            (),
+            catalog_generation="sync-1",
+            observed_at=None,
+        )
+        assert closed == (signal_id,)
+    finally:
+        await writer.close()
+
+    with sqlite3.connect(tmp_path / "signals.db") as connection:
+        rows = connection.execute(
+            "SELECT revision, event_type, observed_at FROM signal_revisions "
+            "WHERE signal_id = ? ORDER BY revision",
+            (signal_id,),
+        ).fetchall()
+    assert rows == [(1, "OPENED", 100), (2, "CLOSED", 100)]
 
 
 @pytest.mark.asyncio

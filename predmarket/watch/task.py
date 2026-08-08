@@ -39,6 +39,7 @@ from predmarket.watch.cache import (
     CacheState,
     OrderBookCache,
     OrderBookDelta,
+    TokenRevisionSnapshot,
 )
 from predmarket.watch.clock import MarketClock
 
@@ -136,6 +137,14 @@ class SignalManager(Protocol):
         *,
         observed_at: int,
     ) -> None: ...
+
+    async def reconcile_open_signals(
+        self,
+        active_token_ids: tuple[str, ...],
+        *,
+        catalog_generation: str | None = None,
+        observed_at: int | None,
+    ) -> Any: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,7 +336,7 @@ class WatchTask:
                     generation = self._cache.generation
                     market_time = self._market_clock.read(generation=generation)
                     if market_time is None:
-                        await self._reconcile_unwatchable_signals(
+                        await self._reconcile_open_signals(
                             token_ids,
                             generation=generation,
                             market_time=None,
@@ -335,7 +344,7 @@ class WatchTask:
                         )
                     raise
             else:
-                await self._reconcile_unwatchable_signals(
+                await self._reconcile_open_signals(
                     token_ids,
                     generation=self._cache.generation,
                     market_time=None,
@@ -559,6 +568,9 @@ class WatchTask:
                 MarketChangeType.MARKET_DEACTIVATED,
                 MarketChangeType.EVENT_SETTLED,
             }
+            aggregate_change = (
+                change.change_type is MarketChangeType.CATALOG_RECONCILED
+            )
             reason = (
                 DecisionReason.EVENT_SETTLED
                 if change.change_type is MarketChangeType.EVENT_SETTLED
@@ -641,6 +653,25 @@ class WatchTask:
                     minimum_end_horizon_ms=self._minimum_end_horizon_ms,
                 )
             await self._prepare_context_catalog(snapshot)
+            if aggregate_change:
+                reconcile_generation = self._cache.generation
+                reconciliation_completed = await self._reconcile_open_signals(
+                    new_token_ids,
+                    generation=reconcile_generation,
+                    market_time=self._market_clock.read(
+                        generation=reconcile_generation
+                    ),
+                    catalog_generation=generation,
+                    detail="catalog_reconciliation",
+                )
+                if new_token_ids == self._active_token_ids:
+                    self._active_market_ids = new_market_ids
+                    self._complete_catalog_change_generation(
+                        generation,
+                        change=change,
+                        started_at=started_at,
+                    )
+                    return
             if (
                 new_token_ids == self._active_token_ids
                 and change.change_type is MarketChangeType.MARKET_UPDATED
@@ -712,7 +743,19 @@ class WatchTask:
                 new_market_ids=new_market_ids,
                 explicitly_closed=explicitly_closed,
                 close_reason=reason,
+                close_rotated_signals=not aggregate_change,
             )
+            if aggregate_change and not reconciliation_completed:
+                reconcile_generation = self._cache.generation
+                await self._reconcile_open_signals(
+                    self._active_token_ids,
+                    generation=reconcile_generation,
+                    market_time=self._market_clock.read(
+                        generation=reconcile_generation
+                    ),
+                    catalog_generation=generation,
+                    detail="catalog_reconciliation_after_recovery",
+                )
             self._complete_catalog_change_generation(
                 generation,
                 change=change,
@@ -1387,6 +1430,7 @@ class WatchTask:
         new_market_ids: tuple[str, ...],
         explicitly_closed: tuple[str, ...],
         close_reason: DecisionReason,
+        close_rotated_signals: bool = True,
     ) -> None:
         old_token_ids = self._active_token_ids
         old_generation = self._cache.generation
@@ -1399,7 +1443,7 @@ class WatchTask:
                 reason="subscription_rotated",
             )
         explicit_set = frozenset(explicitly_closed)
-        if explicitly_closed:
+        if close_rotated_signals and explicitly_closed:
             await self._close_signals(
                 explicitly_closed,
                 close_reason,
@@ -1410,7 +1454,7 @@ class WatchTask:
         invalidated = tuple(
             token_id for token_id in old_token_ids if token_id not in explicit_set
         )
-        if invalidated:
+        if close_rotated_signals and invalidated:
             await self._close_signals(
                 invalidated,
                 DecisionReason.ORDERBOOK_INVALID,
@@ -1806,7 +1850,7 @@ class WatchTask:
                 len(books),
             )
             if reconcile_unwatchable:
-                await self._reconcile_unwatchable_signals(
+                await self._reconcile_open_signals(
                     effective_token_ids,
                     generation=generation,
                     market_time=market_time,
@@ -1938,43 +1982,52 @@ class WatchTask:
             observed_at=market_time,
         )
 
-    async def _reconcile_unwatchable_signals(
+    async def _reconcile_open_signals(
         self,
         active_token_ids: tuple[str, ...],
         *,
         generation: int,
         market_time: int | None,
+        catalog_generation: str | None = None,
         detail: str,
-    ) -> None:
+    ) -> bool:
         if market_time is None:
             _LOGGER.warning(
-                "watch_signal_mutation_skipped "
-                "operation=close_unwatchable_for_active_tokens "
+                "watch_signal_reconciliation_using_latest_signal_time "
+                "operation=reconcile_open_signals "
                 "generation=%d detail=%s active_tokens=%d market_time=None",
                 generation,
                 detail,
                 len(active_token_ids),
             )
-            return
-        close_unwatchable = getattr(
+        reconcile = getattr(
             self._signal_manager,
-            "close_unwatchable_for_active_tokens",
+            "reconcile_open_signals",
             None,
         )
-        if close_unwatchable is None:
-            return
+        if reconcile is None:
+            return True
         started_at = time.monotonic()
-        result = close_unwatchable(active_token_ids, observed_at=market_time)
+        result = reconcile(
+            active_token_ids,
+            catalog_generation=catalog_generation,
+            observed_at=market_time,
+        )
         if inspect.isawaitable(result):
             await result
         _LOGGER.info(
             "watch_signal_reconciliation_completed generation=%d "
-            "market_time=%d active_tokens=%d elapsed_ms=%d",
+            "market_time=%s active_tokens=%d elapsed_ms=%d",
             generation,
-            market_time,
+            (
+                market_time
+                if market_time is not None
+                else "latest_signal_observed_at"
+            ),
             len(active_token_ids),
             int((time.monotonic() - started_at) * 1_000),
         )
+        return True
 
     async def _evaluate_tokens(
         self,
@@ -1989,6 +2042,10 @@ class WatchTask:
         evaluation_monotonic_ms = self._monotonic_now()
         generation = self._cache.generation
         revision = self._cache.revision
+        revision_snapshot = self._cache.snapshot_token_revisions()
+        all_dependency_token_ids = tuple(
+            token_id for token_id, _ in revision_snapshot.revisions
+        )
         market_time = self._market_clock.read(generation=generation)
         if market_time is None:
             _LOGGER.warning(
@@ -2037,7 +2094,7 @@ class WatchTask:
         batched_targets: Mapping[str, Sequence[EvaluationTarget]] | None = None
         contexts_for_batch = getattr(self._context_source, "contexts_for_batch", None)
         if callable(contexts_for_batch):
-            if not self._evaluation_is_current(generation, revision):
+            if not self._evaluation_generation_is_current(generation):
                 self._log_evaluation_aborted(generation, "before_batch_context")
                 return
             context_started_at = time.monotonic()
@@ -2047,11 +2104,11 @@ class WatchTask:
             context_elapsed += time.monotonic() - context_started_at
             if not isinstance(batched_targets, Mapping):
                 raise TypeError("batch context source must return a mapping")
-            if not self._evaluation_is_current(generation, revision):
+            if not self._evaluation_generation_is_current(generation):
                 self._log_evaluation_aborted(generation, "after_batch_context")
                 return
         for token_id in normalized_token_ids:
-            if not self._evaluation_is_current(generation, revision):
+            if not self._evaluation_generation_is_current(generation):
                 self._log_evaluation_aborted(generation, "before_context")
                 return
             if batched_targets is None:
@@ -2062,7 +2119,7 @@ class WatchTask:
                 context_elapsed += time.monotonic() - context_started_at
             else:
                 targets = batched_targets.get(token_id, ())
-            if not self._evaluation_is_current(generation, revision):
+            if not self._evaluation_generation_is_current(generation):
                 self._log_evaluation_aborted(generation, "after_context")
                 return
             materialized = tuple(targets)
@@ -2075,7 +2132,14 @@ class WatchTask:
                     continue
                 evaluated_opportunity_keys.add(target.opportunity_key)
                 target_count += 1
-                if not self._evaluation_is_current(generation, revision):
+                dependency_token_ids = _target_dependency_token_ids(
+                    target,
+                    fallback=all_dependency_token_ids,
+                )
+                if not self._evaluation_is_current(
+                    revision_snapshot,
+                    dependency_token_ids,
+                ):
                     self._log_evaluation_aborted(generation, "before_strategy")
                     return
                 context = target.context
@@ -2125,7 +2189,10 @@ class WatchTask:
                     if inspect.isawaitable(decision):
                         decision = await decision
                 strategy_elapsed += time.monotonic() - strategy_started_at
-                if not self._evaluation_is_current(generation, revision):
+                if not self._evaluation_is_current(
+                    revision_snapshot,
+                    dependency_token_ids,
+                ):
                     self._log_evaluation_aborted(generation, "after_strategy")
                     return
                 if not isinstance(decision, StrategyDecision.__args__):
@@ -2147,7 +2214,10 @@ class WatchTask:
                         sorted({leg.market_id for leg in decision.legs}, key=_utf8)
                     )
                 try:
-                    if not self._evaluation_is_current(generation, revision):
+                    if not self._evaluation_is_current(
+                        revision_snapshot,
+                        dependency_token_ids,
+                    ):
                         self._log_evaluation_aborted(generation, "before_signal_apply")
                         return
                     signal_apply_started_at = time.monotonic()
@@ -2160,7 +2230,10 @@ class WatchTask:
                         )
                     else:
                         async with self._operation_lock:
-                            if not self._evaluation_is_current(generation, revision):
+                            if not self._evaluation_is_current(
+                                revision_snapshot,
+                                dependency_token_ids,
+                            ):
                                 self._log_evaluation_aborted(
                                     generation,
                                     "signal_apply_lock_acquired",
@@ -2180,7 +2253,10 @@ class WatchTask:
                         detail=str(error),
                     )
                     return
-                if not self._evaluation_is_current(generation, revision):
+                if not self._evaluation_is_current(
+                    revision_snapshot,
+                    dependency_token_ids,
+                ):
                     self._log_evaluation_aborted(generation, "after_signal_apply")
                     return
                 if signal_id is not None:
@@ -2257,12 +2333,24 @@ class WatchTask:
                 int(elapsed * 1_000),
             )
 
-    def _evaluation_is_current(self, generation: int, revision: int) -> bool:
+    def _evaluation_generation_is_current(self, generation: int) -> bool:
         return (
             not self._closed
             and self._cache.state is CacheState.VALID
             and self._cache.generation == generation
-            and self._cache.revision == revision
+        )
+
+    def _evaluation_is_current(
+        self,
+        snapshot: TokenRevisionSnapshot,
+        dependency_token_ids: tuple[str, ...],
+    ) -> bool:
+        return (
+            not self._closed
+            and self._cache.token_revisions_match(
+                snapshot,
+                dependency_token_ids,
+            )
         )
 
     def _log_evaluation_aborted(
@@ -2361,6 +2449,24 @@ def _catalog_change_generation(change: MarketChange) -> str | None:
     delimiter = f":{change.change_type.value}:"
     generation, separator, _ = change.change_id.partition(delimiter)
     return generation if separator and generation else None
+
+
+def _target_dependency_token_ids(
+    target: EvaluationTarget,
+    *,
+    fallback: tuple[str, ...],
+) -> tuple[str, ...]:
+    orderbooks = getattr(target.context, "orderbooks", None)
+    if isinstance(orderbooks, Sequence) and not isinstance(
+        orderbooks,
+        (str, bytes),
+    ):
+        token_ids = {
+            book.token_id for book in orderbooks if isinstance(book, OrderBook)
+        }
+        if token_ids:
+            return tuple(sorted(token_ids, key=_utf8))
+    return fallback
 
 
 def _watchable_token_ids(snapshot: CatalogSnapshot) -> tuple[str, ...]:

@@ -670,6 +670,27 @@ class SharedOpportunityContextSource(FakeContextSource):
         )
 
 
+class SingleTokenDependencyContextSource(FakeContextSource):
+    def contexts_for(
+        self,
+        changed_token_id: str,
+        orderbooks: tuple[OrderBook, ...],
+    ) -> tuple[EvaluationTarget, ...]:
+        dependencies = tuple(
+            book for book in orderbooks if book.token_id == changed_token_id
+        )
+        return (
+            EvaluationTarget(
+                context=SimpleNamespace(
+                    changed_token_id=changed_token_id,
+                    orderbooks=dependencies,
+                ),  # type: ignore[arg-type]
+                opportunity_key=f"opportunity:{changed_token_id}",
+                expected_revision=None,
+            ),
+        )
+
+
 class BatchContextSource(FakeContextSource):
     def __init__(self) -> None:
         self.batch_calls: list[tuple[str, ...]] = []
@@ -814,6 +835,8 @@ class FakeSignals:
         self.closed: list[tuple[tuple[str, ...], NotEvaluable]] = []
         self.close_observed_at: list[int] = []
         self.unwatchable: list[tuple[tuple[str, ...], int]] = []
+        self.reconciled: list[tuple[tuple[str, ...], int | None]] = []
+        self.reconcile_generations: list[str | None] = []
         self.close_entered = asyncio.Event()
         self.close_gate: asyncio.Event | None = None
 
@@ -849,6 +872,16 @@ class FakeSignals:
         observed_at: int,
     ) -> None:
         self.unwatchable.append((active_token_ids, observed_at))
+
+    async def reconcile_open_signals(
+        self,
+        active_token_ids: tuple[str, ...],
+        *,
+        catalog_generation: str | None = None,
+        observed_at: int | None,
+    ) -> None:
+        self.reconciled.append((active_token_ids, observed_at))
+        self.reconcile_generations.append(catalog_generation)
 
 
 class NoPersistSignals(FakeSignals):
@@ -986,7 +1019,7 @@ async def test_run_subscribes_all_initial_watchable_tokens_and_evaluates_after_r
     assert gateway.requests == [("token-1", "token-2")]
     assert gateway.hydrated_market_ids == [("market-1",)]
     assert strategy.calls == []
-    assert signals.unwatchable == []
+    assert signals.reconciled == []
     assert watch.cache.state is CacheState.INVALID
     gateway.recovery_gate.set()
     try:
@@ -1002,7 +1035,7 @@ async def test_run_subscribes_all_initial_watchable_tokens_and_evaluates_after_r
     assert gateway.subscriptions[0].closed is True
 
 
-async def test_start_reconciles_unwatchable_signals_at_recovery_market_time() -> None:
+async def test_start_reconciles_open_signals_at_recovery_market_time() -> None:
     signals = FakeSignals()
     watch, _, _, _, _, _ = _watch(
         signals=signals,
@@ -1011,11 +1044,11 @@ async def test_start_reconciles_unwatchable_signals_at_recovery_market_time() ->
 
     await watch.start()
 
-    assert signals.unwatchable == [(('token-1', 'token-2'), 100)]
+    assert signals.reconciled == [(('token-1', 'token-2'), 100)]
     await watch.close()
 
 
-async def test_recovery_failure_before_market_watermark_skips_signal_mutation(
+async def test_recovery_failure_before_market_watermark_reconciles_at_latest_signal_time(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     signals = FakeSignals()
@@ -1028,10 +1061,12 @@ async def test_recovery_failure_before_market_watermark_skips_signal_mutation(
         with pytest.raises(MarketRecoveryInvalidatedError, match="sdk_version_changed"):
             await watch.start()
 
-    assert signals.unwatchable == []
+    assert signals.reconciled == [(('token-1', 'token-2'), None)]
     assert signals.closed == []
     assert any(
-        record.getMessage().startswith("watch_signal_mutation_skipped ")
+        record.getMessage().startswith(
+            "watch_signal_reconciliation_using_latest_signal_time "
+        )
         and "detail=startup_reconciliation" in record.getMessage()
         and "generation=0" in record.getMessage()
         and "market_time=None" in record.getMessage()
@@ -1436,6 +1471,38 @@ async def test_same_generation_cache_revision_change_fences_stale_evaluation() -
     await evaluation
 
     assert len(signals.applied) == applied_before
+    await watch.close()
+
+
+async def test_unrelated_token_revision_change_does_not_fence_evaluation() -> None:
+    strategy = BlockingStreamStrategy()
+    signals = FakeSignals()
+    watch, _, _, _, _, _ = _watch(
+        strategy=strategy,
+        signals=signals,
+        context_source=SingleTokenDependencyContextSource(),
+    )
+    await watch.start()
+    applied_before = len(signals.applied)
+
+    evaluation = asyncio.create_task(
+        watch._evaluate_tokens(("token-1",))  # noqa: SLF001
+    )
+    await asyncio.wait_for(strategy.stream_evaluation_started.wait(), timeout=1)
+    unrelated = watch.cache.get("token-2")
+    assert unrelated is not None
+    assert watch.cache.apply_book(
+        replace(
+            unrelated,
+            bids=(OrderBookLevel(Decimal("0.41"), Decimal("9")),),
+            exchange_timestamp=101,
+            book_hash="unrelated-newer-same-generation",
+        )
+    ) is True
+    strategy.release_stream_evaluation.set()
+    await evaluation
+
+    assert len(signals.applied) == applied_before + 1
     await watch.close()
 
 
@@ -1851,6 +1918,120 @@ async def test_market_update_refreshes_context_catalog_before_scope_shortcut() -
     await watch.close()
 
 
+async def test_catalog_reconciled_loads_once_and_bulk_reconciles_without_rotation() -> None:
+    catalog = FakeCatalog(_catalog())
+    signals = FakeSignals()
+    watch, gateway, _, _, _, _ = _watch(catalog=catalog, signals=signals)
+    await watch.start()
+    baseline_load_calls = catalog.load_calls
+    baseline_requests = tuple(gateway.requests)
+    baseline_closures = tuple(signals.closed)
+    signals.reconciled.clear()
+
+    await watch.handle_market_change(
+        MarketChange(
+            change_id="sync-aggregate:CATALOG_RECONCILED:catalog",
+            change_type=MarketChangeType.CATALOG_RECONCILED,
+            event_id=None,
+            market_id=None,
+            token_ids=(),
+            occurred_at=200,
+            critical=True,
+        )
+    )
+
+    assert catalog.load_calls == baseline_load_calls + 1
+    assert signals.reconciled == [(('token-1', 'token-2'), 100)]
+    assert signals.reconcile_generations[-1] == "sync-aggregate"
+    assert tuple(signals.closed) == baseline_closures
+    assert tuple(gateway.requests) == baseline_requests
+    await watch.close()
+
+
+async def test_catalog_reconciliation_without_market_time_runs_once_before_rotation() -> None:
+    catalog = FakeCatalog(_catalog())
+    signals = FakeSignals()
+    watch, gateway, _, _, _, _ = _watch(catalog=catalog, signals=signals)
+    await watch.start()
+    signals.reconciled.clear()
+    signals.reconcile_generations.clear()
+    watch._market_clock._watermark_ms = None  # noqa: SLF001
+    catalog.snapshot = _catalog(second_market=True, first_active=False)
+
+    await watch.handle_market_change(
+        MarketChange(
+            change_id="sync-aggregate:CATALOG_RECONCILED:catalog",
+            change_type=MarketChangeType.CATALOG_RECONCILED,
+            event_id=None,
+            market_id=None,
+            token_ids=(),
+            occurred_at=200,
+            critical=True,
+        )
+    )
+
+    assert gateway.requests[-1] == ("token-3", "token-4")
+    assert signals.reconciled == [(('token-3', 'token-4'), None)]
+    assert signals.reconcile_generations == ["sync-aggregate"]
+    await watch.close()
+
+
+async def test_catalog_reconciliation_without_market_time_runs_without_rotation() -> None:
+    catalog = FakeCatalog(_catalog())
+    signals = FakeSignals()
+    watch, gateway, _, _, _, _ = _watch(catalog=catalog, signals=signals)
+    await watch.start()
+    baseline_requests = tuple(gateway.requests)
+    signals.reconciled.clear()
+    signals.reconcile_generations.clear()
+    watch._market_clock._watermark_ms = None  # noqa: SLF001
+
+    await watch.handle_market_change(
+        MarketChange(
+            change_id="sync-aggregate:CATALOG_RECONCILED:catalog",
+            change_type=MarketChangeType.CATALOG_RECONCILED,
+            event_id=None,
+            market_id=None,
+            token_ids=(),
+            occurred_at=200,
+            critical=True,
+        )
+    )
+
+    assert tuple(gateway.requests) == baseline_requests
+    assert signals.reconciled == [(('token-1', 'token-2'), None)]
+    assert signals.reconcile_generations == ["sync-aggregate"]
+    await watch.close()
+
+
+async def test_catalog_reconciliation_without_market_time_runs_when_scope_becomes_empty() -> None:
+    catalog = FakeCatalog(_catalog())
+    signals = FakeSignals()
+    watch, _, _, _, _, _ = _watch(catalog=catalog, signals=signals)
+    await watch.start()
+    signals.reconciled.clear()
+    signals.reconcile_generations.clear()
+    watch._market_clock._watermark_ms = None  # noqa: SLF001
+    catalog.snapshot = _catalog(first_active=False)
+
+    await watch.handle_market_change(
+        MarketChange(
+            change_id="sync-aggregate:CATALOG_RECONCILED:catalog",
+            change_type=MarketChangeType.CATALOG_RECONCILED,
+            event_id=None,
+            market_id=None,
+            token_ids=(),
+            occurred_at=200,
+            critical=True,
+        )
+    )
+
+    assert watch.active_token_ids == ()
+    assert signals.reconciled == [((), None)]
+    assert signals.reconcile_generations == ["sync-aggregate"]
+    await watch.close()
+
+
 async def test_same_sync_generation_prepares_catalog_once_and_keeps_controls() -> None:
     context_source = CatalogAwareContextSource()
     catalog = FakeCatalog(_catalog())
@@ -1926,7 +2107,7 @@ async def test_start_adopts_gateway_pruned_recovery_scope() -> None:
         "token-2",
     }
     assert signals.closed == []
-    assert signals.unwatchable == [(('token-1', 'token-2'), 100)]
+    assert signals.reconciled == [(('token-1', 'token-2'), 100)]
     await watch.close()
 
 
@@ -2112,14 +2293,17 @@ async def test_close_wakes_run_with_no_active_tokens() -> None:
 
 
 async def test_start_and_close_allow_an_empty_catalog_without_recovery() -> None:
+    signals = FakeSignals()
     watch, gateway, _, _, _, _ = _watch(
-        catalog=FakeCatalog(CatalogSnapshot(events=(), markets=(), tokens=()))
+        catalog=FakeCatalog(CatalogSnapshot(events=(), markets=(), tokens=())),
+        signals=signals,
     )
 
     await watch.start()
     assert watch.active_token_ids == ()
     assert gateway.requests == []
     assert gateway.hydrated_market_ids == []
+    assert signals.reconciled == [((), None)]
 
     running = asyncio.create_task(watch.run())
     await asyncio.sleep(0)
