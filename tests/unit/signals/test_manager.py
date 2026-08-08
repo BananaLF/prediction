@@ -120,7 +120,13 @@ async def _open_manager(
     catalog = CatalogRepository(database_path, writer)
     signals = SignalRepository(database_path, writer)
     event, market, token = _catalog()
-    await catalog.save_catalog(events=(event,), markets=(market,), tokens=(token,))
+    await catalog.save_complete_catalog(
+        generation="sync-1",
+        updated_at=0,
+        events=(event,),
+        markets=(market,),
+        tokens=(token,),
+    )
     manager = SignalManager(
         signals,
         strategy_type=StrategyType.BINARY_UNDERPRICED,

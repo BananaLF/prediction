@@ -489,10 +489,10 @@ async def test_supervisor_starts_watch_from_existing_catalog_during_incomplete_i
     try:
         catalog = CatalogRepository(database_path, writer)
         market = Market(
-            id="market-orphan",
-            event_id=None,
-            condition_id="condition-orphan",
-            question="Orphan?",
+            id="market-existing",
+            event_id="event-existing",
+            condition_id="condition-existing",
+            question="Existing?",
             status=MarketStatus.ACTIVE,
             active=True,
             accepting_orders=True,
@@ -500,12 +500,20 @@ async def test_supervisor_starts_watch_from_existing_catalog_during_incomplete_i
             sync_generation="sync-existing",
             sync_generation_complete=True,
         )
+        event = Event(
+            id="event-existing",
+            title="Existing",
+            status=MarketStatus.ACTIVE,
+            market_ids=(market.id,),
+            sync_generation="sync-existing",
+            sync_generation_complete=True,
+        )
         await catalog.save_catalog(
-            events=(),
+            events=(event,),
             markets=(market,),
             tokens=(
                 Token(
-                    id="token-orphan",
+                    id="token-existing",
                     market_id=market.id,
                     outcome="YES",
                     position=0,

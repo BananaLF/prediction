@@ -431,7 +431,7 @@ async def test_stage_aborts_when_preflight_wal_cannot_be_reclaimed(
         checkpoint_wal_bytes=(16 * 1024 * 1024,),
     )
 
-    with pytest.raises(CatalogSyncAborted, match="preflight"):
+    with pytest.raises(CatalogSyncAborted, match="preflight") as raised:
         await CatalogGenerationCoordinator(writer).stage(
             _generation_input(
                 generation="sync-blocked",
@@ -440,6 +440,9 @@ async def test_stage_aborts_when_preflight_wal_cannot_be_reclaimed(
             )
         )
 
+    assert raised.value.generation == "sync-blocked"
+    assert raised.value.reason == str(raised.value)
+    assert raised.value.wal_peak_bytes == 16 * 1024 * 1024
     assert writer.transaction_count == 0
     with _connect(database_path) as connection:
         assert connection.execute(
@@ -559,7 +562,7 @@ async def test_stage_aborts_generation_when_post_batch_wal_reaches_abort_line(
         checkpoint_wal_bytes=(0, abort_bytes),
     )
 
-    with pytest.raises(CatalogSyncAborted, match="abort waterline"):
+    with pytest.raises(CatalogSyncAborted, match="abort waterline") as raised:
         await CatalogGenerationCoordinator(
             writer,
             batch_limits=CatalogBatchLimits(max_rows=1),
@@ -571,6 +574,8 @@ async def test_stage_aborts_generation_when_post_batch_wal_reaches_abort_line(
             )
         )
 
+    assert raised.value.generation == "sync-abort"
+    assert raised.value.wal_peak_bytes == abort_bytes
     with _connect(database_path) as connection:
         row = connection.execute(
             """

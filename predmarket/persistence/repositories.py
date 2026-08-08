@@ -156,157 +156,70 @@ class CatalogRepository:
             len(materialized_tokens),
         )
 
-        if await _schema_version(self._path) == 4:
-            reconciliation = (
-                None
-                if reconciliation_change is None
-                else PendingCatalogReconciliation(
-                    change=reconciliation_change,
-                    market_ids=tuple(json.loads(encoded_reconciliation_market_ids)),
-                )
+        reconciliation = (
+            None
+            if reconciliation_change is None
+            else PendingCatalogReconciliation(
+                change=reconciliation_change,
+                market_ids=tuple(json.loads(encoded_reconciliation_market_ids)),
             )
-            generation_input = GenerationInput(
+        )
+        generation_input = GenerationInput(
+            sync_generation=generation,
+            updated_at=updated_at,
+            events=materialized_events,
+            markets=materialized_markets,
+            tokens=materialized_tokens,
+            input_digest=catalog_input_digest(
                 sync_generation=generation,
                 updated_at=updated_at,
                 events=materialized_events,
                 markets=materialized_markets,
                 tokens=materialized_tokens,
-                input_digest=catalog_input_digest(
-                    sync_generation=generation,
-                    updated_at=updated_at,
-                    events=materialized_events,
-                    markets=materialized_markets,
-                    tokens=materialized_tokens,
-                ),
-            )
-            existing_generation = await _fetch_one(
-                self._path,
-                """
-                SELECT generations.id, generations.input_digest,
-                       generations.status, state.active_generation_id
-                FROM catalog_generations AS generations
-                JOIN catalog_state AS state ON state.id = 1
-                WHERE generations.sync_generation = ?
-                """,
-                (generation,),
-            )
-            if existing_generation is not None:
-                if existing_generation["input_digest"] != generation_input.input_digest:
-                    raise CatalogGenerationError(
-                        "existing generation has a different normalized catalog payload"
-                    )
-                if existing_generation["status"] == "COMMITTED":
-                    if (
-                        existing_generation["id"]
-                        != existing_generation["active_generation_id"]
-                    ):
-                        raise CatalogActivationConflict(
-                            "committed generation is no longer active"
-                        )
-                    _LOGGER.info(
-                        "catalog_complete_save_completed sync_generation=%s "
-                        "elapsed_ms=%d idempotent=true",
-                        generation,
-                        int((time.monotonic() - started_at) * 1_000),
-                    )
-                    return
-                if existing_generation["status"] == "ABORTED":
-                    raise CatalogGenerationError(
-                        "existing generation was aborted and cannot be retried"
-                    )
-            coordinator = CatalogGenerationCoordinator(
-                self._writer,
-                database_path=self._path,
-            )
-            staged = await coordinator.stage(generation_input)
-            validation = await coordinator.validate_candidate(staged)
-            await coordinator.activate(validation, reconciliation)
-            _LOGGER.info(
-                "catalog_complete_save_completed sync_generation=%s elapsed_ms=%d",
-                generation,
-                int((time.monotonic() - started_at) * 1_000),
-            )
-            return
-
-        async def command(connection: aiosqlite.Connection) -> None:
-            stage_started_at = time.monotonic()
-            for table in ("events", "markets", "tokens"):
-                await connection.execute(
-                    f"""
-                    UPDATE {table}
-                    SET sync_generation = ?,
-                        sync_generation_complete = 1,
-                        updated_at = MAX(updated_at, ?)
-                    """,
-                    (generation, updated_at),
+            ),
+        )
+        existing_generation = await _fetch_one(
+            self._path,
+            """
+            SELECT generations.id, generations.input_digest,
+                   generations.status, state.active_generation_id
+            FROM catalog_generations AS generations
+            JOIN catalog_state AS state ON state.id = 1
+            WHERE generations.sync_generation = ?
+            """,
+            (generation,),
+        )
+        if existing_generation is not None:
+            if existing_generation["input_digest"] != generation_input.input_digest:
+                raise CatalogGenerationError(
+                    "existing generation has a different normalized catalog payload"
                 )
-            _LOGGER.info(
-                "catalog_complete_save_stage_completed sync_generation=%s "
-                "stage=advance_existing_generation elapsed_ms=%d",
-                generation,
-                int((time.monotonic() - stage_started_at) * 1_000),
-            )
-
-            for stage, statement, entities, values in (
-                ("upsert_events", _UPSERT_EVENT, materialized_events, _event_values),
-                ("upsert_markets", _UPSERT_MARKET, materialized_markets, _market_values),
-                ("upsert_tokens", _UPSERT_TOKEN, materialized_tokens, _token_values),
-            ):
-                stage_started_at = time.monotonic()
-                if entities:
-                    await connection.executemany(
-                        statement,
-                        (values(entity) for entity in entities),
+            if existing_generation["status"] == "COMMITTED":
+                if (
+                    existing_generation["id"]
+                    != existing_generation["active_generation_id"]
+                ):
+                    raise CatalogActivationConflict(
+                        "committed generation is no longer active"
                     )
                 _LOGGER.info(
-                    "catalog_complete_save_stage_completed sync_generation=%s "
-                    "stage=%s rows=%d elapsed_ms=%d",
+                    "catalog_complete_save_completed sync_generation=%s "
+                    "elapsed_ms=%d idempotent=true",
                     generation,
-                    stage,
-                    len(entities),
-                    int((time.monotonic() - stage_started_at) * 1_000),
+                    int((time.monotonic() - started_at) * 1_000),
                 )
-            if reconciliation_change is not None:
-                reconciliation_details = _encode_json_object(
-                    {
-                        "change_id": reconciliation_change.change_id,
-                        "change_type": reconciliation_change.change_type.value,
-                        "critical": reconciliation_change.critical,
-                        "event_id": reconciliation_change.event_id,
-                        "market_id": reconciliation_change.market_id,
-                        "market_ids": json.loads(encoded_reconciliation_market_ids),
-                        "sync_generation": generation,
-                        "token_ids": reconciliation_change.token_ids,
-                    }
+                return
+            if existing_generation["status"] == "ABORTED":
+                raise CatalogGenerationError(
+                    "existing generation was aborted and cannot be retried"
                 )
-                await connection.execute(
-                    """
-                    INSERT INTO system_events (
-                        component, severity, event_type, message,
-                        details_json, occurred_at
-                    )
-                    SELECT 'SYNC', 'INFO', 'CATALOG_RECONCILIATION_READY', ?, ?, ?
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM system_events
-                        WHERE event_type = 'CATALOG_RECONCILIATION_READY'
-                          AND json_extract(details_json, '$.change_id') = ?
-                    )
-                    """,
-                    (
-                        f"Catalog reconciliation {reconciliation_change.change_id} ready",
-                        reconciliation_details,
-                        reconciliation_change.occurred_at,
-                        reconciliation_change.change_id,
-                    ),
-                )
-            _LOGGER.info(
-                "catalog_complete_save_command_completed sync_generation=%s "
-                "elapsed_ms=%d",
-                generation,
-                int((time.monotonic() - started_at) * 1_000),
-            )
-
-        await self._writer.execute(command)
+        coordinator = CatalogGenerationCoordinator(
+            self._writer,
+            database_path=self._path,
+        )
+        staged = await coordinator.stage(generation_input)
+        validation = await coordinator.validate_candidate(staged)
+        await coordinator.activate(validation, reconciliation)
         _LOGGER.info(
             "catalog_complete_save_completed sync_generation=%s elapsed_ms=%d",
             generation,
@@ -1087,166 +1000,6 @@ class SystemEventRepository:
         )
 
 
-_UPSERT_EVENT = """
-INSERT INTO events (
-    id, slug, title, description, status, neg_risk, neg_risk_id,
-    neg_risk_type, neg_risk_complete, neg_risk_conversion_supported,
-    neg_risk_metadata_json, neg_risk_synced_at, market_ids_json,
-    sync_generation, sync_generation_complete, start_at, end_at,
-    resolved_at, source_updated_at, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-    slug = excluded.slug,
-    title = excluded.title,
-    description = excluded.description,
-    status = excluded.status,
-    neg_risk = excluded.neg_risk,
-    neg_risk_id = excluded.neg_risk_id,
-    neg_risk_type = excluded.neg_risk_type,
-    neg_risk_complete = excluded.neg_risk_complete,
-    neg_risk_conversion_supported = excluded.neg_risk_conversion_supported,
-    neg_risk_metadata_json = excluded.neg_risk_metadata_json,
-    neg_risk_synced_at = excluded.neg_risk_synced_at,
-    market_ids_json = excluded.market_ids_json,
-    sync_generation = excluded.sync_generation,
-    sync_generation_complete = excluded.sync_generation_complete,
-    start_at = excluded.start_at,
-    end_at = excluded.end_at,
-    resolved_at = excluded.resolved_at,
-    source_updated_at = excluded.source_updated_at,
-    updated_at = excluded.updated_at
-WHERE excluded.updated_at >= events.updated_at
-"""
-
-_UPSERT_MARKET = """
-INSERT INTO markets (
-    id, event_id, condition_id, slug, question, description, status,
-    active, accepting_orders, enable_orderbook, neg_risk,
-    neg_risk_outcome_position, neg_risk_member_complete, sync_generation,
-    sync_generation_complete, tick_size, minimum_order_size, end_at,
-    resolved_at, source_updated_at, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-    event_id = excluded.event_id,
-    condition_id = excluded.condition_id,
-    slug = excluded.slug,
-    question = excluded.question,
-    description = excluded.description,
-    status = excluded.status,
-    active = excluded.active,
-    accepting_orders = excluded.accepting_orders,
-    enable_orderbook = excluded.enable_orderbook,
-    neg_risk = excluded.neg_risk,
-    neg_risk_outcome_position = excluded.neg_risk_outcome_position,
-    neg_risk_member_complete = excluded.neg_risk_member_complete,
-    sync_generation = excluded.sync_generation,
-    sync_generation_complete = excluded.sync_generation_complete,
-    tick_size = excluded.tick_size,
-    minimum_order_size = excluded.minimum_order_size,
-    end_at = excluded.end_at,
-    resolved_at = excluded.resolved_at,
-    source_updated_at = excluded.source_updated_at,
-    updated_at = excluded.updated_at
-WHERE excluded.updated_at >= markets.updated_at
-"""
-
-_UPSERT_TOKEN = """
-INSERT INTO tokens (
-    id, market_id, outcome, position, fee_schedule_json, fee_updated_at,
-    sync_generation, sync_generation_complete, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-    market_id = excluded.market_id,
-    outcome = excluded.outcome,
-    position = excluded.position,
-    fee_schedule_json = excluded.fee_schedule_json,
-    fee_updated_at = excluded.fee_updated_at,
-    sync_generation = excluded.sync_generation,
-    sync_generation_complete = excluded.sync_generation_complete,
-    updated_at = excluded.updated_at
-WHERE excluded.updated_at >= tokens.updated_at
-"""
-
-def _event_values(event: Event) -> tuple[Any, ...]:
-    return (
-        event.id,
-        event.slug,
-        event.title,
-        event.description,
-        event.status.value,
-        int(event.neg_risk),
-        event.neg_risk_id,
-        event.neg_risk_type,
-        int(event.neg_risk_complete),
-        int(event.neg_risk_conversion_supported),
-        (
-            None
-            if event.neg_risk_metadata is None
-            else _encode_json_object(event.neg_risk_metadata)
-        ),
-        event.neg_risk_synced_at,
-        _encode_ids(event.market_ids, allow_empty=True),
-        event.sync_generation,
-        int(event.sync_generation_complete),
-        event.start_at,
-        event.end_at,
-        event.resolved_at,
-        event.source_updated_at,
-        event.created_at,
-        event.updated_at,
-    )
-
-
-def _market_values(market: Market) -> tuple[Any, ...]:
-    return (
-        market.id,
-        market.event_id,
-        market.condition_id,
-        market.slug,
-        market.question,
-        market.description,
-        market.status.value,
-        int(market.active),
-        int(market.accepting_orders),
-        int(market.enable_orderbook),
-        int(market.neg_risk),
-        market.neg_risk_outcome_position,
-        int(market.neg_risk_member_complete),
-        market.sync_generation,
-        int(market.sync_generation_complete),
-        None if market.tick_size is None else encode_decimal(market.tick_size),
-        (
-            None
-            if market.minimum_order_size is None
-            else encode_decimal(market.minimum_order_size)
-        ),
-        market.end_at,
-        market.resolved_at,
-        market.source_updated_at,
-        market.created_at,
-        market.updated_at,
-    )
-
-
-def _token_values(token: Token) -> tuple[Any, ...]:
-    return (
-        token.id,
-        token.market_id,
-        token.outcome,
-        token.position,
-        (
-            None
-            if token.fee_schedule is None
-            else _encode_fee_schedule(token.fee_schedule)
-        ),
-        token.fee_updated_at,
-        token.sync_generation,
-        int(token.sync_generation_complete),
-        token.created_at,
-        token.updated_at,
-    )
-
-
 def _relation_values(relation: Relation) -> tuple[Any, ...]:
     return (
         relation.id,
@@ -1460,31 +1213,6 @@ def _require_type(value: Any, item_type: type[Any], field_name: str) -> None:
         raise ValueError(f"{field_name} must be a {item_type.__name__}")
 
 
-async def _rebuild_event_market_ids(
-    connection: aiosqlite.Connection,
-    event_id: str,
-) -> None:
-    cursor = await connection.execute(
-        "SELECT 1 FROM events WHERE id = ?",
-        (event_id,),
-    )
-    if await cursor.fetchone() is None:
-        raise ValueError(f"event {event_id!r} does not exist")
-    cursor = await connection.execute(
-        """
-        SELECT id FROM markets
-        WHERE event_id = ?
-        ORDER BY CAST(id AS BLOB)
-        """,
-        (event_id,),
-    )
-    actual = tuple(row[0] for row in await cursor.fetchall())
-    await connection.execute(
-        "UPDATE events SET market_ids_json = ? WHERE id = ?",
-        (_encode_ids(actual, allow_empty=True), event_id),
-    )
-
-
 async def _fetch_one(
     path: Path,
     sql: str,
@@ -1495,16 +1223,6 @@ async def _fetch_one(
         await connection.execute("PRAGMA query_only = ON")
         cursor = await connection.execute(sql, parameters)
         return await cursor.fetchone()
-
-
-async def _schema_version(path: Path) -> int:
-    async with aiosqlite.connect(path) as connection:
-        await connection.execute("PRAGMA query_only = ON")
-        cursor = await connection.execute("PRAGMA user_version")
-        row = await cursor.fetchone()
-    if row is None:
-        raise RuntimeError("database schema version is unavailable")
-    return int(row[0])
 
 
 async def _fetch_all(

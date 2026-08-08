@@ -43,6 +43,18 @@ class CatalogGenerationError(RuntimeError):
 class CatalogSyncAborted(CatalogGenerationError):
     """Raised when WAL safety requires abandoning a complete sync."""
 
+    def __init__(
+        self,
+        *,
+        generation: str,
+        reason: str,
+        wal_peak_bytes: int,
+    ) -> None:
+        self.generation = generation
+        self.reason = reason
+        self.wal_peak_bytes = wal_peak_bytes
+        super().__init__(reason)
+
 
 class CatalogConstraintError(ValueError):
     """Candidate snapshot violates a catalog invariant."""
@@ -202,9 +214,14 @@ class CatalogGenerationCoordinator:
             raise TypeError("value must be GenerationInput")
         plans = _build_plans(value)
         preflight = await self._writer.checkpoint(CheckpointMode.TRUNCATE)
+        wal_peak_bytes = preflight.wal_bytes
         if preflight.wal_bytes >= self._wal_policy.preflight_bytes:
             raise CatalogSyncAborted(
-                "catalog WAL preflight could not reclaim below the safety threshold"
+                generation=value.sync_generation,
+                reason=(
+                    "catalog WAL preflight could not reclaim below the safety threshold"
+                ),
+                wal_peak_bytes=wal_peak_bytes,
             )
         generation, cursors = await self._create_or_resume_staging(value, plans)
         wal_bytes = preflight.wal_bytes
@@ -232,7 +249,11 @@ class CatalogGenerationCoordinator:
                             "single-row batch would exceed the WAL safety reserve",
                         )
                         raise CatalogSyncAborted(
-                            "catalog staging cannot safely write a single-row batch"
+                            generation=value.sync_generation,
+                            reason=(
+                                "catalog staging cannot safely write a single-row batch"
+                            ),
+                            wal_peak_bytes=wal_peak_bytes,
                         )
                     adaptive_max_rows = max(1, (batch_end - start) // 2)
                     continue
@@ -241,13 +262,22 @@ class CatalogGenerationCoordinator:
                         generation.id,
                         "WAL reached the abort waterline",
                     )
-                    raise CatalogSyncAborted("catalog staging reached the WAL abort waterline")
+                    raise CatalogSyncAborted(
+                        generation=value.sync_generation,
+                        reason="catalog staging reached the WAL abort waterline",
+                        wal_peak_bytes=wal_peak_bytes,
+                    )
                 if action is WalAction.PAUSE_AND_CHECKPOINT:
-                    wal_bytes = await self._pause_for_wal(generation.id)
+                    wal_bytes, wal_peak_bytes = await self._pause_for_wal(
+                        generation.id,
+                        sync_generation=value.sync_generation,
+                        wal_peak_bytes=wal_peak_bytes,
+                    )
                     continue
                 if action is WalAction.PASSIVE_CHECKPOINT:
                     checkpoint = await self._writer.checkpoint(CheckpointMode.PASSIVE)
                     wal_bytes = checkpoint.wal_bytes
+                    wal_peak_bytes = max(wal_peak_bytes, wal_bytes)
                     await asyncio.sleep(0)
                     action = decide_wal_action(
                         wal_bytes=wal_bytes,
@@ -275,6 +305,7 @@ class CatalogGenerationCoordinator:
                     wal_delta_bytes=wal_delta,
                 )
                 wal_bytes = checkpoint.wal_bytes
+                wal_peak_bytes = max(wal_peak_bytes, wal_bytes)
                 post_batch_action = decide_wal_action(
                     wal_bytes=wal_bytes,
                     predicted_delta=0,
@@ -286,10 +317,16 @@ class CatalogGenerationCoordinator:
                         "WAL reached the abort waterline after a payload batch",
                     )
                     raise CatalogSyncAborted(
-                        "catalog staging reached the WAL abort waterline"
+                        generation=value.sync_generation,
+                        reason="catalog staging reached the WAL abort waterline",
+                        wal_peak_bytes=wal_peak_bytes,
                     )
                 if post_batch_action is WalAction.PAUSE_AND_CHECKPOINT:
-                    wal_bytes = await self._pause_for_wal(generation.id)
+                    wal_bytes, wal_peak_bytes = await self._pause_for_wal(
+                        generation.id,
+                        sync_generation=value.sync_generation,
+                        wal_peak_bytes=wal_peak_bytes,
+                    )
                 start = batch_end
                 await asyncio.sleep(0)
         return generation
@@ -433,7 +470,6 @@ class CatalogGenerationCoordinator:
         async def command(
             connection: aiosqlite.Connection,
         ) -> tuple[CandidateValidation, RebaseResult]:
-            connection.row_factory = aiosqlite.Row
             cursor = await connection.execute(
                 """
                 SELECT generations.sync_generation,
@@ -448,6 +484,7 @@ class CatalogGenerationCoordinator:
                 """,
                 (validation.generation_id,),
             )
+            cursor.row_factory = aiosqlite.Row
             row = await cursor.fetchone()
             if row is None or row["status"] != "STAGING":
                 raise CatalogActivationConflict(
@@ -476,6 +513,7 @@ class CatalogGenerationCoordinator:
                 """,
                 (from_revision, through_revision),
             )
+            cursor.row_factory = aiosqlite.Row
             changes = list(await cursor.fetchall())
             if through_revision > from_revision and not changes:
                 raise CatalogActivationConflict(
@@ -658,7 +696,7 @@ class CatalogGenerationCoordinator:
                 """
             )
             state = await cursor.fetchone()
-            if state != (
+            if state is None or tuple(state) != (
                 generation.base_generation_id,
                 validation.validated_runtime_revision,
             ):
@@ -811,19 +849,30 @@ class CatalogGenerationCoordinator:
 
         await self._writer.execute(command)
 
-    async def _pause_for_wal(self, generation_id: int) -> int:
+    async def _pause_for_wal(
+        self,
+        generation_id: int,
+        *,
+        sync_generation: str,
+        wal_peak_bytes: int,
+    ) -> tuple[int, int]:
         for _ in range(self._max_pause_checkpoints):
             checkpoint = await self._writer.checkpoint(CheckpointMode.RESTART)
+            wal_peak_bytes = max(wal_peak_bytes, checkpoint.wal_bytes)
             await asyncio.sleep(0)
             if checkpoint.wal_bytes < self._wal_policy.pause_bytes:
-                return checkpoint.wal_bytes
+                return checkpoint.wal_bytes, wal_peak_bytes
             if checkpoint.wal_bytes >= self._wal_policy.abort_bytes:
                 break
         await self._abort_generation(
             generation_id,
             "WAL could not be reclaimed while catalog staging was paused",
         )
-        raise CatalogSyncAborted("catalog staging WAL pause could not be cleared")
+        raise CatalogSyncAborted(
+            generation=sync_generation,
+            reason="catalog staging WAL pause could not be cleared",
+            wal_peak_bytes=wal_peak_bytes,
+        )
 
     async def _abort_generation(self, generation_id: int, reason: str) -> None:
         now = self._clock()
@@ -870,7 +919,6 @@ async def write_runtime_catalog(
         if len(identifiers) != len(set(identifiers)):
             raise ValueError(f"{label} contains duplicate IDs")
 
-    connection.row_factory = aiosqlite.Row
     cursor = await connection.execute(
         """
         SELECT state.active_generation_id, state.runtime_revision,
@@ -881,6 +929,7 @@ async def write_runtime_catalog(
         WHERE state.id = 1 AND generations.status = 'COMMITTED'
         """
     )
+    cursor.row_factory = aiosqlite.Row
     state = await cursor.fetchone()
     if state is None:
         raise CatalogGenerationError("active catalog generation is missing")
@@ -1171,6 +1220,7 @@ async def _fetch_version_rows(
         """,
         parameters,
     )
+    cursor.row_factory = aiosqlite.Row
     return list(await cursor.fetchall())
 
 
