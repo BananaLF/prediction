@@ -6,8 +6,9 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass, replace
 from decimal import Decimal
-from enum import Enum
+from enum import Enum, StrEnum
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import time
@@ -62,6 +63,18 @@ class CatalogConstraintError(ValueError):
 
 class CatalogActivationConflict(RuntimeError):
     """Runtime revision changed after candidate validation."""
+
+
+class CatalogFaultPoint(StrEnum):
+    """Explicit test-only interruption boundaries for generation workflows."""
+
+    AFTER_BATCH_COMMIT = "AFTER_BATCH_COMMIT"
+    AFTER_VALIDATION = "AFTER_VALIDATION"
+    AFTER_REBASE = "AFTER_REBASE"
+    BEFORE_ACTIVATION_COMMIT = "BEFORE_ACTIVATION_COMMIT"
+    AFTER_ACTIVATION_COMMIT = "AFTER_ACTIVATION_COMMIT"
+    AFTER_CHECKPOINT = "AFTER_CHECKPOINT"
+    AFTER_CLEANUP_BATCH = "AFTER_CLEANUP_BATCH"
 
 
 class _GenerationWriter(Protocol):
@@ -185,6 +198,8 @@ class CatalogGenerationCoordinator:
         max_activation_rebases: int = 3,
         clock: Callable[[], int] = lambda: int(time.time()),
         database_path: Path | None = None,
+        fault_hook: Callable[[CatalogFaultPoint], object | Awaitable[object]]
+        | None = None,
     ) -> None:
         if not isinstance(batch_limits, CatalogBatchLimits):
             raise TypeError("batch_limits must be CatalogBatchLimits")
@@ -199,6 +214,8 @@ class CatalogGenerationCoordinator:
             raise ValueError("max_pause_checkpoints must be a positive integer")
         if type(max_activation_rebases) is not int or max_activation_rebases <= 0:
             raise ValueError("max_activation_rebases must be a positive integer")
+        if fault_hook is not None and not callable(fault_hook):
+            raise TypeError("fault_hook must be callable or None")
         self._writer = writer
         self._batch_limits = batch_limits
         self._wal_policy = wal_policy
@@ -206,6 +223,7 @@ class CatalogGenerationCoordinator:
         self._max_pause_checkpoints = max_pause_checkpoints
         self._max_activation_rebases = max_activation_rebases
         self._clock = clock
+        self._fault_hook = fault_hook
         inferred_path = getattr(writer, "path", None)
         if database_path is None and inferred_path is None:
             inferred_path = getattr(writer, "_path", None)
@@ -305,7 +323,9 @@ class CatalogGenerationCoordinator:
                     start=start,
                     end=batch_end,
                 )
+                await self._hit_fault(CatalogFaultPoint.AFTER_BATCH_COMMIT)
                 checkpoint = await self._writer.checkpoint(CheckpointMode.PASSIVE)
+                await self._hit_fault(CatalogFaultPoint.AFTER_CHECKPOINT)
                 wal_delta = max(0, checkpoint.wal_bytes - wal_bytes)
                 self._wal_amplification = update_wal_amplification(
                     current=self._wal_amplification,
@@ -350,6 +370,7 @@ class CatalogGenerationCoordinator:
         try:
             validation = await self._read_candidate_validation(generation)
             await self._freeze_candidate(generation, validation)
+            await self._hit_fault(CatalogFaultPoint.AFTER_VALIDATION)
             return validation
         except CatalogConstraintError as error:
             await self._abort_generation(generation.id, str(error))
@@ -540,6 +561,7 @@ class CatalogGenerationCoordinator:
             )
 
         result = await self._writer.execute(command)
+        await self._hit_fault(CatalogFaultPoint.AFTER_CLEANUP_BATCH)
         checkpoint = await self._writer.checkpoint(CheckpointMode.PASSIVE)
         action = decide_wal_action(
             wal_bytes=checkpoint.wal_bytes,
@@ -653,7 +675,10 @@ class CatalogGenerationCoordinator:
                     ),
                 )
 
+            await self._hit_fault(CatalogFaultPoint.BEFORE_ACTIVATION_COMMIT)
+
         await self._writer.execute(command)
+        await self._hit_fault(CatalogFaultPoint.AFTER_ACTIVATION_COMMIT)
 
     async def rebase(
         self,
@@ -809,10 +834,19 @@ class CatalogGenerationCoordinator:
             return rebased, result
 
         try:
-            return await self._writer.execute(command)
+            result = await self._writer.execute(command)
+            await self._hit_fault(CatalogFaultPoint.AFTER_REBASE)
+            return result
         except CatalogConstraintError as error:
             await self._abort_generation(validation.generation_id, str(error))
             raise
+
+    async def _hit_fault(self, point: CatalogFaultPoint) -> None:
+        if self._fault_hook is None:
+            return
+        result = self._fault_hook(point)
+        if inspect.isawaitable(result):
+            await result
 
     async def _read_candidate_validation(
         self,

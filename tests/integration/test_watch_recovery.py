@@ -28,11 +28,18 @@ from predmarket.domain.signal import (
     StrategyType,
 )
 from predmarket.notification.notifier import Notifier
+from predmarket.persistence.catalog_generations import (
+    CatalogFaultPoint,
+    CatalogGenerationCoordinator,
+    GenerationInput,
+    catalog_input_digest,
+)
 from predmarket.persistence.repositories import (
     CatalogRepository,
     CatalogSnapshot,
     SignalRepository,
 )
+from predmarket.persistence.schema import create_v4_database
 from predmarket.persistence.writer import DatabaseWriter
 from predmarket.polymarket.gateway import MarketStreamEvent, MarketStreamInvalidated
 from predmarket.watch.cache import CacheState
@@ -741,4 +748,145 @@ async def test_sqlite_signal_times_follow_each_market_generation_across_recovery
     finally:
         if watch is not None:
             await watch.close()
+        await writer.close()
+
+
+async def test_full_sync_rebases_concurrent_watch_write_without_mixed_reads(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    try:
+        catalog = CatalogRepository(database_path, writer)
+        old_event = Event(
+            id="event-1",
+            slug="event-slug",
+            title="Old",
+            status=MarketStatus.ACTIVE,
+            market_ids=("market-1",),
+            sync_generation="sync-old",
+            sync_generation_complete=True,
+            updated_at=10,
+        )
+        old_market = Market(
+            id="market-1",
+            event_id="event-1",
+            condition_id="condition-1",
+            slug="market-slug",
+            question="Old?",
+            status=MarketStatus.ACTIVE,
+            active=True,
+            accepting_orders=True,
+            enable_orderbook=True,
+            sync_generation="sync-old",
+            sync_generation_complete=True,
+            updated_at=10,
+        )
+        old_token = Token(
+            id="token-1",
+            market_id="market-1",
+            outcome="YES",
+            position=0,
+            sync_generation="sync-old",
+            sync_generation_complete=True,
+            updated_at=10,
+        )
+        await catalog.save_complete_catalog(
+            generation="sync-old",
+            updated_at=10,
+            events=(old_event,),
+            markets=(old_market,),
+            tokens=(old_token,),
+        )
+
+        new_event = replace(
+            old_event,
+            title="Full sync",
+            sync_generation="sync-new",
+            updated_at=20,
+        )
+        new_market = replace(
+            old_market,
+            question="Full sync?",
+            sync_generation="sync-new",
+            updated_at=20,
+        )
+        new_token = replace(
+            old_token,
+            sync_generation="sync-new",
+            updated_at=20,
+        )
+        generation_input = GenerationInput(
+            sync_generation="sync-new",
+            updated_at=20,
+            events=(new_event,),
+            markets=(new_market,),
+            tokens=(new_token,),
+            input_digest=catalog_input_digest(
+                sync_generation="sync-new",
+                updated_at=20,
+                events=(new_event,),
+                markets=(new_market,),
+                tokens=(new_token,),
+            ),
+        )
+
+        validated = asyncio.Event()
+        release_activation = asyncio.Event()
+
+        async def pause_after_validation(point: CatalogFaultPoint) -> None:
+            if point is CatalogFaultPoint.AFTER_VALIDATION:
+                validated.set()
+                await release_activation.wait()
+
+        coordinator = CatalogGenerationCoordinator(
+            writer,
+            fault_hook=pause_after_validation,
+        )
+
+        async def full_sync() -> None:
+            staged = await coordinator.stage(generation_input)
+            validation = await coordinator.validate_candidate(staged)
+            await coordinator.activate(validation, None)
+
+        stop_reading = asyncio.Event()
+        observed: list[tuple[str, str, str]] = []
+
+        async def read_catalogs() -> None:
+            while not stop_reading.is_set():
+                snapshot = await catalog.load_catalog()
+                if snapshot.events and snapshot.markets and snapshot.tokens:
+                    observed.append(
+                        (
+                            snapshot.events[0].sync_generation,
+                            snapshot.markets[0].sync_generation,
+                            snapshot.tokens[0].sync_generation,
+                        )
+                    )
+                await asyncio.sleep(0)
+
+        reader_task = asyncio.create_task(read_catalogs())
+        sync_task = asyncio.create_task(full_sync())
+        await validated.wait()
+        await catalog.save_event(
+            replace(old_event, title="Watch wins", updated_at=30)
+        )
+        release_activation.set()
+        await sync_task
+        stop_reading.set()
+        await reader_task
+
+        snapshot = await catalog.load_catalog()
+        assert snapshot.events[0].title == "Watch wins"
+        assert snapshot.events[0].updated_at == 30
+        assert snapshot.markets[0].question == "Full sync?"
+        assert observed
+        assert all(
+            event_generation == market_generation == token_generation
+            for event_generation, market_generation, token_generation in observed
+        )
+        assert {values[0] for values in observed} <= {"sync-old", "sync-new"}
+    finally:
         await writer.close()
