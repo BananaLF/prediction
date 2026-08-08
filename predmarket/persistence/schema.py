@@ -931,7 +931,16 @@ def _build_schema_v4() -> str:
         downstream_indexes.append(index_sql)
 
     return "\n\n".join(
-        [_SCHEMA_V4_CATALOG, *downstream_tables, *downstream_indexes]
+        [
+            _SCHEMA_V4_CATALOG,
+            *downstream_tables,
+            *downstream_indexes,
+            """
+CREATE UNIQUE INDEX catalog_reconciliation_ready_change_id_idx
+    ON system_events(json_extract(details_json, '$.change_id'))
+    WHERE event_type = 'CATALOG_RECONCILIATION_READY';
+""".strip(),
+        ]
     )
 
 

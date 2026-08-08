@@ -8,14 +8,19 @@ from typing import Any
 import aiosqlite
 import pytest
 
+from predmarket.catalog.changes import MarketChange, MarketChangeType
 from predmarket.domain.market import Event, Market, MarketStatus, Token
 from predmarket.persistence.catalog_generations import (
+    CandidateValidation,
+    CatalogActivationConflict,
     CatalogBatchLimits,
+    CatalogConstraintError,
     CatalogGenerationCoordinator,
     CatalogSyncAborted,
     GenerationInput,
 )
 from predmarket.persistence.schema import GenerationStatus, create_v4_database
+from predmarket.persistence.repositories import PendingCatalogReconciliation
 from predmarket.persistence.wal import WalPolicy
 from predmarket.persistence.writer import CheckpointMode, CheckpointResult
 
@@ -576,3 +581,285 @@ async def test_stage_aborts_generation_when_post_batch_wal_reaches_abort_line(
         ).fetchone()[0]
     assert row == ("ABORTED", 1)
     assert active_generation_id == 1
+
+
+def _related_generation_input(
+    *,
+    generation: str,
+    event_slug: str | None = "event-slug",
+    market_slug: str | None = "market-slug",
+) -> GenerationInput:
+    event = Event(
+        id="event-1",
+        slug=event_slug,
+        title="Event",
+        status=MarketStatus.ACTIVE,
+        market_ids=("market-1",),
+        sync_generation=generation,
+        sync_generation_complete=True,
+        updated_at=10,
+    )
+    market = Market(
+        id="market-1",
+        event_id=event.id,
+        condition_id="condition-1",
+        slug=market_slug,
+        question="Question?",
+        status=MarketStatus.ACTIVE,
+        active=True,
+        accepting_orders=True,
+        enable_orderbook=True,
+        sync_generation=generation,
+        sync_generation_complete=True,
+        updated_at=10,
+    )
+    token = Token(
+        id="token-1",
+        market_id=market.id,
+        outcome="YES",
+        position=0,
+        sync_generation=generation,
+        sync_generation_complete=True,
+        updated_at=10,
+    )
+    return GenerationInput(
+        sync_generation=generation,
+        updated_at=10,
+        events=(event,),
+        markets=(market,),
+        tokens=(token,),
+        input_digest=f"digest-{generation}",
+    )
+
+
+def _pending_reconciliation(generation: str) -> PendingCatalogReconciliation:
+    return PendingCatalogReconciliation(
+        change=MarketChange(
+            change_id=f"{generation}:CATALOG_RECONCILED:catalog",
+            change_type=MarketChangeType.CATALOG_RECONCILED,
+            event_id=None,
+            market_id=None,
+            token_ids=(),
+            occurred_at=10,
+            critical=True,
+        ),
+        market_ids=("market-1",),
+    )
+
+
+async def test_validate_candidate_freezes_effective_snapshot(tmp_path: Path) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    coordinator = CatalogGenerationCoordinator(_CatalogTestWriter(database_path))
+    staged = await coordinator.stage(
+        _related_generation_input(generation="sync-valid")
+    )
+
+    validation = await coordinator.validate_candidate(staged)
+
+    assert validation == CandidateValidation(
+        generation_id=staged.id,
+        event_count=1,
+        market_count=1,
+        token_count=1,
+        snapshot_digest=validation.snapshot_digest,
+        validated_runtime_revision=0,
+    )
+    assert len(validation.snapshot_digest) == 64
+    with _connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT candidate_event_count, candidate_market_count,
+                   candidate_token_count, candidate_snapshot_digest, validated_at
+            FROM catalog_generations WHERE id = ?
+            """,
+            (staged.id,),
+        ).fetchone()
+    assert row[:4] == (1, 1, 1, validation.snapshot_digest)
+    assert row[4] is not None
+
+
+@pytest.mark.parametrize(
+    ("violation", "message"),
+    (
+        ("event_slug", "event slug"),
+        ("market_slug", "market slug"),
+        ("condition", "condition"),
+        ("position", "position"),
+        ("outcome", "outcome"),
+        ("missing_parent", "parent"),
+    ),
+)
+async def test_validate_candidate_aborts_catalog_constraint_violations(
+    tmp_path: Path,
+    violation: str,
+    message: str,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    generation = "sync-invalid"
+    value = _related_generation_input(generation=generation)
+    event = value.events[0]
+    market = value.markets[0]
+    token = value.tokens[0]
+    events = value.events
+    markets = value.markets
+    tokens = value.tokens
+    if violation == "event_slug":
+        events += (replace(event, id="event-2", market_ids=()),)
+    elif violation == "market_slug":
+        markets += (
+            replace(
+                market,
+                id="market-2",
+                condition_id="condition-2",
+            ),
+        )
+    elif violation == "condition":
+        markets += (replace(market, id="market-2", slug="market-2"),)
+    elif violation == "position":
+        tokens += (replace(token, id="token-2", outcome="NO"),)
+    elif violation == "outcome":
+        tokens += (replace(token, id="token-2", position=1),)
+    else:
+        with _connect(database_path) as connection:
+            connection.execute(
+                "INSERT INTO catalog_event_ids (id) VALUES ('missing-event')"
+            )
+        markets = (replace(market, event_id="missing-event"),)
+    value = replace(
+        value,
+        events=events,
+        markets=markets,
+        tokens=tokens,
+        input_digest=f"digest-{violation}",
+    )
+    coordinator = CatalogGenerationCoordinator(_CatalogTestWriter(database_path))
+    staged = await coordinator.stage(value)
+
+    with pytest.raises(CatalogConstraintError, match=message):
+        await coordinator.validate_candidate(staged)
+
+    with _connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT status, failure_reason FROM catalog_generations WHERE id = ?",
+            (staged.id,),
+        ).fetchone()
+        active_generation_id = connection.execute(
+            "SELECT active_generation_id FROM catalog_state WHERE id = 1"
+        ).fetchone()[0]
+    assert row[0] == "ABORTED"
+    assert message in row[1]
+    assert active_generation_id == 1
+
+
+async def test_validate_candidate_aborts_count_or_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    coordinator = CatalogGenerationCoordinator(_CatalogTestWriter(database_path))
+    staged = await coordinator.stage(
+        _related_generation_input(generation="sync-corrupt")
+    )
+    with _connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE catalog_generations
+            SET written_market_count = written_market_count + 1
+            WHERE id = ?
+            """,
+            (staged.id,),
+        )
+
+    with pytest.raises(CatalogConstraintError, match="count or digest"):
+        await coordinator.validate_candidate(staged)
+
+    with _connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT status FROM catalog_generations WHERE id = ?",
+            (staged.id,),
+        ).fetchone() == ("ABORTED",)
+
+
+async def test_activate_rolls_back_pointer_status_and_outbox_then_retries(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    coordinator = CatalogGenerationCoordinator(_CatalogTestWriter(database_path))
+    staged = await coordinator.stage(
+        _related_generation_input(generation="sync-activate")
+    )
+    validation = await coordinator.validate_candidate(staged)
+    with _connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_catalog_ready
+            BEFORE INSERT ON system_events
+            WHEN NEW.event_type = 'CATALOG_RECONCILIATION_READY'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected outbox failure');
+            END
+            """
+        )
+    reconciliation = _pending_reconciliation("sync-activate")
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected outbox failure"):
+        await coordinator.activate(validation, reconciliation)
+
+    with _connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT status FROM catalog_generations WHERE id = ?",
+            (staged.id,),
+        ).fetchone() == ("STAGING",)
+        assert connection.execute(
+            "SELECT active_generation_id FROM catalog_state WHERE id = 1"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM system_events"
+        ).fetchone() == (0,)
+        connection.execute("DROP TRIGGER fail_catalog_ready")
+
+    await coordinator.activate(validation, reconciliation)
+
+    with _connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT status FROM catalog_generations WHERE id = ?",
+            (staged.id,),
+        ).fetchone() == ("COMMITTED",)
+        assert connection.execute(
+            "SELECT active_generation_id FROM catalog_state WHERE id = 1"
+        ).fetchone() == (staged.id,)
+        assert connection.execute(
+            """
+            SELECT COUNT(*) FROM system_events
+            WHERE event_type = 'CATALOG_RECONCILIATION_READY'
+            """
+        ).fetchone() == (1,)
+
+
+async def test_activate_rejects_runtime_revision_change(tmp_path: Path) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    coordinator = CatalogGenerationCoordinator(_CatalogTestWriter(database_path))
+    staged = await coordinator.stage(
+        _related_generation_input(generation="sync-conflict")
+    )
+    validation = await coordinator.validate_candidate(staged)
+    with _connect(database_path) as connection:
+        connection.execute(
+            "UPDATE catalog_state SET runtime_revision = 1 WHERE id = 1"
+        )
+
+    with pytest.raises(CatalogActivationConflict, match="runtime revision"):
+        await coordinator.activate(validation, None)
+
+    with _connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT status FROM catalog_generations WHERE id = ?",
+            (staged.id,),
+        ).fetchone() == ("STAGING",)
+        assert connection.execute(
+            "SELECT active_generation_id FROM catalog_state WHERE id = 1"
+        ).fetchone() == (1,)

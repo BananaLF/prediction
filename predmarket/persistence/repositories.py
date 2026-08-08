@@ -30,6 +30,13 @@ from predmarket.domain.signal import (
     OpportunityPresent,
     StrategyType,
 )
+from predmarket.persistence.catalog_generations import (
+    CatalogActivationConflict,
+    CatalogGenerationError,
+    CatalogGenerationCoordinator,
+    GenerationInput,
+    catalog_input_digest,
+)
 from predmarket.persistence.writer import DatabaseWriter
 
 
@@ -236,6 +243,78 @@ class CatalogRepository:
             len(materialized_markets),
             len(materialized_tokens),
         )
+
+        if await _schema_version(self._path) == 4:
+            reconciliation = (
+                None
+                if reconciliation_change is None
+                else PendingCatalogReconciliation(
+                    change=reconciliation_change,
+                    market_ids=tuple(json.loads(encoded_reconciliation_market_ids)),
+                )
+            )
+            generation_input = GenerationInput(
+                sync_generation=generation,
+                updated_at=updated_at,
+                events=materialized_events,
+                markets=materialized_markets,
+                tokens=materialized_tokens,
+                input_digest=catalog_input_digest(
+                    sync_generation=generation,
+                    updated_at=updated_at,
+                    events=materialized_events,
+                    markets=materialized_markets,
+                    tokens=materialized_tokens,
+                ),
+            )
+            existing_generation = await _fetch_one(
+                self._path,
+                """
+                SELECT generations.id, generations.input_digest,
+                       generations.status, state.active_generation_id
+                FROM catalog_generations AS generations
+                JOIN catalog_state AS state ON state.id = 1
+                WHERE generations.sync_generation = ?
+                """,
+                (generation,),
+            )
+            if existing_generation is not None:
+                if existing_generation["input_digest"] != generation_input.input_digest:
+                    raise CatalogGenerationError(
+                        "existing generation has a different normalized catalog payload"
+                    )
+                if existing_generation["status"] == "COMMITTED":
+                    if (
+                        existing_generation["id"]
+                        != existing_generation["active_generation_id"]
+                    ):
+                        raise CatalogActivationConflict(
+                            "committed generation is no longer active"
+                        )
+                    _LOGGER.info(
+                        "catalog_complete_save_completed sync_generation=%s "
+                        "elapsed_ms=%d idempotent=true",
+                        generation,
+                        int((time.monotonic() - started_at) * 1_000),
+                    )
+                    return
+                if existing_generation["status"] == "ABORTED":
+                    raise CatalogGenerationError(
+                        "existing generation was aborted and cannot be retried"
+                    )
+            coordinator = CatalogGenerationCoordinator(
+                self._writer,
+                database_path=self._path,
+            )
+            staged = await coordinator.stage(generation_input)
+            validation = await coordinator.validate_candidate(staged)
+            await coordinator.activate(validation, reconciliation)
+            _LOGGER.info(
+                "catalog_complete_save_completed sync_generation=%s elapsed_ms=%d",
+                generation,
+                int((time.monotonic() - started_at) * 1_000),
+            )
+            return
 
         async def command(connection: aiosqlite.Connection) -> None:
             stage_started_at = time.monotonic()
@@ -1509,6 +1588,16 @@ async def _fetch_one(
         await connection.execute("PRAGMA query_only = ON")
         cursor = await connection.execute(sql, parameters)
         return await cursor.fetchone()
+
+
+async def _schema_version(path: Path) -> int:
+    async with aiosqlite.connect(path) as connection:
+        await connection.execute("PRAGMA query_only = ON")
+        cursor = await connection.execute("PRAGMA user_version")
+        row = await cursor.fetchone()
+    if row is None:
+        raise RuntimeError("database schema version is unavailable")
+    return int(row[0])
 
 
 async def _fetch_all(
