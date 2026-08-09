@@ -85,3 +85,36 @@ def test_migrate_rejects_non_v1_without_mutating_database(tmp_path: Path) -> Non
 
     assert database_path.read_bytes() == original_bytes
     assert not backup_path.exists()
+
+
+def test_v1_to_v2_requires_an_explicit_backup(tmp_path: Path) -> None:
+    database_path = tmp_path / "market.db"
+    _create_v1_database(database_path)
+
+    with pytest.raises(ValueError, match="backup is required"):
+        migrate_database(database_path, target_version=2)
+
+
+def test_v3_to_v4_rejects_an_explicit_backup(tmp_path: Path) -> None:
+    database_path = tmp_path / "market.db"
+    backup_path = tmp_path / "manual-backup.db"
+
+    with pytest.raises(ValueError, match="backup must not be provided"):
+        migrate_database(database_path, backup_path, target_version=4)
+
+
+def test_legacy_migration_does_not_treat_v4_as_a_downgrade_source(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    backup_path = tmp_path / "market-v4-backup.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE v4_marker (id INTEGER PRIMARY KEY)")
+        connection.execute("PRAGMA user_version = 4")
+    original_bytes = database_path.read_bytes()
+
+    with pytest.raises(ValueError, match="schema version 4"):
+        migrate_database(database_path, backup_path, target_version=2)
+
+    assert database_path.read_bytes() == original_bytes
+    assert not backup_path.exists()

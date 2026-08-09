@@ -209,6 +209,7 @@ async def CatalogGenerationCoordinator.stage(
 ### Task 4: 候选快照校验与短事务原子激活
 
 **Files:**
+- Modify: `predmarket/persistence/schema.py` — ready outbox 唯一索引
 - Modify: `predmarket/persistence/catalog_generations.py`
 - Modify: `predmarket/persistence/repositories.py:173-333`
 - Modify: `tests/unit/persistence/test_catalog_generations.py`

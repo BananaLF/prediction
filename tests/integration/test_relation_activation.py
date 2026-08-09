@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sqlite3
 import threading
+from typing import Any
 
 import pytest
 import yaml
@@ -125,6 +126,33 @@ async def _seed_relation(
         await writer.close()
 
 
+async def _mutate_catalog_entity(
+    database_path: Path,
+    entity_type: str,
+    entity_id: str,
+    **changes: Any,
+) -> None:
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    try:
+        catalog = CatalogRepository(database_path, writer)
+        getters = {
+            "event": catalog.get_event,
+            "market": catalog.get_market,
+            "token": catalog.get_token,
+        }
+        savers = {
+            "event": catalog.save_event,
+            "market": catalog.save_market,
+            "token": catalog.save_token,
+        }
+        current = await getters[entity_type](entity_id)
+        assert current is not None
+        await savers[entity_type](replace(current, **changes))
+    finally:
+        await writer.close()
+
+
 def _write_config(path: Path, database_path: Path) -> Path:
     raw = yaml.safe_load(Path("config/default.yaml").read_text())
     raw["database"]["path"] = str(database_path)
@@ -206,20 +234,23 @@ async def test_relations_list_show_and_analyze_use_persistent_database(
 
 
 @pytest.mark.parametrize(
-    "semantic_change_sql",
+    ("entity_type", "entity_id", "semantic_changes"),
     [
-        "UPDATE events SET title = 'Different event semantics' WHERE id = 'event-1'",
-        "UPDATE markets SET description = 'Different resolution wording' "
-        "WHERE id = 'market-a'",
-        "UPDATE markets SET condition_id = 'different-condition' "
-        "WHERE id = 'market-a'",
-        "UPDATE tokens SET outcome = 'DIFFERENT' "
-        "WHERE id = 'market-a-token-0'",
+        ("event", "event-1", {"title": "Different event semantics"}),
+        (
+            "market",
+            "market-a",
+            {"description": "Different resolution wording"},
+        ),
+        ("market", "market-a", {"condition_id": "different-condition"}),
+        ("token", "market-a-token-0", {"outcome": "DIFFERENT"}),
     ],
 )
 async def test_cli_approval_rejects_semantics_changed_after_analysis(
     tmp_path: Path,
-    semantic_change_sql: str,
+    entity_type: str,
+    entity_id: str,
+    semantic_changes: dict[str, Any],
 ) -> None:
     database_path = tmp_path / "market.db"
     config_path = _write_config(tmp_path, database_path)
@@ -244,8 +275,13 @@ async def test_cli_approval_rejects_semantics_changed_after_analysis(
         analyzer=analyzer,
         now_ms=lambda: 11,
     ) == 0
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(semantic_change_sql)
+    await _mutate_catalog_entity(
+        database_path,
+        entity_type,
+        entity_id,
+        updated_at=12,
+        **semantic_changes,
+    )
 
     with pytest.raises(ValueError, match="semantics changed"):
         await asyncio.to_thread(
@@ -291,15 +327,15 @@ async def test_cli_approval_ignores_nonsemantic_market_metadata_changes(
         analyzer=analyzer,
         now_ms=lambda: 11,
     ) == 0
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            """
-            UPDATE markets
-            SET tick_size = '0.02', minimum_order_size = '5',
-                source_updated_at = 999, updated_at = 999
-            WHERE id = 'market-a'
-            """
-        )
+    await _mutate_catalog_entity(
+        database_path,
+        "market",
+        "market-a",
+        tick_size=Decimal("0.02"),
+        minimum_order_size=Decimal("5"),
+        source_updated_at=999,
+        updated_at=999,
+    )
 
     assert await asyncio.to_thread(
         main,
@@ -344,11 +380,13 @@ async def test_analysis_rejects_semantics_changed_while_analyzer_is_running(
         )
     )
     assert await asyncio.to_thread(started.wait, 1)
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            "UPDATE markets SET question = 'Changed during analysis?' "
-            "WHERE id = 'market-a'"
-        )
+    await _mutate_catalog_entity(
+        database_path,
+        "market",
+        "market-a",
+        question="Changed during analysis?",
+        updated_at=12,
+    )
     release.set()
 
     with pytest.raises(ValueError, match="changed during analysis"):

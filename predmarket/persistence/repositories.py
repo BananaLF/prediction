@@ -30,6 +30,14 @@ from predmarket.domain.signal import (
     OpportunityPresent,
     StrategyType,
 )
+from predmarket.persistence.catalog_generations import (
+    CatalogActivationConflict,
+    CatalogGenerationError,
+    CatalogGenerationCoordinator,
+    GenerationInput,
+    catalog_input_digest,
+    write_runtime_catalog,
+)
 from predmarket.persistence.writer import DatabaseWriter
 
 
@@ -71,101 +79,12 @@ class CatalogRepository:
         materialized_tokens = _typed_tuple(tokens, Token, "tokens")
 
         async def command(connection: aiosqlite.Connection) -> None:
-            affected_event_ids = {event.id for event in materialized_events}
-            affected_event_ids.update(
-                market.event_id
-                for market in materialized_markets
-                if market.event_id is not None
-            )
-            await connection.execute(
-                """
-                CREATE TEMP TABLE IF NOT EXISTS _catalog_incoming_markets (
-                    id TEXT PRIMARY KEY
-                )
-                """
-            )
-            await connection.execute("DELETE FROM _catalog_incoming_markets")
-            if materialized_markets:
-                await connection.executemany(
-                    "INSERT INTO _catalog_incoming_markets (id) VALUES (?)",
-                    ((market.id,) for market in materialized_markets),
-                )
-                cursor = await connection.execute(
-                    """
-                    SELECT DISTINCT markets.event_id
-                    FROM markets
-                    JOIN _catalog_incoming_markets AS incoming
-                      ON incoming.id = markets.id
-                    WHERE markets.event_id IS NOT NULL
-                    """
-                )
-                affected_event_ids.update(row[0] for row in await cursor.fetchall())
-
-            if materialized_events:
-                await connection.executemany(
-                    _UPSERT_EVENT,
-                    (_event_values(event) for event in materialized_events),
-                )
-            if materialized_markets:
-                await connection.executemany(
-                    _UPSERT_MARKET,
-                    (_market_values(market) for market in materialized_markets),
-                )
-            if materialized_tokens:
-                await connection.executemany(
-                    _UPSERT_TOKEN,
-                    (_token_values(token) for token in materialized_tokens),
-                )
-
-            await connection.execute(
-                """
-                CREATE TEMP TABLE IF NOT EXISTS _catalog_affected_events (
-                    id TEXT PRIMARY KEY
-                )
-                """
-            )
-            await connection.execute("DELETE FROM _catalog_affected_events")
-            sorted_event_ids = tuple(
-                sorted(affected_event_ids, key=lambda value: value.encode("utf-8"))
-            )
-            if not sorted_event_ids:
-                return
-            await connection.executemany(
-                "INSERT INTO _catalog_affected_events (id) VALUES (?)",
-                ((event_id,) for event_id in sorted_event_ids),
-            )
-            cursor = await connection.execute(
-                """
-                SELECT affected.id
-                FROM _catalog_affected_events AS affected
-                LEFT JOIN events ON events.id = affected.id
-                WHERE events.id IS NULL
-                ORDER BY CAST(affected.id AS BLOB)
-                LIMIT 1
-                """
-            )
-            missing_event = await cursor.fetchone()
-            if missing_event is not None:
-                raise ValueError(f"event {missing_event[0]!r} does not exist")
-
-            cursor = await connection.execute(
-                """
-                SELECT affected.id, markets.id
-                FROM _catalog_affected_events AS affected
-                LEFT JOIN markets ON markets.event_id = affected.id
-                ORDER BY CAST(affected.id AS BLOB), CAST(markets.id AS BLOB)
-                """
-            )
-            market_ids_by_event = {event_id: [] for event_id in sorted_event_ids}
-            for event_id, market_id in await cursor.fetchall():
-                if market_id is not None:
-                    market_ids_by_event[event_id].append(market_id)
-            await connection.executemany(
-                "UPDATE events SET market_ids_json = ? WHERE id = ?",
-                (
-                    (_encode_ids(market_ids_by_event[event_id], allow_empty=True), event_id)
-                    for event_id in sorted_event_ids
-                ),
+            await write_runtime_catalog(
+                connection,
+                events=materialized_events,
+                markets=materialized_markets,
+                tokens=materialized_tokens,
+                changed_at=int(time.time()),
             )
 
         await self._writer.execute(command)
@@ -237,85 +156,70 @@ class CatalogRepository:
             len(materialized_tokens),
         )
 
-        async def command(connection: aiosqlite.Connection) -> None:
-            stage_started_at = time.monotonic()
-            for table in ("events", "markets", "tokens"):
-                await connection.execute(
-                    f"""
-                    UPDATE {table}
-                    SET sync_generation = ?,
-                        sync_generation_complete = 1,
-                        updated_at = MAX(updated_at, ?)
-                    """,
-                    (generation, updated_at),
-                )
-            _LOGGER.info(
-                "catalog_complete_save_stage_completed sync_generation=%s "
-                "stage=advance_existing_generation elapsed_ms=%d",
-                generation,
-                int((time.monotonic() - stage_started_at) * 1_000),
+        reconciliation = (
+            None
+            if reconciliation_change is None
+            else PendingCatalogReconciliation(
+                change=reconciliation_change,
+                market_ids=tuple(json.loads(encoded_reconciliation_market_ids)),
             )
-
-            for stage, statement, entities, values in (
-                ("upsert_events", _UPSERT_EVENT, materialized_events, _event_values),
-                ("upsert_markets", _UPSERT_MARKET, materialized_markets, _market_values),
-                ("upsert_tokens", _UPSERT_TOKEN, materialized_tokens, _token_values),
-            ):
-                stage_started_at = time.monotonic()
-                if entities:
-                    await connection.executemany(
-                        statement,
-                        (values(entity) for entity in entities),
+        )
+        generation_input = GenerationInput(
+            sync_generation=generation,
+            updated_at=updated_at,
+            events=materialized_events,
+            markets=materialized_markets,
+            tokens=materialized_tokens,
+            input_digest=catalog_input_digest(
+                sync_generation=generation,
+                updated_at=updated_at,
+                events=materialized_events,
+                markets=materialized_markets,
+                tokens=materialized_tokens,
+            ),
+        )
+        existing_generation = await _fetch_one(
+            self._path,
+            """
+            SELECT generations.id, generations.input_digest,
+                   generations.status, state.active_generation_id
+            FROM catalog_generations AS generations
+            JOIN catalog_state AS state ON state.id = 1
+            WHERE generations.sync_generation = ?
+            """,
+            (generation,),
+        )
+        if existing_generation is not None:
+            if existing_generation["input_digest"] != generation_input.input_digest:
+                raise CatalogGenerationError(
+                    "existing generation has a different normalized catalog payload"
+                )
+            if existing_generation["status"] == "COMMITTED":
+                if (
+                    existing_generation["id"]
+                    != existing_generation["active_generation_id"]
+                ):
+                    raise CatalogActivationConflict(
+                        "committed generation is no longer active"
                     )
                 _LOGGER.info(
-                    "catalog_complete_save_stage_completed sync_generation=%s "
-                    "stage=%s rows=%d elapsed_ms=%d",
+                    "catalog_complete_save_completed sync_generation=%s "
+                    "elapsed_ms=%d idempotent=true",
                     generation,
-                    stage,
-                    len(entities),
-                    int((time.monotonic() - stage_started_at) * 1_000),
+                    int((time.monotonic() - started_at) * 1_000),
                 )
-            if reconciliation_change is not None:
-                reconciliation_details = _encode_json_object(
-                    {
-                        "change_id": reconciliation_change.change_id,
-                        "change_type": reconciliation_change.change_type.value,
-                        "critical": reconciliation_change.critical,
-                        "event_id": reconciliation_change.event_id,
-                        "market_id": reconciliation_change.market_id,
-                        "market_ids": json.loads(encoded_reconciliation_market_ids),
-                        "sync_generation": generation,
-                        "token_ids": reconciliation_change.token_ids,
-                    }
+                return
+            if existing_generation["status"] == "ABORTED":
+                raise CatalogGenerationError(
+                    "existing generation was aborted and cannot be retried"
                 )
-                await connection.execute(
-                    """
-                    INSERT INTO system_events (
-                        component, severity, event_type, message,
-                        details_json, occurred_at
-                    )
-                    SELECT 'SYNC', 'INFO', 'CATALOG_RECONCILIATION_READY', ?, ?, ?
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM system_events
-                        WHERE event_type = 'CATALOG_RECONCILIATION_READY'
-                          AND json_extract(details_json, '$.change_id') = ?
-                    )
-                    """,
-                    (
-                        f"Catalog reconciliation {reconciliation_change.change_id} ready",
-                        reconciliation_details,
-                        reconciliation_change.occurred_at,
-                        reconciliation_change.change_id,
-                    ),
-                )
-            _LOGGER.info(
-                "catalog_complete_save_command_completed sync_generation=%s "
-                "elapsed_ms=%d",
-                generation,
-                int((time.monotonic() - started_at) * 1_000),
-            )
-
-        await self._writer.execute(command)
+        coordinator = CatalogGenerationCoordinator(
+            self._writer,
+            database_path=self._path,
+        )
+        staged = await coordinator.stage(generation_input)
+        validation = await coordinator.validate_candidate(staged)
+        await coordinator.activate(validation, reconciliation)
         _LOGGER.info(
             "catalog_complete_save_completed sync_generation=%s elapsed_ms=%d",
             generation,
@@ -326,8 +230,11 @@ class CatalogRepository:
         _require_type(event, Event, "event")
 
         async def command(connection: aiosqlite.Connection) -> None:
-            await connection.execute(_UPSERT_EVENT, _event_values(event))
-            await _rebuild_event_market_ids(connection, event.id)
+            await write_runtime_catalog(
+                connection,
+                events=(event,),
+                changed_at=int(time.time()),
+            )
 
         await self._writer.execute(command)
 
@@ -335,33 +242,25 @@ class CatalogRepository:
         _require_type(market, Market, "market")
 
         async def command(connection: aiosqlite.Connection) -> None:
-            cursor = await connection.execute(
-                "SELECT event_id FROM markets WHERE id = ?",
-                (market.id,),
+            await write_runtime_catalog(
+                connection,
+                markets=(market,),
+                changed_at=int(time.time()),
             )
-            row = await cursor.fetchone()
-            old_event_id = None if row is None else row[0]
-            if market.event_id is not None:
-                cursor = await connection.execute(
-                    "SELECT 1 FROM events WHERE id = ?",
-                    (market.event_id,),
-                )
-                if await cursor.fetchone() is None:
-                    raise ValueError(f"event {market.event_id!r} does not exist")
-            await connection.execute(_UPSERT_MARKET, _market_values(market))
-            for event_id in sorted(
-                {value for value in (old_event_id, market.event_id) if value is not None},
-                key=lambda value: value.encode("utf-8"),
-            ):
-                await _rebuild_event_market_ids(connection, event_id)
 
         await self._writer.execute(command)
 
     async def save_token(self, token: Token) -> None:
         _require_type(token, Token, "token")
-        await self._writer.execute(
-            lambda connection: connection.execute(_UPSERT_TOKEN, _token_values(token))
-        )
+
+        async def command(connection: aiosqlite.Connection) -> None:
+            await write_runtime_catalog(
+                connection,
+                tokens=(token,),
+                changed_at=int(time.time()),
+            )
+
+        await self._writer.execute(command)
 
     async def get_event(self, event_id: str) -> Event | None:
         row = await _fetch_one(self._path, "SELECT * FROM events WHERE id = ?", (event_id,))
@@ -1101,166 +1000,6 @@ class SystemEventRepository:
         )
 
 
-_UPSERT_EVENT = """
-INSERT INTO events (
-    id, slug, title, description, status, neg_risk, neg_risk_id,
-    neg_risk_type, neg_risk_complete, neg_risk_conversion_supported,
-    neg_risk_metadata_json, neg_risk_synced_at, market_ids_json,
-    sync_generation, sync_generation_complete, start_at, end_at,
-    resolved_at, source_updated_at, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-    slug = excluded.slug,
-    title = excluded.title,
-    description = excluded.description,
-    status = excluded.status,
-    neg_risk = excluded.neg_risk,
-    neg_risk_id = excluded.neg_risk_id,
-    neg_risk_type = excluded.neg_risk_type,
-    neg_risk_complete = excluded.neg_risk_complete,
-    neg_risk_conversion_supported = excluded.neg_risk_conversion_supported,
-    neg_risk_metadata_json = excluded.neg_risk_metadata_json,
-    neg_risk_synced_at = excluded.neg_risk_synced_at,
-    market_ids_json = excluded.market_ids_json,
-    sync_generation = excluded.sync_generation,
-    sync_generation_complete = excluded.sync_generation_complete,
-    start_at = excluded.start_at,
-    end_at = excluded.end_at,
-    resolved_at = excluded.resolved_at,
-    source_updated_at = excluded.source_updated_at,
-    updated_at = excluded.updated_at
-WHERE excluded.updated_at >= events.updated_at
-"""
-
-_UPSERT_MARKET = """
-INSERT INTO markets (
-    id, event_id, condition_id, slug, question, description, status,
-    active, accepting_orders, enable_orderbook, neg_risk,
-    neg_risk_outcome_position, neg_risk_member_complete, sync_generation,
-    sync_generation_complete, tick_size, minimum_order_size, end_at,
-    resolved_at, source_updated_at, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-    event_id = excluded.event_id,
-    condition_id = excluded.condition_id,
-    slug = excluded.slug,
-    question = excluded.question,
-    description = excluded.description,
-    status = excluded.status,
-    active = excluded.active,
-    accepting_orders = excluded.accepting_orders,
-    enable_orderbook = excluded.enable_orderbook,
-    neg_risk = excluded.neg_risk,
-    neg_risk_outcome_position = excluded.neg_risk_outcome_position,
-    neg_risk_member_complete = excluded.neg_risk_member_complete,
-    sync_generation = excluded.sync_generation,
-    sync_generation_complete = excluded.sync_generation_complete,
-    tick_size = excluded.tick_size,
-    minimum_order_size = excluded.minimum_order_size,
-    end_at = excluded.end_at,
-    resolved_at = excluded.resolved_at,
-    source_updated_at = excluded.source_updated_at,
-    updated_at = excluded.updated_at
-WHERE excluded.updated_at >= markets.updated_at
-"""
-
-_UPSERT_TOKEN = """
-INSERT INTO tokens (
-    id, market_id, outcome, position, fee_schedule_json, fee_updated_at,
-    sync_generation, sync_generation_complete, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-    market_id = excluded.market_id,
-    outcome = excluded.outcome,
-    position = excluded.position,
-    fee_schedule_json = excluded.fee_schedule_json,
-    fee_updated_at = excluded.fee_updated_at,
-    sync_generation = excluded.sync_generation,
-    sync_generation_complete = excluded.sync_generation_complete,
-    updated_at = excluded.updated_at
-WHERE excluded.updated_at >= tokens.updated_at
-"""
-
-def _event_values(event: Event) -> tuple[Any, ...]:
-    return (
-        event.id,
-        event.slug,
-        event.title,
-        event.description,
-        event.status.value,
-        int(event.neg_risk),
-        event.neg_risk_id,
-        event.neg_risk_type,
-        int(event.neg_risk_complete),
-        int(event.neg_risk_conversion_supported),
-        (
-            None
-            if event.neg_risk_metadata is None
-            else _encode_json_object(event.neg_risk_metadata)
-        ),
-        event.neg_risk_synced_at,
-        _encode_ids(event.market_ids, allow_empty=True),
-        event.sync_generation,
-        int(event.sync_generation_complete),
-        event.start_at,
-        event.end_at,
-        event.resolved_at,
-        event.source_updated_at,
-        event.created_at,
-        event.updated_at,
-    )
-
-
-def _market_values(market: Market) -> tuple[Any, ...]:
-    return (
-        market.id,
-        market.event_id,
-        market.condition_id,
-        market.slug,
-        market.question,
-        market.description,
-        market.status.value,
-        int(market.active),
-        int(market.accepting_orders),
-        int(market.enable_orderbook),
-        int(market.neg_risk),
-        market.neg_risk_outcome_position,
-        int(market.neg_risk_member_complete),
-        market.sync_generation,
-        int(market.sync_generation_complete),
-        None if market.tick_size is None else encode_decimal(market.tick_size),
-        (
-            None
-            if market.minimum_order_size is None
-            else encode_decimal(market.minimum_order_size)
-        ),
-        market.end_at,
-        market.resolved_at,
-        market.source_updated_at,
-        market.created_at,
-        market.updated_at,
-    )
-
-
-def _token_values(token: Token) -> tuple[Any, ...]:
-    return (
-        token.id,
-        token.market_id,
-        token.outcome,
-        token.position,
-        (
-            None
-            if token.fee_schedule is None
-            else _encode_fee_schedule(token.fee_schedule)
-        ),
-        token.fee_updated_at,
-        token.sync_generation,
-        int(token.sync_generation_complete),
-        token.created_at,
-        token.updated_at,
-    )
-
-
 def _relation_values(relation: Relation) -> tuple[Any, ...]:
     return (
         relation.id,
@@ -1472,31 +1211,6 @@ def _typed_tuple(
 def _require_type(value: Any, item_type: type[Any], field_name: str) -> None:
     if not isinstance(value, item_type):
         raise ValueError(f"{field_name} must be a {item_type.__name__}")
-
-
-async def _rebuild_event_market_ids(
-    connection: aiosqlite.Connection,
-    event_id: str,
-) -> None:
-    cursor = await connection.execute(
-        "SELECT 1 FROM events WHERE id = ?",
-        (event_id,),
-    )
-    if await cursor.fetchone() is None:
-        raise ValueError(f"event {event_id!r} does not exist")
-    cursor = await connection.execute(
-        """
-        SELECT id FROM markets
-        WHERE event_id = ?
-        ORDER BY CAST(id AS BLOB)
-        """,
-        (event_id,),
-    )
-    actual = tuple(row[0] for row in await cursor.fetchall())
-    await connection.execute(
-        "UPDATE events SET market_ids_json = ? WHERE id = ?",
-        (_encode_ids(actual, allow_empty=True), event_id),
-    )
 
 
 async def _fetch_one(

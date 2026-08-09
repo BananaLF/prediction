@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from enum import StrEnum
 from pathlib import Path
 import re
 import sqlite3
@@ -10,7 +11,14 @@ import sqlite3
 from predmarket.domain.decimal import decode_decimal, encode_decimal
 from predmarket.domain.fees import FeeSchedule
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+TARGET_SCHEMA_VERSION = 4
+
+
+class GenerationStatus(StrEnum):
+    STAGING = "STAGING"
+    COMMITTED = "COMMITTED"
+    ABORTED = "ABORTED"
 
 SCHEMA_V1 = """
 CREATE TABLE events (
@@ -567,6 +575,378 @@ def _build_schema_v3() -> str:
 SCHEMA_V3 = _build_schema_v3()
 
 
+_SCHEMA_V4_CATALOG = """
+CREATE TABLE catalog_generations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sync_generation TEXT NOT NULL UNIQUE CHECK (length(sync_generation) > 0),
+    input_digest TEXT NOT NULL CHECK (length(input_digest) > 0),
+    base_generation_id INTEGER REFERENCES catalog_generations(id),
+    base_runtime_revision INTEGER NOT NULL CHECK (base_runtime_revision >= 0),
+    rebased_runtime_revision INTEGER
+        CHECK (rebased_runtime_revision IS NULL OR rebased_runtime_revision >= 0),
+    planned_event_count INTEGER NOT NULL DEFAULT 0 CHECK (planned_event_count >= 0),
+    planned_market_count INTEGER NOT NULL DEFAULT 0 CHECK (planned_market_count >= 0),
+    planned_token_count INTEGER NOT NULL DEFAULT 0 CHECK (planned_token_count >= 0),
+    planned_event_digest TEXT,
+    planned_market_digest TEXT,
+    planned_token_digest TEXT,
+    written_event_count INTEGER NOT NULL DEFAULT 0 CHECK (written_event_count >= 0),
+    written_market_count INTEGER NOT NULL DEFAULT 0 CHECK (written_market_count >= 0),
+    written_token_count INTEGER NOT NULL DEFAULT 0 CHECK (written_token_count >= 0),
+    written_event_digest TEXT,
+    written_market_digest TEXT,
+    written_token_digest TEXT,
+    event_cursor TEXT,
+    market_cursor TEXT,
+    token_cursor TEXT,
+    candidate_event_count INTEGER CHECK (candidate_event_count IS NULL OR candidate_event_count >= 0),
+    candidate_market_count INTEGER CHECK (candidate_market_count IS NULL OR candidate_market_count >= 0),
+    candidate_token_count INTEGER CHECK (candidate_token_count IS NULL OR candidate_token_count >= 0),
+    candidate_snapshot_digest TEXT,
+    status TEXT NOT NULL CHECK (status IN ('STAGING', 'COMMITTED', 'ABORTED')),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    validated_at INTEGER CHECK (validated_at IS NULL OR validated_at >= created_at),
+    activated_at INTEGER CHECK (activated_at IS NULL OR activated_at >= created_at),
+    aborted_at INTEGER CHECK (aborted_at IS NULL OR aborted_at >= created_at),
+    failure_reason TEXT,
+    recovery_json TEXT CHECK (recovery_json IS NULL OR json_valid(recovery_json))
+);
+
+CREATE UNIQUE INDEX catalog_generations_one_staging_idx
+    ON catalog_generations((1)) WHERE status = 'STAGING';
+CREATE INDEX catalog_generations_status_id_idx ON catalog_generations(status, id);
+
+CREATE TABLE catalog_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    active_generation_id INTEGER NOT NULL REFERENCES catalog_generations(id),
+    runtime_revision INTEGER NOT NULL DEFAULT 0 CHECK (runtime_revision >= 0),
+    cleanup_generation_id INTEGER REFERENCES catalog_generations(id),
+    cleanup_entity_type TEXT
+        CHECK (cleanup_entity_type IS NULL OR cleanup_entity_type IN ('EVENT', 'MARKET', 'TOKEN')),
+    cleanup_entity_id TEXT,
+    last_checkpoint_at INTEGER CHECK (last_checkpoint_at IS NULL OR last_checkpoint_at >= 0),
+    CHECK (
+        (cleanup_entity_type IS NULL AND cleanup_entity_id IS NULL)
+        OR cleanup_entity_type IS NOT NULL
+    )
+);
+
+CREATE TABLE catalog_event_ids (
+    id TEXT PRIMARY KEY CHECK (length(id) > 0),
+    created_at INTEGER NOT NULL DEFAULT 0 CHECK (created_at >= 0)
+);
+
+CREATE TABLE catalog_market_ids (
+    id TEXT PRIMARY KEY CHECK (length(id) > 0),
+    event_id TEXT REFERENCES catalog_event_ids(id),
+    created_at INTEGER NOT NULL DEFAULT 0 CHECK (created_at >= 0)
+);
+CREATE INDEX catalog_market_ids_event_id_idx ON catalog_market_ids(event_id);
+
+CREATE TABLE catalog_token_ids (
+    id TEXT PRIMARY KEY CHECK (length(id) > 0),
+    market_id TEXT NOT NULL REFERENCES catalog_market_ids(id),
+    created_at INTEGER NOT NULL DEFAULT 0 CHECK (created_at >= 0),
+    UNIQUE (market_id, id)
+);
+CREATE INDEX catalog_token_ids_market_id_idx ON catalog_token_ids(market_id);
+
+CREATE TABLE event_versions (
+    entity_id TEXT NOT NULL REFERENCES catalog_event_ids(id),
+    generation_id INTEGER NOT NULL REFERENCES catalog_generations(id),
+    slug TEXT,
+    title TEXT NOT NULL CHECK (length(trim(title)) > 0),
+    description TEXT,
+    status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'CLOSED', 'RESOLVED', 'ARCHIVED')),
+    neg_risk INTEGER NOT NULL CHECK (neg_risk IN (0, 1)),
+    neg_risk_id TEXT,
+    neg_risk_type TEXT,
+    neg_risk_complete INTEGER NOT NULL CHECK (neg_risk_complete IN (0, 1)),
+    neg_risk_conversion_supported INTEGER NOT NULL
+        CHECK (neg_risk_conversion_supported IN (0, 1)),
+    neg_risk_metadata_json TEXT
+        CHECK (
+            neg_risk_metadata_json IS NULL OR (
+                json_valid(neg_risk_metadata_json)
+                AND json_type(neg_risk_metadata_json) = 'object'
+            )
+        ),
+    neg_risk_synced_at INTEGER CHECK (neg_risk_synced_at IS NULL OR neg_risk_synced_at >= 0),
+    market_ids_json TEXT NOT NULL
+        CHECK (json_valid(market_ids_json) AND json_type(market_ids_json) = 'array'),
+    start_at INTEGER CHECK (start_at IS NULL OR start_at >= 0),
+    end_at INTEGER CHECK (end_at IS NULL OR end_at >= 0),
+    resolved_at INTEGER CHECK (resolved_at IS NULL OR resolved_at >= 0),
+    source_updated_at INTEGER CHECK (source_updated_at IS NULL OR source_updated_at >= 0),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+    PRIMARY KEY (entity_id, generation_id)
+);
+CREATE INDEX event_versions_entity_generation_idx
+    ON event_versions(entity_id, generation_id DESC);
+CREATE INDEX event_versions_generation_entity_idx
+    ON event_versions(generation_id, entity_id);
+CREATE INDEX event_versions_slug_idx ON event_versions(slug, generation_id DESC);
+
+CREATE TABLE market_versions (
+    entity_id TEXT NOT NULL REFERENCES catalog_market_ids(id),
+    generation_id INTEGER NOT NULL REFERENCES catalog_generations(id),
+    condition_id TEXT NOT NULL CHECK (length(condition_id) > 0),
+    slug TEXT,
+    question TEXT NOT NULL CHECK (length(trim(question)) > 0),
+    description TEXT,
+    status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'CLOSED', 'RESOLVED', 'ARCHIVED')),
+    active INTEGER NOT NULL CHECK (active IN (0, 1)),
+    accepting_orders INTEGER NOT NULL CHECK (accepting_orders IN (0, 1)),
+    enable_orderbook INTEGER NOT NULL CHECK (enable_orderbook IN (0, 1)),
+    neg_risk INTEGER NOT NULL CHECK (neg_risk IN (0, 1)),
+    neg_risk_outcome_position INTEGER
+        CHECK (neg_risk_outcome_position IS NULL OR neg_risk_outcome_position >= 0),
+    neg_risk_member_complete INTEGER NOT NULL
+        CHECK (neg_risk_member_complete IN (0, 1)),
+    tick_size TEXT
+        CHECK (
+            tick_size IS NULL OR (
+                typeof(tick_size) = 'text'
+                AND length(tick_size) > 0
+                AND substr(tick_size, 1, 1) GLOB '[0-9]'
+                AND tick_size NOT GLOB '*[^0-9.]*'
+                AND tick_size NOT GLOB '*.*.*'
+                AND tick_size NOT GLOB '0[0-9]*'
+                AND substr(tick_size, -1, 1) <> '.'
+                AND NOT (tick_size LIKE '%.%' AND substr(tick_size, -1, 1) = '0')
+                AND (tick_size = '1' OR tick_size LIKE '0.%')
+            )
+        ),
+    minimum_order_size TEXT
+        CHECK (
+            minimum_order_size IS NULL OR (
+                typeof(minimum_order_size) = 'text'
+                AND length(minimum_order_size) > 0
+                AND substr(minimum_order_size, 1, 1) GLOB '[0-9]'
+                AND minimum_order_size NOT GLOB '*[^0-9.]*'
+                AND minimum_order_size NOT GLOB '*.*.*'
+                AND minimum_order_size NOT GLOB '0[0-9]*'
+                AND substr(minimum_order_size, -1, 1) <> '.'
+                AND NOT (
+                    minimum_order_size LIKE '%.%'
+                    AND substr(minimum_order_size, -1, 1) = '0'
+                )
+                AND minimum_order_size <> '0'
+            )
+        ),
+    end_at INTEGER CHECK (end_at IS NULL OR end_at >= 0),
+    resolved_at INTEGER CHECK (resolved_at IS NULL OR resolved_at >= 0),
+    source_updated_at INTEGER CHECK (source_updated_at IS NULL OR source_updated_at >= 0),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+    PRIMARY KEY (entity_id, generation_id)
+);
+CREATE INDEX market_versions_entity_generation_idx
+    ON market_versions(entity_id, generation_id DESC);
+CREATE INDEX market_versions_generation_entity_idx
+    ON market_versions(generation_id, entity_id);
+CREATE INDEX market_versions_condition_idx
+    ON market_versions(condition_id, generation_id DESC);
+CREATE INDEX market_versions_slug_idx ON market_versions(slug, generation_id DESC);
+
+CREATE TABLE token_versions (
+    entity_id TEXT NOT NULL REFERENCES catalog_token_ids(id),
+    generation_id INTEGER NOT NULL REFERENCES catalog_generations(id),
+    outcome TEXT NOT NULL CHECK (length(outcome) > 0),
+    position INTEGER NOT NULL CHECK (position >= 0),
+    fee_schedule_json TEXT
+        CHECK (
+            fee_schedule_json IS NULL OR (
+                json_valid(fee_schedule_json)
+                AND json_type(fee_schedule_json) = 'object'
+            )
+        ),
+    fee_updated_at INTEGER CHECK (fee_updated_at IS NULL OR fee_updated_at >= 0),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+    PRIMARY KEY (entity_id, generation_id)
+);
+CREATE INDEX token_versions_entity_generation_idx
+    ON token_versions(entity_id, generation_id DESC);
+CREATE INDEX token_versions_generation_entity_idx
+    ON token_versions(generation_id, entity_id);
+CREATE INDEX token_versions_market_position_idx
+    ON token_versions(position, generation_id DESC);
+CREATE INDEX token_versions_outcome_idx ON token_versions(outcome, generation_id DESC);
+
+CREATE TABLE catalog_runtime_changes (
+    runtime_revision INTEGER NOT NULL CHECK (runtime_revision >= 1),
+    entity_type TEXT NOT NULL CHECK (entity_type IN ('EVENT', 'MARKET', 'TOKEN')),
+    entity_id TEXT NOT NULL CHECK (length(entity_id) > 0),
+    generation_id INTEGER NOT NULL REFERENCES catalog_generations(id),
+    updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+    changed_at INTEGER NOT NULL CHECK (changed_at >= 0),
+    PRIMARY KEY (runtime_revision, entity_type, entity_id)
+);
+CREATE INDEX catalog_runtime_changes_entity_idx
+    ON catalog_runtime_changes(entity_type, entity_id, runtime_revision DESC);
+
+CREATE VIEW events AS
+SELECT
+    identities.id,
+    versions.slug,
+    versions.title,
+    versions.description,
+    versions.status,
+    versions.neg_risk,
+    versions.neg_risk_id,
+    versions.neg_risk_type,
+    versions.neg_risk_complete,
+    versions.neg_risk_conversion_supported,
+    versions.neg_risk_metadata_json,
+    versions.neg_risk_synced_at,
+    versions.market_ids_json,
+    active_generation.sync_generation AS sync_generation,
+    1 AS sync_generation_complete,
+    versions.start_at,
+    versions.end_at,
+    versions.resolved_at,
+    versions.source_updated_at,
+    versions.created_at,
+    versions.updated_at
+FROM catalog_event_ids AS identities
+JOIN event_versions AS versions ON versions.entity_id = identities.id
+JOIN catalog_state AS state ON state.id = 1
+JOIN catalog_generations AS active_generation
+    ON active_generation.id = state.active_generation_id
+   AND active_generation.status = 'COMMITTED'
+WHERE versions.generation_id = (
+    SELECT MAX(candidate.generation_id)
+    FROM event_versions AS candidate
+    JOIN catalog_generations AS candidate_generation
+        ON candidate_generation.id = candidate.generation_id
+       AND candidate_generation.status = 'COMMITTED'
+    WHERE candidate.entity_id = identities.id
+      AND candidate.generation_id <= state.active_generation_id
+);
+
+CREATE VIEW markets AS
+SELECT
+    identities.id,
+    identities.event_id,
+    versions.condition_id,
+    versions.slug,
+    versions.question,
+    versions.description,
+    versions.status,
+    versions.active,
+    versions.accepting_orders,
+    versions.enable_orderbook,
+    versions.neg_risk,
+    versions.neg_risk_outcome_position,
+    versions.neg_risk_member_complete,
+    active_generation.sync_generation AS sync_generation,
+    1 AS sync_generation_complete,
+    versions.tick_size,
+    versions.minimum_order_size,
+    versions.end_at,
+    versions.resolved_at,
+    versions.source_updated_at,
+    versions.created_at,
+    versions.updated_at
+FROM catalog_market_ids AS identities
+JOIN market_versions AS versions ON versions.entity_id = identities.id
+JOIN catalog_state AS state ON state.id = 1
+JOIN catalog_generations AS active_generation
+    ON active_generation.id = state.active_generation_id
+   AND active_generation.status = 'COMMITTED'
+WHERE versions.generation_id = (
+    SELECT MAX(candidate.generation_id)
+    FROM market_versions AS candidate
+    JOIN catalog_generations AS candidate_generation
+        ON candidate_generation.id = candidate.generation_id
+       AND candidate_generation.status = 'COMMITTED'
+    WHERE candidate.entity_id = identities.id
+      AND candidate.generation_id <= state.active_generation_id
+);
+
+CREATE VIEW tokens AS
+SELECT
+    identities.id,
+    identities.market_id,
+    versions.outcome,
+    versions.position,
+    versions.fee_schedule_json,
+    versions.fee_updated_at,
+    active_generation.sync_generation AS sync_generation,
+    1 AS sync_generation_complete,
+    versions.created_at,
+    versions.updated_at
+FROM catalog_token_ids AS identities
+JOIN token_versions AS versions ON versions.entity_id = identities.id
+JOIN catalog_state AS state ON state.id = 1
+JOIN catalog_generations AS active_generation
+    ON active_generation.id = state.active_generation_id
+   AND active_generation.status = 'COMMITTED'
+WHERE versions.generation_id = (
+    SELECT MAX(candidate.generation_id)
+    FROM token_versions AS candidate
+    JOIN catalog_generations AS candidate_generation
+        ON candidate_generation.id = candidate.generation_id
+       AND candidate_generation.status = 'COMMITTED'
+    WHERE candidate.entity_id = identities.id
+      AND candidate.generation_id <= state.active_generation_id
+);
+"""
+
+
+def _build_schema_v4() -> str:
+    """Build v4 around catalog identity/version tables and v3 downstream tables."""
+
+    downstream_tables: list[str] = []
+    for table in _SCHEMA_TABLES[3:]:
+        table_match = re.search(
+            rf"(?ms)^CREATE TABLE {re.escape(table)} \(.*?^\);",
+            SCHEMA_V3,
+        )
+        if table_match is None:
+            raise RuntimeError(f"schema table {table!r} is missing")
+        table_sql = table_match.group(0)
+        table_sql = table_sql.replace(
+            "REFERENCES markets(id)",
+            "REFERENCES catalog_market_ids(id)",
+        ).replace(
+            "REFERENCES tokens(market_id, id)",
+            "REFERENCES catalog_token_ids(market_id, id)",
+        )
+        downstream_tables.append(table_sql)
+
+    downstream_indexes: list[str] = []
+    for index_match in re.finditer(
+        r"(?ms)^CREATE (?:UNIQUE )?INDEX .*?;",
+        SCHEMA_V3,
+    ):
+        index_sql = index_match.group(0)
+        indexed_table = re.search(r"\bON\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", index_sql)
+        if indexed_table is None:
+            raise RuntimeError("schema index has no target table")
+        if indexed_table.group(1) in {"events", "markets", "tokens"}:
+            continue
+        downstream_indexes.append(index_sql)
+
+    return "\n\n".join(
+        [
+            _SCHEMA_V4_CATALOG,
+            *downstream_tables,
+            *downstream_indexes,
+            """
+CREATE UNIQUE INDEX catalog_reconciliation_ready_change_id_idx
+    ON system_events(json_extract(details_json, '$.change_id'))
+    WHERE event_type = 'CATALOG_RECONCILIATION_READY';
+""".strip(),
+        ]
+    )
+
+
+SCHEMA_V4 = _build_schema_v4()
+
+
 def _quote_identifier(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
@@ -695,7 +1075,7 @@ def _migrate_v2_to_v3(database_path: Path) -> None:
             assert isinstance(index_sql, str)
             connection.execute(index_sql)
 
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 3")
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -705,19 +1085,12 @@ def _migrate_v2_to_v3(database_path: Path) -> None:
         connection.close()
 
 
-def initialize_database(path: Path) -> None:
-    """Create schema v3 or migrate an existing schema v2 database to v3."""
+def create_v4_database(path: Path) -> None:
+    """Create a new, empty schema-v4 database for tests and migration."""
+
     database_path = Path(path)
     if database_path.exists() and database_path.stat().st_size > 0:
-        version = _read_existing_version(database_path)
-        if version == SCHEMA_VERSION:
-            return
-        if version == 2:
-            _migrate_v2_to_v3(database_path)
-            return
-        raise ValueError(
-            f"unsupported database schema version {version}; expected {SCHEMA_VERSION}"
-        )
+        raise ValueError(f"refusing to overwrite nonempty database {database_path}")
 
     database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path)
@@ -726,14 +1099,50 @@ def initialize_database(path: Path) -> None:
         connection.execute("PRAGMA journal_mode = WAL")
         try:
             connection.execute("BEGIN IMMEDIATE")
-            _execute_sql_script(connection, SCHEMA_V3)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            _execute_sql_script(connection, SCHEMA_V4)
+            bootstrap = connection.execute(
+                """
+                INSERT INTO catalog_generations (
+                    sync_generation, input_digest, base_generation_id,
+                    base_runtime_revision, rebased_runtime_revision,
+                    status, created_at, validated_at, activated_at
+                ) VALUES ('bootstrap-v4', 'bootstrap-v4', NULL, 0, 0,
+                          'COMMITTED', 0, 0, 0)
+                """
+            )
+            assert bootstrap.lastrowid is not None
+            connection.execute(
+                """
+                INSERT INTO catalog_state (id, active_generation_id, runtime_revision)
+                VALUES (1, ?, 0)
+                """,
+                (bootstrap.lastrowid,),
+            )
+            connection.execute(f"PRAGMA user_version = {TARGET_SCHEMA_VERSION}")
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
     finally:
         connection.close()
+
+
+def initialize_database(path: Path) -> None:
+    """Create or accept schema v4; older schemas require explicit migration."""
+    database_path = Path(path)
+    if database_path.exists() and database_path.stat().st_size > 0:
+        version = _read_existing_version(database_path)
+        if version == SCHEMA_VERSION:
+            return
+        if version in {1, 2, 3}:
+            raise ValueError(
+                f"database schema version {version} requires explicit migration to v4; "
+                "run predmarket migrate --to 4 --database PATH"
+            )
+        raise ValueError(
+            f"unsupported database schema version {version}; expected {SCHEMA_VERSION}"
+        )
+    create_v4_database(database_path)
 
 
 def _read_existing_version(path: Path) -> int:

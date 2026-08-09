@@ -7,7 +7,13 @@ import pytest
 
 import predmarket.persistence.schema as schema_module
 from predmarket.domain.signal import DecisionReason
-from predmarket.persistence.schema import SCHEMA_V2, initialize_database
+from predmarket.persistence.schema import (
+    SCHEMA_V2,
+    SCHEMA_V3,
+    TARGET_SCHEMA_VERSION,
+    create_v4_database,
+    initialize_database,
+)
 
 
 PROJECT_TABLES = {
@@ -23,11 +29,91 @@ PROJECT_TABLES = {
     "tokens",
 }
 
+V4_CATALOG_TABLES = {
+    "catalog_event_ids",
+    "catalog_generations",
+    "catalog_market_ids",
+    "catalog_runtime_changes",
+    "catalog_state",
+    "catalog_token_ids",
+    "event_versions",
+    "market_versions",
+    "token_versions",
+}
+
 
 def _connect(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
+
+
+def test_create_v4_database_creates_generation_schema(tmp_path: Path) -> None:
+    database_path = tmp_path / "market.db"
+
+    create_v4_database(database_path)
+
+    with _connect(database_path) as connection:
+        objects = dict(
+            connection.execute(
+                "SELECT name, type FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"
+            )
+        )
+        assert V4_CATALOG_TABLES <= objects.keys()
+        assert {objects[name] for name in V4_CATALOG_TABLES} == {"table"}
+        assert objects["events"] == "view"
+        assert objects["markets"] == "view"
+        assert objects["tokens"] == "view"
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            TARGET_SCHEMA_VERSION,
+        )
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+def test_v4_catalog_views_preserve_v3_columns_and_downstream_identity_fks(
+    tmp_path: Path,
+) -> None:
+    v3_path = tmp_path / "v3.db"
+    v4_path = tmp_path / "v4.db"
+    with sqlite3.connect(v3_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(
+            "BEGIN IMMEDIATE;\n"
+            + SCHEMA_V3
+            + "\nPRAGMA user_version = 3;\nCOMMIT;\n"
+        )
+    create_v4_database(v4_path)
+
+    with _connect(v3_path) as v3_connection, _connect(v4_path) as v4_connection:
+        for catalog_name in ("events", "markets", "tokens"):
+            v3_columns = [
+                row[1]
+                for row in v3_connection.execute(f"PRAGMA table_info({catalog_name})")
+            ]
+            v4_columns = [
+                row[1]
+                for row in v4_connection.execute(f"PRAGMA table_info({catalog_name})")
+            ]
+            assert v4_columns == v3_columns
+
+        relation_targets = {
+            row[2]
+            for row in v4_connection.execute("PRAGMA foreign_key_list(relations)")
+        }
+        signal_leg_targets = {
+            row[2]
+            for row in v4_connection.execute("PRAGMA foreign_key_list(signal_legs)")
+        }
+        snapshot_targets = {
+            row[2]
+            for row in v4_connection.execute(
+                "PRAGMA foreign_key_list(orderbook_snapshots)"
+            )
+        }
+        assert "catalog_market_ids" in relation_targets
+        assert {"catalog_market_ids", "catalog_token_ids"} <= signal_leg_targets
+        assert {"catalog_market_ids", "catalog_token_ids"} <= snapshot_targets
 
 
 def _create_schema_v2_database(path: Path) -> None:
@@ -41,6 +127,59 @@ def _create_schema_v2_database(path: Path) -> None:
 
 
 def _insert_catalog(connection: sqlite3.Connection) -> None:
+    is_v4 = connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'catalog_state'"
+    ).fetchone()
+    if is_v4:
+        connection.execute(
+            "INSERT INTO catalog_event_ids (id, created_at) VALUES ('event-1', 1)"
+        )
+        connection.execute(
+            """
+            INSERT INTO event_versions (
+                entity_id, generation_id, title, status, neg_risk,
+                neg_risk_complete, neg_risk_conversion_supported,
+                market_ids_json, created_at, updated_at
+            ) VALUES ('event-1', 1, 'Event', 'ACTIVE', 0, 0, 0,
+                      '["market-1","market-2"]', 1, 1)
+            """
+        )
+        for market_id, condition_id in (
+            ("market-1", "condition-1"),
+            ("market-2", "condition-2"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO catalog_market_ids (id, event_id, created_at)
+                VALUES (?, 'event-1', 1)
+                """,
+                (market_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO market_versions (
+                    entity_id, generation_id, condition_id, question, status,
+                    active, accepting_orders, enable_orderbook, neg_risk,
+                    neg_risk_member_complete, created_at, updated_at
+                ) VALUES (?, 1, ?, 'Question?', 'ACTIVE', 1, 1, 1, 0, 0, 1, 1)
+                """,
+                (market_id, condition_id),
+            )
+        connection.execute(
+            """
+            INSERT INTO catalog_token_ids (id, market_id, created_at)
+            VALUES ('token-1', 'market-1', 1)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO token_versions (
+                entity_id, generation_id, outcome, position, created_at, updated_at
+            ) VALUES ('token-1', 1, 'YES', 0, 1, 1)
+            """
+        )
+        return
+
     connection.execute(
         """
         INSERT INTO events (
@@ -133,7 +272,7 @@ def _insert_revision(
     )
 
 
-def test_initialize_database_creates_exact_schema_v3_and_wal(tmp_path: Path) -> None:
+def test_initialize_database_creates_exact_schema_v4_and_wal(tmp_path: Path) -> None:
     database_path = tmp_path / "market.db"
 
     initialize_database(database_path)
@@ -148,8 +287,10 @@ def test_initialize_database_creates_exact_schema_v3_and_wal(tmp_path: Path) -> 
                 """
             )
         }
-        assert tables == PROJECT_TABLES
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert tables == (PROJECT_TABLES - {"events", "markets", "tokens"}) | V4_CATALOG_TABLES
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            TARGET_SCHEMA_VERSION,
+        )
         assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
@@ -201,14 +342,34 @@ def test_initialize_database_rejects_nonempty_unknown_schema_without_mutation(
     assert database_path.read_bytes() == original_bytes
 
 
-def test_initialize_database_accepts_an_existing_schema_v3(tmp_path: Path) -> None:
+def test_initialize_database_accepts_an_existing_schema_v4(tmp_path: Path) -> None:
     database_path = tmp_path / "market.db"
     initialize_database(database_path)
 
     initialize_database(database_path)
 
     with _connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            TARGET_SCHEMA_VERSION,
+        )
+
+
+def test_initialize_database_rejects_v3_with_explicit_upgrade_command(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            "BEGIN IMMEDIATE;\n"
+            + SCHEMA_V3
+            + "\nPRAGMA user_version = 3;\nCOMMIT;\n"
+        )
+    original_bytes = database_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"predmarket migrate --to 4"):
+        initialize_database(database_path)
+
+    assert database_path.read_bytes() == original_bytes
 
 
 def test_initialize_database_rolls_back_a_partially_failing_schema_script(
@@ -218,7 +379,7 @@ def test_initialize_database_rolls_back_a_partially_failing_schema_script(
     database_path = tmp_path / "market.db"
     monkeypatch.setattr(
         schema_module,
-        "SCHEMA_V3",
+        "SCHEMA_V4",
         """
         CREATE TABLE partial_table (id INTEGER PRIMARY KEY);
         CREATE TABLE broken_table (;
@@ -248,14 +409,17 @@ def test_schema_decimal_columns_require_canonical_plain_decimal_text(
         _insert_catalog(connection)
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
-                "UPDATE markets SET tick_size = '1E-5' WHERE id = 'market-1'"
+                "UPDATE market_versions SET tick_size = '1E-5' "
+                "WHERE entity_id = 'market-1' AND generation_id = 1"
             )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
-                "UPDATE markets SET tick_size = '0.010' WHERE id = 'market-1'"
+                "UPDATE market_versions SET tick_size = '0.010' "
+                "WHERE entity_id = 'market-1' AND generation_id = 1"
             )
         connection.execute(
-            "UPDATE markets SET tick_size = ? WHERE id = 'market-1'",
+            "UPDATE market_versions SET tick_size = ? "
+            "WHERE entity_id = 'market-1' AND generation_id = 1",
             ("0." + "0" * 499 + "1",),
         )
         assert connection.execute(
@@ -263,7 +427,7 @@ def test_schema_decimal_columns_require_canonical_plain_decimal_text(
         ).fetchone() == ("0." + "0" * 499 + "1",)
 
 
-def test_schema_v2_migration_normalizes_legacy_decimal_spellings(
+def test_initialize_database_rejects_schema_v2_without_mutating_legacy_data(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "market.db"
@@ -288,21 +452,22 @@ def test_schema_v2_migration_normalizes_legacy_decimal_spellings(
             ),
         )
 
-    initialize_database(database_path)
+    with pytest.raises(ValueError, match="schema version 2 requires explicit migration"):
+        initialize_database(database_path)
 
     with _connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
         assert connection.execute(
             "SELECT tick_size, minimum_order_size FROM markets WHERE id = 'market-1'"
-        ).fetchone() == ("0.00001", "1.23")
+        ).fetchone() == ("1E-5", "001.2300")
         assert connection.execute(
             "SELECT event_id FROM markets WHERE id = 'market-2'"
         ).fetchone() == (None,)
         assert connection.execute(
             "SELECT fee_schedule_json FROM tokens WHERE id = 'token-1'"
         ).fetchone() == (
-            '{"enabled":true,"model":"FLAT","parameters":{"rate":"0.00001"},'
-            '"source":"legacy"}',
+            '{"enabled":true,"model":"FLAT",'
+            '"parameters":{"rate":"1E-5"},"source":"legacy"}',
         )
 
 

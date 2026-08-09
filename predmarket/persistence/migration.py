@@ -5,6 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 import sqlite3
 
+from predmarket.persistence.catalog_migration import (
+    MigrationResult,
+    migrate_v3_to_v4,
+)
+
 _TARGET_VERSION = 2
 _PROJECT_TABLES = {
     "arbitrage_signals",
@@ -90,13 +95,19 @@ CREATE TABLE markets_v2 (
 
 def migrate_database(
     database_path: Path,
-    backup_path: Path,
+    backup_path: Path | None = None,
     *,
     target_version: int,
-) -> None:
-    """Migrate schema v1 to v2 after creating an immutable backup copy."""
+) -> MigrationResult | None:
+    """Route legacy v1→v2 or side-by-side v3→v4 migration."""
+    if target_version == 4:
+        if backup_path is not None:
+            raise ValueError("backup must not be provided for v3 to v4 migration")
+        return migrate_v3_to_v4(database_path)
     if target_version != _TARGET_VERSION:
-        raise ValueError(f"unsupported migration target {target_version}; expected 2")
+        raise ValueError("unsupported migration target; expected 2 or 4")
+    if backup_path is None:
+        raise ValueError("backup is required for v1 to v2 migration")
 
     source_path = Path(database_path)
     destination_path = Path(backup_path)
@@ -138,6 +149,7 @@ def migrate_database(
         _check_sqlite_integrity(connection)
     finally:
         connection.close()
+    return None
 
 
 def _validate_v1(path: Path) -> None:

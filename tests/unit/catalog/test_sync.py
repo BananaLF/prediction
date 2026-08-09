@@ -15,9 +15,9 @@ from predmarket.catalog.changes import MarketChange, MarketChangeType
 from predmarket.catalog.sync import (
     SyncMarketTask,
     _changes_for_delivery,
-    _log_orphan_warnings,
 )
 from predmarket.domain.market import Event, Market, MarketStatus, Token
+from predmarket.persistence.catalog_generations import CatalogSyncAborted
 from predmarket.persistence.repositories import (
     CatalogRepository,
     CatalogSnapshot,
@@ -222,24 +222,6 @@ def test_changes_for_delivery_coalesces_critical_catalog_wakeups() -> None:
     assert coalesced == 11
 
 
-def test_orphan_warning_logs_are_sampled(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    warnings = tuple(f"market market-{index} parent event missing" for index in range(12))
-
-    with caplog.at_level(logging.WARNING, logger="predmarket.catalog.sync"):
-        _log_orphan_warnings(warnings)
-
-    records = [
-        record
-        for record in caplog.records
-        if record.message.startswith("sync_market_parent_missing ")
-    ]
-    assert len(records) == 11
-    assert "market market-0" in records[0].message
-    assert records[-1].message.endswith("total=12 omitted=2")
-
-
 class _FailingCatalog:
     def __init__(self, delegate: CatalogRepository) -> None:
         self._delegate = delegate
@@ -267,6 +249,28 @@ class _RecordingCatalog:
             }
         )
         await self._delegate.save_catalog(**values)
+
+
+class _WalAbortingCatalog:
+    def __init__(self, delegate: CatalogRepository) -> None:
+        self._delegate = delegate
+        self._aborts_remaining = 1
+
+    async def load_catalog(self) -> CatalogSnapshot:
+        return await self._delegate.load_catalog()
+
+    async def save_catalog(self, **values: object) -> None:
+        await self._delegate.save_catalog(**values)  # type: ignore[arg-type]
+
+    async def save_complete_catalog(self, **values: object) -> None:
+        if self._aborts_remaining:
+            self._aborts_remaining -= 1
+            raise CatalogSyncAborted(
+                generation=str(values["generation"]),
+                reason="catalog staging reached the WAL abort waterline",
+                wal_peak_bytes=96 * 1024 * 1024,
+            )
+        await self._delegate.save_complete_catalog(**values)  # type: ignore[arg-type]
 
 
 class _MarkerFailingSystemEvents:
@@ -495,6 +499,54 @@ async def test_complete_generation_drains_gateway_and_commits_before_publish(
     assert all(token.sync_generation_complete for token in stored.tokens)
 
 
+async def test_wal_abort_retains_active_catalog_and_allows_next_retry(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    await _seed(catalog, ("market-old",))
+    queue = _RecordingQueue(catalog)
+    generations = iter(("sync-aborted", "sync-retry"))
+    task = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-new",)),),
+            markets=(_snapshot("market-new"),),
+        ),
+        catalog=_WalAbortingCatalog(catalog),
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 100,
+        generation_factory=lambda: next(generations),
+    )
+
+    aborted = await task.run_once()
+
+    assert aborted.complete is False
+    assert aborted.sync_generation == "sync-aborted"
+    assert aborted.markets_persisted == 0
+    assert aborted.changes_published == aborted.changes_dropped == 0
+    assert await catalog.get_market("market-new") is None
+    retained = await catalog.get_market("market-old")
+    assert retained is not None
+    assert retained.active is True
+    assert queue.items == []
+    rows = await system_events.read_after(0)
+    assert rows[-1]["event_type"] == "SYNC_GENERATION_INCOMPLETE"
+    assert rows[-1]["details"]["sync_generation"] == "sync-aborted"
+    assert rows[-1]["details"]["wal_peak_bytes"] == 96 * 1024 * 1024
+    assert not any(
+        row["event_type"] == "CATALOG_RECONCILIATION_READY" for row in rows
+    )
+
+    retried = await task.run_once()
+
+    assert retried.complete is True
+    assert retried.sync_generation == "sync-retry"
+    assert await catalog.get_market("market-new") is not None
+    assert [change.change_type for change in queue.items] == [
+        MarketChangeType.CATALOG_RECONCILED
+    ]
+
+
 async def test_complete_generation_publishes_one_reconciliation_control(
     catalog_runtime,
 ) -> None:
@@ -585,7 +637,7 @@ async def test_pending_reconciliation_is_republished_before_remote_fetch(
     assert await system_events.list_pending_catalog_reconciliations() == ()
 
 
-async def test_complete_generation_accepts_orphan_markets_and_empty_events(
+async def test_complete_generation_accepts_parentless_market(
     catalog_runtime,
 ) -> None:
     catalog, system_events = catalog_runtime
@@ -610,16 +662,15 @@ async def test_complete_generation_accepts_orphan_markets_and_empty_events(
     result = await task.run_once()
 
     assert result.complete is True
+    assert result.error is None
+    assert result.markets_persisted == 1
     stored_event = await catalog.get_event("event-1")
     stored_market = await catalog.get_market("market-orphan")
     assert stored_event is not None
     assert stored_event.market_ids == ()
     assert stored_market is not None
     assert stored_market.event_id is None
-    assert [
-        (change.change_type, change.event_id, change.market_id)
-        for change in queue.items
-    ] == [(MarketChangeType.CATALOG_RECONCILED, None, None)]
+    assert len(queue.items) == 1
 
 
 async def test_prepare_complete_missing_events_is_linear() -> None:
@@ -693,8 +744,8 @@ def test_prepare_complete_only_selects_semantic_changes_for_upsert() -> None:
     assert tuple(market.id for market in changed.market_upserts) == ("market-1",)
 
 
-async def test_complete_generation_detaches_market_when_parent_event_is_missing(
-    catalog_runtime, caplog: pytest.LogCaptureFixture,
+async def test_complete_generation_rejects_market_when_parent_event_is_missing(
+    catalog_runtime,
 ) -> None:
     catalog, system_events = catalog_runtime
     snapshot = _snapshot("market-missing-parent")
@@ -711,19 +762,17 @@ async def test_complete_generation_detaches_market_when_parent_event_is_missing(
         generation_factory=lambda: "sync-missing-parent",
     )
 
-    with caplog.at_level(logging.WARNING, logger="predmarket.catalog.sync"):
-        result = await task.run_once()
+    result = await task.run_once()
 
-    assert result.complete is True
+    assert result.complete is False
+    assert result.error is not None
+    assert "event-not-returned" in result.error
     stored_market = await catalog.get_market("market-missing-parent")
-    assert stored_market is not None
-    assert stored_market.event_id is None
-    assert stored_market.sync_generation_complete is True
-    assert any("event-not-returned" in warning for warning in result.warnings)
-    assert "sync_market_parent_missing" in caplog.text
+    assert stored_market is None
+    assert result.warnings == ()
 
 
-async def test_incomplete_generation_persists_orphan_market_snapshot(
+async def test_incomplete_generation_discards_parentless_market_snapshot(
     catalog_runtime,
 ) -> None:
     catalog, system_events = catalog_runtime
@@ -748,10 +797,8 @@ async def test_incomplete_generation_persists_orphan_market_snapshot(
 
     assert result.complete is False
     stored_market = await catalog.get_market("market-orphan")
-    assert stored_market is not None
-    assert stored_market.event_id is None
-    assert stored_market.sync_generation == "sync-orphan-incomplete"
-    assert stored_market.sync_generation_complete is False
+    assert stored_market is None
+    assert result.markets_persisted == 0
 
 
 async def test_complete_generation_deactivates_only_missing_market(

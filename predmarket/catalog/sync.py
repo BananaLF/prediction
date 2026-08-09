@@ -18,6 +18,7 @@ from predmarket.catalog.changes import (
     MarketChangeType,
 )
 from predmarket.domain.market import Event, Market, MarketStatus, Token
+from predmarket.persistence.catalog_generations import CatalogSyncAborted
 from predmarket.persistence.repositories import (
     CatalogRepository,
     CatalogSnapshot,
@@ -166,7 +167,6 @@ class SyncMarketTask:
         events: list[Event] = []
         snapshots: list[MarketSnapshot] = []
         market_warnings: tuple[MarketMappingWarning, ...] = ()
-        orphan_warnings: tuple[str, ...] = ()
 
         stage_started_at = time.monotonic()
         _LOGGER.info(
@@ -281,11 +281,6 @@ class SyncMarketTask:
             if refresh_error is not None:
                 errors.append(refresh_error)
         if not errors:
-            snapshots, orphan_warnings = _detach_missing_parent_events(
-                events=events,
-                snapshots=snapshots,
-            )
-            _log_orphan_warnings(orphan_warnings)
             validation_error = _validate_complete_source(
                 events=events,
                 snapshots=snapshots,
@@ -378,10 +373,7 @@ class SyncMarketTask:
                 skipped_market_ids=tuple(
                     warning.market_id for warning in market_warnings
                 ),
-                warnings=(
-                    tuple(warning.error for warning in market_warnings)
-                    + orphan_warnings
-                ),
+                warnings=tuple(warning.error for warning in market_warnings),
             )
 
         stage_started_at = time.monotonic()
@@ -433,21 +425,62 @@ class SyncMarketTask:
             generation,
         )
         complete_save = getattr(self._catalog, "save_complete_catalog", None)
-        if callable(complete_save):
-            await complete_save(
-                generation=generation,
-                updated_at=occurred_at,
-                events=prepared.event_upserts,
-                markets=prepared.market_upserts,
-                tokens=prepared.token_upserts,
-                reconciliation_change=reconciliation,
-                reconciliation_market_ids=watchable_market_ids,
+        try:
+            if callable(complete_save):
+                await complete_save(
+                    generation=generation,
+                    updated_at=occurred_at,
+                    events=prepared.event_upserts,
+                    markets=prepared.market_upserts,
+                    tokens=prepared.token_upserts,
+                    reconciliation_change=reconciliation,
+                    reconciliation_market_ids=watchable_market_ids,
+                )
+            else:
+                await self._catalog.save_catalog(
+                    events=prepared.events,
+                    markets=prepared.markets,
+                    tokens=prepared.tokens,
+                )
+        except CatalogSyncAborted as error:
+            await self._system_events.append(
+                component="SYNC",
+                severity="ERROR",
+                event_type="SYNC_GENERATION_INCOMPLETE",
+                message="Catalog sync generation was aborted for WAL safety",
+                occurred_at=occurred_at,
+                details={
+                    "sync_generation": error.generation,
+                    "error": error.reason,
+                    "wal_peak_bytes": error.wal_peak_bytes,
+                    "events_seen": len(events),
+                    "markets_seen": len(snapshots),
+                    "tokens_seen": sum(len(item.tokens) for item in snapshots),
+                },
             )
-        else:
-            await self._catalog.save_catalog(
-                events=prepared.events,
-                markets=prepared.markets,
-                tokens=prepared.tokens,
+            _LOGGER.error(
+                "sync_aborted sync_generation=%s wal_peak_bytes=%d "
+                "elapsed_ms=%d error=%s",
+                error.generation,
+                error.wal_peak_bytes,
+                int((time.monotonic() - sync_started_at) * 1_000),
+                error.reason,
+            )
+            return SyncResult(
+                sync_generation=generation,
+                complete=False,
+                events_seen=len(events),
+                markets_seen=len(snapshots),
+                markets_persisted=0,
+                tokens_seen=sum(len(item.tokens) for item in snapshots),
+                changes_published=0,
+                changes_dropped=0,
+                error=error.reason,
+                degraded=self._degraded,
+                skipped_market_ids=tuple(
+                    warning.market_id for warning in market_warnings
+                ),
+                warnings=tuple(warning.error for warning in market_warnings),
             )
         _LOGGER.info(
             "sync_stage_completed sync_generation=%s stage=catalog_persist "
@@ -541,10 +574,7 @@ class SyncMarketTask:
             skipped_market_ids=tuple(
                 warning.market_id for warning in market_warnings
             ),
-            warnings=(
-                tuple(warning.error for warning in market_warnings)
-                + orphan_warnings
-            ),
+            warnings=tuple(warning.error for warning in market_warnings),
         )
 
     async def _republish_pending_reconciliations(self) -> None:
@@ -840,53 +870,6 @@ def _validate_complete_source(
     return None
 
 
-def _detach_missing_parent_events(
-    *,
-    events: Sequence[Event],
-    snapshots: Sequence[MarketSnapshot],
-) -> tuple[list[MarketSnapshot], tuple[str, ...]]:
-    event_ids = {event.id for event in events}
-    normalized: list[MarketSnapshot] = []
-    warnings: list[str] = []
-    for snapshot in snapshots:
-        market = snapshot.market
-        if (
-            market.status is MarketStatus.ACTIVE
-            and market.active
-            and market.event_id is not None
-            and market.event_id not in event_ids
-        ):
-            warnings.append(
-                f"market {market.id} parent event {market.event_id} was absent; "
-                "persisting market as orphan"
-            )
-            market = replace(
-                market,
-                event_id=None,
-                neg_risk_member_complete=False,
-                neg_risk_outcome_position=None,
-            )
-            snapshot = replace(snapshot, market=market)
-        normalized.append(snapshot)
-    return normalized, tuple(warnings)
-
-
-def _log_orphan_warnings(
-    warnings: Sequence[str],
-    *,
-    sample_limit: int = 10,
-) -> None:
-    for warning in warnings[:sample_limit]:
-        _LOGGER.warning("sync_market_parent_missing %s", warning)
-    omitted = len(warnings) - sample_limit
-    if omitted > 0:
-        _LOGGER.warning(
-            "sync_market_parent_missing summary total=%d omitted=%d",
-            len(warnings),
-            omitted,
-        )
-
-
 def _changes_for_delivery(
     changes: Sequence[MarketChange],
     *,
@@ -1115,9 +1098,11 @@ def _prepare_incomplete(
     for item in snapshots:
         old_market = old_markets.get(item.market.id)
         parent_exists = (
-            item.market.event_id is None
-            or item.market.event_id in incoming_events
-            or item.market.event_id in old_events
+            item.market.event_id is not None
+            and (
+                item.market.event_id in incoming_events
+                or item.market.event_id in old_events
+            )
         )
         identity_is_stable = old_market is None or (
             old_market.condition_id == item.market.condition_id
@@ -1230,12 +1215,12 @@ def _prepare_incomplete(
 
     # A linked new market is safe only when its parent event can be stored in
     # the same transaction. Existing parents are included above to preserve
-    # dual-write; orphan markets have no parent prerequisite.
+    # dual-write. Parentless markets are never valid catalog candidates.
     permitted_event_ids = set(event_upserts)
     market_upserts = {
         market_id: market
         for market_id, market in market_upserts.items()
-        if market.event_id is None or market.event_id in permitted_event_ids
+        if market.event_id in permitted_event_ids
     }
     permitted_market_ids = set(market_upserts)
     token_upserts = {

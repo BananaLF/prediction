@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
 import inspect
 from pathlib import Path
+import sqlite3
 from typing import Any, Generic, TypeVar
 
 import aiosqlite
@@ -30,10 +32,26 @@ class DatabaseWriterClosedError(DatabaseWriterError):
     """Raised when the writer is unavailable or has begun closing."""
 
 
+class CheckpointMode(StrEnum):
+    PASSIVE = "PASSIVE"
+    RESTART = "RESTART"
+    TRUNCATE = "TRUNCATE"
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointResult:
+    mode: CheckpointMode
+    busy: int
+    log_pages: int
+    checkpointed_pages: int
+    wal_bytes: int
+
+
 @dataclass(frozen=True)
 class _Request(Generic[T]):
     command: DatabaseCommand[T]
     result: asyncio.Future[T]
+    transactional: bool
 
 
 _STOP = object()
@@ -100,12 +118,61 @@ class DatabaseWriter:
             )
 
     async def execute(self, command: DatabaseCommand[T]) -> T:
+        return await self._submit(command, transactional=True)
+
+    async def execute_non_transactional(self, command: DatabaseCommand[T]) -> T:
+        """Serialize a command that must run outside a transaction."""
+
+        return await self._submit(command, transactional=False)
+
+    async def checkpoint(
+        self,
+        mode: CheckpointMode = CheckpointMode.PASSIVE,
+    ) -> CheckpointResult:
+        """Run one validated checkpoint request through the writer actor."""
+
+        if not isinstance(mode, CheckpointMode):
+            raise TypeError("mode must be a CheckpointMode")
+
+        async def command(connection: aiosqlite.Connection) -> CheckpointResult:
+            cursor = await connection.execute(f"PRAGMA wal_checkpoint({mode.value})")
+            try:
+                row = await cursor.fetchone()
+            finally:
+                await cursor.close()
+            if row is None or len(row) != 3:
+                raise sqlite3.DatabaseError("unexpected wal_checkpoint result")
+            wal_path = self._path.with_name(self._path.name + "-wal")
+            try:
+                wal_bytes = wal_path.stat().st_size
+            except FileNotFoundError:
+                wal_bytes = 0
+            return CheckpointResult(
+                mode=mode,
+                busy=int(row[0]),
+                log_pages=int(row[1]),
+                checkpointed_pages=int(row[2]),
+                wal_bytes=wal_bytes,
+            )
+
+        return await self.execute_non_transactional(command)
+
+    async def _submit(
+        self,
+        command: DatabaseCommand[T],
+        *,
+        transactional: bool,
+    ) -> T:
         if not callable(command):
             raise TypeError("command must be callable")
         if not self._started or self._closing or self._closed:
             raise DatabaseWriterClosedError("database writer is not accepting commands")
         result: asyncio.Future[T] = asyncio.get_running_loop().create_future()
-        request = _Request(command=command, result=result)
+        request = _Request(
+            command=command,
+            result=result,
+            transactional=transactional,
+        )
         try:
             self._queue.put_nowait(request)
         except asyncio.QueueFull as error:
@@ -163,14 +230,21 @@ class DatabaseWriter:
                 request = item
                 assert isinstance(request, _Request)
                 try:
-                    await connection.execute("BEGIN IMMEDIATE")
+                    if request.transactional:
+                        await connection.execute("BEGIN IMMEDIATE")
+                    else:
+                        assert connection.in_transaction is False
                     value = request.command(connection)
                     if inspect.isawaitable(value):
                         value = await value
-                    await connection.commit()
+                    if request.transactional:
+                        await connection.commit()
+                    else:
+                        assert connection.in_transaction is False
                 except BaseException as error:
                     try:
-                        await connection.rollback()
+                        if connection.in_transaction:
+                            await connection.rollback()
                     except BaseException as rollback_error:
                         error.add_note(f"rollback also failed: {rollback_error!r}")
                     if not request.result.done():

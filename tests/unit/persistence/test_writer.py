@@ -34,6 +34,7 @@ from predmarket.persistence.repositories import (
 )
 from predmarket.persistence.schema import initialize_database
 from predmarket.persistence.writer import (
+    CheckpointMode,
     DatabaseQueueFullError,
     DatabaseWriter,
     DatabaseWriterClosedError,
@@ -150,6 +151,69 @@ async def test_writer_rolls_back_failed_command_and_continues(tmp_path: Path) ->
             "SELECT id, event_type FROM system_events ORDER BY id"
         ).fetchall()
     assert rows == [(inserted_id, "RECOVERED")]
+
+
+async def test_writer_distinguishes_transactional_and_non_transactional_commands(
+    tmp_path: Path,
+) -> None:
+    writer = DatabaseWriter(tmp_path / "market.db")
+    await writer.start()
+
+    async def transactional(connection: aiosqlite.Connection) -> bool:
+        return connection.in_transaction
+
+    async def non_transactional(connection: aiosqlite.Connection) -> bool:
+        return connection.in_transaction
+
+    async def failing_non_transactional(connection: aiosqlite.Connection) -> None:
+        assert connection.in_transaction is False
+        raise RuntimeError("non-transactional boom")
+
+    try:
+        assert await writer.execute(transactional) is True
+        assert await writer.execute_non_transactional(non_transactional) is False
+        with pytest.raises(RuntimeError, match="non-transactional boom"):
+            await writer.execute_non_transactional(failing_non_transactional)
+        assert await writer.execute(transactional) is True
+    finally:
+        await writer.close()
+
+
+async def test_writer_passive_checkpoint_runs_outside_transaction(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+
+    async def insert_event(connection: aiosqlite.Connection, event_type: str) -> None:
+        await connection.execute(
+            """
+            INSERT INTO system_events (
+                component, severity, event_type, message, occurred_at
+            ) VALUES ('DATABASE', 'INFO', ?, 'checkpoint fixture', 1)
+            """,
+            (event_type,),
+        )
+
+    reader = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        await writer.execute(lambda connection: insert_event(connection, "BEFORE_READ"))
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM system_events").fetchone()
+        await writer.execute(lambda connection: insert_event(connection, "AFTER_READ"))
+
+        result = await writer.checkpoint(CheckpointMode.PASSIVE)
+
+        assert result.mode is CheckpointMode.PASSIVE
+        assert result.busy >= 0
+        assert result.log_pages >= 1
+        assert 0 <= result.checkpointed_pages <= result.log_pages
+        assert result.wal_bytes >= 0
+    finally:
+        reader.rollback()
+        reader.close()
+        await writer.close()
 
 
 async def test_writer_queue_is_bounded_and_close_drains_accepted_work(
@@ -618,8 +682,8 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
     finally:
         await writer.close()
 
-    assert stored_market == market
-    assert stored_token == token
+    assert stored_market == replace(market, sync_generation="bootstrap-v4")
+    assert stored_token == replace(token, sync_generation="bootstrap-v4")
     assert stored_relation is not None
     assert replace(stored_relation, llm_analysis=llm_approved.llm_analysis) == llm_approved
     assert stored_relation.llm_analysis is not None
@@ -638,7 +702,8 @@ async def test_repositories_round_trip_typed_catalog_and_relation_records(
     with sqlite3.connect(database_path) as connection:
         connection.execute("PRAGMA ignore_check_constraints = ON")
         connection.execute(
-            "UPDATE markets SET tick_size = '1E-5' WHERE id = 'market-1'"
+            "UPDATE market_versions SET tick_size = '1E-5' "
+            "WHERE entity_id = 'market-1'"
         )
         connection.execute(
             "UPDATE relations SET llm_confidence = '8.75E-1' "
@@ -860,7 +925,7 @@ async def test_catalog_bulk_save_uses_bounded_database_round_trips(
     assert stored_event.market_ids == event.market_ids
 
 
-async def test_complete_catalog_save_advances_unchanged_rows_without_upsert(
+async def test_complete_catalog_save_advances_unchanged_rows_without_rewriting_payload(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "market.db"
@@ -913,13 +978,13 @@ async def test_complete_catalog_save_advances_unchanged_rows_without_upsert(
         await writer.close()
 
     assert stored.events == (
-        replace(event, sync_generation="sync-2", updated_at=20),
+        replace(event, sync_generation="sync-2"),
     )
     assert stored.markets == (
-        replace(market, sync_generation="sync-2", updated_at=20),
+        replace(market, sync_generation="sync-2"),
     )
     assert stored.tokens == (
-        replace(token, sync_generation="sync-2", updated_at=20),
+        replace(token, sync_generation="sync-2"),
     )
 
 
@@ -1022,7 +1087,7 @@ async def test_complete_catalog_save_does_not_overwrite_newer_watch_refresh(
         await writer.close()
 
     assert stored.events == (
-        replace(event, sync_generation="sync-2", updated_at=20),
+        replace(event, sync_generation="sync-2"),
     )
     assert stored.markets == (
         replace(refreshed_market, sync_generation="sync-2"),
