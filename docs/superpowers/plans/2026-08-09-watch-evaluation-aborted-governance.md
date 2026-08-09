@@ -51,10 +51,10 @@
 
 **Step 1: Add a same-generation revision-mismatch assertion.**
 
-Extend the existing test_same_generation_cache_revision_change_fences_stale_evaluation scenario so the strategy is released after token-1 advances in the same valid generation. Capture INFO logs from predmarket.watch.task and assert that the representative abort record includes:
+Extend the existing test_same_generation_cache_revision_change_fences_stale_evaluation scenario so the strategy is released after token-1 advances in the same valid generation. Capture INFO logs from predmarket.watch.task and assert that the per-abort record includes:
 
 ~~~
-watch_evaluation_abort_summary
+watch_evaluation_aborted
 reason=dependency_revision_changed
 stage=after_strategy
 sample_token_ids=token-1
@@ -83,7 +83,7 @@ env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u http_proxy -u http
   .venv/bin/python -m pytest -q tests/unit/watch/test_task.py -k 'evaluation_abort or same_generation_cache_revision_change_fences_stale_evaluation'
 ~~~
 
-Expected result: the new reason/summary assertions fail because the current implementation has no classification or window summary, while the pre-existing safety assertion remains green. This is the RED checkpoint.
+Expected result: the new reason/revision assertions fail because the current implementation has no classification or revision sample, while the pre-existing safety assertion remains green. This is the RED checkpoint. Window-summary assertions belong to Task 3 and are intentionally not part of this checkpoint.
 
 ## Task 2: Implement structured abort classification
 
