@@ -12,14 +12,14 @@ predmarket signals list --config config/default.yaml
 The default configuration is `config/default.yaml`; it stores local evidence in
 `data/predmarket-v1.sqlite3`. `run` is the long-running observer: it reads only
 public Polymarket data, writes local evidence, relations, signals, and
-operational state, initializes Schema v3, watches order books, evaluates
+operational state, initializes Schema v4, watches order books, evaluates
 strategies, and sends notifications. `status` and `signals list` are local
 SQLite reads, so use them after `run` has initialized the database. They do not
 make Polymarket requests.
 
 The filename is retained for historical compatibility; the SQLite
-`PRAGMA user_version` for a current database is `3`. A v2 database is migrated
-transactionally during initialization.
+`PRAGMA user_version` for a current database is `4`. Legacy databases are
+migrated explicitly while the service is stopped.
 
 If the first sync is incomplete because an event request fails, `run` starts
 `watch` as soon as the committed database contains a valid active market with a
@@ -28,12 +28,12 @@ this is a degraded startup, not a database-integrity bypass.
 
 ## Schema migration and diagnosis
 
-Schema v1 databases must be migrated explicitly while the service is stopped.
-The migration creates the requested backup and changes only the market/event
-relation constraint:
+Schema v3 databases must be migrated explicitly to v4 while the service is
+stopped. The migration creates the v4 catalog-generation tables and validates
+the installed result:
 
 ```console
-predmarket migrate --to 2 --database data/predmarket-v1.sqlite3 --backup data/predmarket-v1.sqlite3.before-v2
+predmarket migrate --to 4 --database data/predmarket-v1.sqlite3
 predmarket doctor --database data/predmarket-v1.sqlite3
 ```
 
@@ -49,7 +49,7 @@ application log file in the default configuration. Check a running process in
 its terminal, and use `status` for the configured database, signal count, and
 system-event count.
 
-`run` performs only the required startup checks: Schema v3, SQLite structural
+`run` performs only the required startup checks: Schema v4, SQLite structural
 integrity, foreign-key basics, and the expected project tables. It does not scan
 all persisted application payloads during startup. Use the read-only doctor for
 the full semantic scan:
@@ -139,3 +139,15 @@ Polymarket access is read-only and confined to the public REST/WebSocket gateway
 The service has no wallet, credentials, signing, order submission, cancellation,
 or execution capability. Signals and `CLOSED` records remain evidence about an
 opportunity, not trades, fills, settlement, or realized returns.
+
+## Schema v4 发布后观测
+
+升级前停止所有会写入目标数据库的服务，并确认可恢复备份。升级和观测命令如下：
+
+```console
+predmarket migrate --to 4 --database PATH
+predmarket doctor --database PATH
+python scripts/validate_catalog_v4.py --database PATH --duration-seconds 1800 --interval-seconds 30 --output reports/catalog-v4.json
+```
+
+探针是只读观测：不自动停止服务、迁移、重置、全量同步或触发交易。WAL 仅记录观测值，硬阈值为 128 MiB；超过阈值时由操作人员按备份、停写和恢复流程处理。报告中的估计不是成交或结算结果，`realized` 为 `unsupported`。

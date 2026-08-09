@@ -89,7 +89,7 @@ predmarket run
 | `predmarket --help` | 查看全局帮助和子命令 | 只读，不需要数据库或网络 |
 | `predmarket run --config config/default.yaml` | 启动公开市场数据采集和信号服务 | 读取配置并写入/初始化本地 SQLite；需要公开数据网络可用 |
 | `predmarket doctor --database PATH` | 检查本地数据库 schema、SQLite 完整性和 catalog 诊断 | 只读本地 SQLite；数据库必须已初始化 |
-| `predmarket migrate --to 2 --database PATH --backup PATH` | 将 Schema v1 数据库显式迁移到 v2 | 写入迁移后的数据库，并创建指定备份；执行前应停止服务 |
+| `predmarket migrate --to 4 --database PATH` | 将 Schema v3 数据库显式迁移到 v4 | 写入迁移后的数据库；执行前应停止服务并确认备份 |
 | `predmarket status --config config/default.yaml` | 查看本地信号和系统事件计数 | 只读本地 SQLite；数据库必须已初始化 |
 | `predmarket signals list --config config/default.yaml` | 列出已记录信号 | 只读本地 SQLite；数据库必须已初始化 |
 | `predmarket signals show SIGNAL_ID --config config/default.yaml` | 查看一个信号及其证据字段 | 只读本地 SQLite；数据库必须已初始化且 ID 存在 |
@@ -124,12 +124,12 @@ python -m predmarket status --config config/default.yaml
 
 ## 数据库与 reset
 
-默认数据库路径是 `data/predmarket-v1.sqlite3`，当前 SQLite Schema 是 v2。`markets.event_id` 可以为空，表示上游没有对应 event；`events.market_ids` 是由本地 market 关系重建的反向索引。只要数据库中有合法的 active market 和 token，`run` 即使遇到不完整的首轮 sync 也会启动 watch，并继续后台同步。
+默认数据库路径是 `data/predmarket-v1.sqlite3`，文件名保留用于历史兼容；当前 SQLite Schema 是 v4。`markets.event_id` 可以为空，表示上游没有对应 event；`events.market_ids` 是由本地 market 关系重建的反向索引。只要数据库中有合法的 active market 和 token，`run` 即使遇到不完整的首轮 sync 也会启动 watch，并继续后台同步。
 
-旧的 Schema v1 数据库不会由服务自动修改。停止服务后，先创建备份并显式迁移，再启动 `run`：
+现有 Schema v3 数据库不会由服务自动修改。停止服务后，先确认备份并显式迁移到 v4，再启动 `run`：
 
 ```console
-predmarket migrate --to 2 --database data/predmarket-v1.sqlite3 --backup data/predmarket-v1.sqlite3.before-v2
+predmarket migrate --to 4 --database data/predmarket-v1.sqlite3
 predmarket doctor --database data/predmarket-v1.sqlite3
 ```
 
@@ -177,3 +177,15 @@ python scripts/reset_database.py --config config/default.yaml --execute
 ### 信号是否等于收益？
 
 不是。信号只表示机会观察和证据记录；`OPEN`、`UPDATED`、`CLOSED` 都不表示成交或实际收益，服务也不会下单、撤单或执行链上操作。
+
+## Schema v4 发布后观测
+
+Schema v4 的升级由操作人员显式执行。先停止写入该数据库的服务并确认备份，再按顺序运行：
+
+```console
+predmarket migrate --to 4 --database PATH
+predmarket doctor --database PATH
+python scripts/validate_catalog_v4.py --database PATH --duration-seconds 1800 --interval-seconds 30 --output reports/catalog-v4.json
+```
+
+`validate_catalog_v4.py` 只读打开数据库，执行一次健康检查并默认观测 30 分钟；它不自动停止服务、不迁移、不重置、不全量同步，也不触发交易动作。WAL 大小只作观测，硬阈值为 128 MiB，超过阈值应由操作人员处理。报告中的价格与收益是证据或估计，不代表成交；`realized` 固定为 `unsupported`。

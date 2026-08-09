@@ -26,8 +26,8 @@ The default configuration remains `config/default.yaml`, whose default SQLite
 path is `data/predmarket-v1.sqlite3` (relative to the repository working
 directory).  That file is not created by the configuration template.
 The filename is retained for historical compatibility; an initialized database
-uses SQLite Schema v3 (`PRAGMA user_version = 3`) and migrates Schema v2 during
-initialization.
+uses SQLite Schema v4 (`PRAGMA user_version = 4`). Legacy databases are
+migrated explicitly while the service is stopped.
 
 The matrix lists both CLI help forms:
 
@@ -62,7 +62,7 @@ entry point, only the console-form help case is skipped.  Both help commands
 are static checks and do not need a database or network.
 
 `status` opens SQLite read-only and therefore needs a configuration whose
-`database.path` names an initialized temporary Schema v3 database:
+`database.path` names an initialized temporary Schema v4 database:
 
 ```console
 predmarket status --config /path/to/initialized-temporary-config.yaml
@@ -75,8 +75,8 @@ using it for a status check:
 
 | Check | Expected result |
 | --- | --- |
-| `PRAGMA user_version` | Schema v3 (`3`) |
-| Project tables | Expected table count for Schema v3 (ten project tables) |
+| `PRAGMA user_version` | Schema v4 (`4`) |
+| Project objects | Expected Schema v4 tables plus `events`/`markets`/`tokens` views |
 | `PRAGMA integrity_check` | `ok` |
 | `PRAGMA foreign_key_check` | No rows |
 
@@ -86,18 +86,30 @@ network services and is optional: passing offline tests does not assert that a
 live smoke will succeed, and a live smoke is not required for offline test
 success.
 
-The smallest repository-backed Schema v3 check uses pytest's temporary
+The smallest repository-backed Schema v4 check uses pytest's temporary
 database directory and does not touch `data/predmarket-v1.sqlite3`:
 
 ```console
 pytest -q \
-  tests/unit/persistence/test_schema.py::test_initialize_database_creates_exact_schema_v3_and_wal \
-  tests/unit/persistence/test_integrity.py::test_integrity_accepts_a_valid_schema_v3_database
+  tests/unit/persistence/test_schema.py::test_initialize_database_creates_exact_schema_v4_and_wal \
+  tests/unit/persistence/test_integrity.py::test_integrity_accepts_a_valid_schema_v4_database
 ```
 
 These tests initialize a temporary database through the production
-`initialize_database()` path, then check the Schema v3 version, project-table
+`initialize_database()` path, then check the Schema v4 version, project-object
 set, SQLite integrity, and read-only application integrity checks.  The
 documentation-command test only parses documented local commands and does not
 execute real database, network, or reset side effects.  Reset behavior is
 exercised separately only against temporary files.
+
+## Schema v4 发布后观测验证
+
+升级目标数据库前先停止写入服务并确认备份，然后显式执行迁移、doctor 和只读观测：
+
+```console
+predmarket migrate --to 4 --database PATH
+predmarket doctor --database PATH
+python scripts/validate_catalog_v4.py --database PATH --duration-seconds 1800 --interval-seconds 30 --output reports/catalog-v4.json
+```
+
+观测脚本不自动停止服务、不迁移、不重置、不全量同步，也不触发交易。它记录 WAL 大小并以 128 MiB 作为硬阈值；报告中的估计不等于成交或实际收益，`realized` 明确为 `unsupported`。应保留报告、数据库和操作日志供复核。
