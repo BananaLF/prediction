@@ -1004,6 +1004,56 @@ def test_decimal_diagnostics_are_bounded_to_eight_fractional_digits() -> None:
     assert _format_decimal_for_log(None) == "none"
 
 
+def test_evaluation_abort_classifier_distinguishes_cache_generation_and_dependency() -> None:
+    watch, _, _, _, _, _ = _watch()
+    watch.cache.begin_resync(generation=1, token_ids=("token-1", "token-2"))
+    watch.cache.apply_snapshot((_book("token-1", 1), _book("token-2", 1)))
+    snapshot = watch.cache.snapshot_token_revisions()
+    current = watch.cache.get("token-1")
+    assert current is not None
+    assert watch.cache.apply_book(
+        replace(
+            current,
+            exchange_timestamp=101,
+            book_hash="classifier-revision-change",
+        )
+    ) is True
+
+    assert (
+        watch._classify_evaluation_abort(  # noqa: SLF001
+            1,
+            revision_snapshot=snapshot,
+            dependency_token_ids=("token-1",),
+        ).reason
+        == "dependency_revision_changed"
+    )
+    assert (
+        watch._classify_evaluation_abort(  # noqa: SLF001
+            2,
+            revision_snapshot=snapshot,
+            dependency_token_ids=("token-1",),
+        ).reason
+        == "generation_changed"
+    )
+    missing = watch._classify_evaluation_abort(  # noqa: SLF001
+        1,
+        revision_snapshot=snapshot,
+        dependency_token_ids=("missing-token",),
+    )
+    assert missing.reason == "dependency_missing"
+    assert missing.changed_token_ids == ("missing-token",)
+
+    assert watch.cache.invalidate(generation=1, reason="test_invalid") is True
+    assert (
+        watch._classify_evaluation_abort(  # noqa: SLF001
+            1,
+            revision_snapshot=snapshot,
+            dependency_token_ids=("token-1",),
+        ).reason
+        == "cache_invalid_or_closed"
+    )
+
+
 async def test_run_subscribes_all_initial_watchable_tokens_and_evaluates_after_rest() -> None:
     # Catches startup analyzing before the complete REST recovery baseline exists.
     gateway = FakeGateway()
@@ -1446,31 +1496,44 @@ async def test_host_wall_movement_does_not_make_market_book_stale() -> None:
     await watch.close()
 
 
-async def test_same_generation_cache_revision_change_fences_stale_evaluation() -> None:
+async def test_same_generation_cache_revision_change_fences_stale_evaluation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     strategy = BlockingStreamStrategy()
     signals = FakeSignals()
     watch, _, _, _, _, _ = _watch(strategy=strategy, signals=signals)
     await watch.start()
     applied_before = len(signals.applied)
 
-    evaluation = asyncio.create_task(
-        watch._evaluate_tokens(("token-1",))  # noqa: SLF001
-    )
-    await asyncio.wait_for(strategy.stream_evaluation_started.wait(), timeout=1)
-    current = watch.cache.get("token-1")
-    assert current is not None
-    assert watch.cache.apply_book(
-        replace(
-            current,
-            bids=(OrderBookLevel(Decimal("0.41"), Decimal("9")),),
-            exchange_timestamp=101,
-            book_hash="newer-same-generation",
+    with caplog.at_level(logging.DEBUG, logger="predmarket.watch.task"):
+        evaluation = asyncio.create_task(
+            watch._evaluate_tokens(("token-1",))  # noqa: SLF001
         )
-    ) is True
-    strategy.release_stream_evaluation.set()
-    await evaluation
+        await asyncio.wait_for(strategy.stream_evaluation_started.wait(), timeout=1)
+        current = watch.cache.get("token-1")
+        assert current is not None
+        assert watch.cache.apply_book(
+            replace(
+                current,
+                bids=(OrderBookLevel(Decimal("0.41"), Decimal("9")),),
+                exchange_timestamp=101,
+                book_hash="newer-same-generation",
+            )
+        ) is True
+        strategy.release_stream_evaluation.set()
+        await evaluation
 
     assert len(signals.applied) == applied_before
+    abort = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("watch_evaluation_aborted ")
+    )
+    assert "reason=dependency_revision_changed" in abort
+    assert "stage=after_strategy" in abort
+    assert "sample_token_ids=token-1" in abort
+    assert "sample_expected_revisions=token-1:1" in abort
+    assert "sample_actual_revisions=token-1:2" in abort
     await watch.close()
 
 
@@ -1504,6 +1567,98 @@ async def test_unrelated_token_revision_change_does_not_fence_evaluation() -> No
 
     assert len(signals.applied) == applied_before + 1
     await watch.close()
+
+
+async def test_evaluation_abort_summary_aggregates_without_completed_summary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monotonic = [0]
+    strategy = BlockingStreamStrategy()
+    watch, _, _, _, _, _ = _watch(
+        strategy=strategy,
+        monotonic_ms=lambda: monotonic[0],
+    )
+    await watch.start()
+
+    with caplog.at_level(logging.INFO, logger="predmarket.watch.task"):
+        for sequence, timestamp in ((1, 101), (2, 102)):
+            strategy.stream_evaluation_started.clear()
+            strategy.release_stream_evaluation.clear()
+            evaluation = asyncio.create_task(
+                watch._evaluate_tokens(("token-1",))  # noqa: SLF001
+            )
+            await asyncio.wait_for(
+                strategy.stream_evaluation_started.wait(), timeout=1
+            )
+            current = watch.cache.get("token-1")
+            assert current is not None
+            assert watch.cache.apply_book(
+                replace(
+                    current,
+                    bids=(OrderBookLevel(Decimal("0.41"), Decimal("9")),),
+                    exchange_timestamp=timestamp,
+                    book_hash=f"abort-summary-{sequence}",
+                )
+            ) is True
+            if sequence == 2:
+                monotonic[0] = 10_000
+            strategy.release_stream_evaluation.set()
+            await evaluation
+
+    summaries = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("watch_evaluation_abort_summary ")
+    ]
+    assert len(summaries) == 1
+    assert "window_aborted=2" in summaries[0]
+    assert "reason_counts=dependency_revision_changed:2" in summaries[0]
+    assert "stage_counts=after_strategy:2" in summaries[0]
+    assert not any(
+        record.levelno == logging.INFO
+        and record.getMessage().startswith("watch_evaluation_aborted ")
+        for record in caplog.records
+    )
+    await watch.close()
+
+
+async def test_evaluation_abort_summary_flushes_unfinished_window_on_close(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    strategy = BlockingStreamStrategy()
+    watch, _, _, _, _, _ = _watch(strategy=strategy)
+    await watch.start()
+    strategy.stream_evaluation_started.clear()
+    strategy.release_stream_evaluation.clear()
+
+    evaluation = asyncio.create_task(
+        watch._evaluate_tokens(("token-1",))  # noqa: SLF001
+    )
+    await asyncio.wait_for(strategy.stream_evaluation_started.wait(), timeout=1)
+    current = watch.cache.get("token-1")
+    assert current is not None
+    assert watch.cache.apply_book(
+        replace(
+            current,
+            bids=(OrderBookLevel(Decimal("0.41"), Decimal("9")),),
+            exchange_timestamp=101,
+            book_hash="abort-close",
+        )
+    ) is True
+    strategy.release_stream_evaluation.set()
+
+    with caplog.at_level(logging.INFO, logger="predmarket.watch.task"):
+        await evaluation
+        await watch.close()
+        await watch.close()
+
+    summaries = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("watch_evaluation_abort_summary ")
+    ]
+    assert len(summaries) == 1
+    assert "window_aborted=1" in summaries[0]
 
 
 async def test_signal_apply_is_atomic_with_final_cache_revision_check() -> None:
@@ -1745,7 +1900,7 @@ async def test_generation_change_during_signal_apply_aborts_evaluation_without_c
     await watch.start()
     signals.reject_apply = True
 
-    with caplog.at_level(logging.INFO, logger="predmarket.watch.task"):
+    with caplog.at_level(logging.DEBUG, logger="predmarket.watch.task"):
         await watch._evaluate_tokens(("token-1",))  # noqa: SLF001
 
     assert "watch_evaluation_aborted" in caplog.text
