@@ -1,10 +1,10 @@
 # Catalog v4 部署验收与持续观察 Implementation Plan
 
-> **状态：** 实施完成，正在执行最终验证与 PR 交付。
+> **状态：** 实施完成，最终验证完成，等待 PR 合并。
 
 > **执行记录：** 各任务已在本隔离分支中按最小变更实现；中间任务未拆分为独立提交，统一在最终验证通过后提交。
 
-当前已完成：探针 CLI、v4 catalog/SQLite/WAL 检查、运行与信号证据关联、非重复采样窗口、稳定 JSON 报告、文档契约和 v4 运维文档。聚焦探针测试为 `19 passed`；清理代理环境后的完整测试为 `765 passed, 2 skipped`。默认环境的 5 个失败来自外部 `socks5://127.0.0.1:7890` 代理和缺少 `socksio`，不是本次变更代码路径。
+当前已完成：探针 CLI、v4 catalog/SQLite/WAL 检查、运行与信号证据关联、非重复采样窗口、稳定 JSON 报告、文档契约和 v4 运维文档。最终验证结果为：探针测试 `28 passed`；完整构建脚本 `774 passed, 2 skipped`；CLI help 校验通过；`git diff --check` 通过。测试仍有 Python 3.14/`pytest-asyncio` 弃用警告，但没有失败。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -438,4 +438,4 @@ git commit -m "feat: add catalog v4 deployment validation"
 git push -u origin issue-20-catalog-v4-validation
 ```
 
-After this plan is approved for implementation, create the PR and request review; do not merge it without the separate exact approval phrase `批准合并`.
+After this plan is approved for implementation, create the PR and request review; merge only after the user explicitly authorizes the merge.
