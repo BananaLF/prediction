@@ -51,7 +51,7 @@
 
 **Step 1: Add a same-generation revision-mismatch assertion.**
 
-Extend the existing test_same_generation_cache_revision_change_fences_stale_evaluation scenario so the strategy is released after token-1 advances in the same valid generation. Capture INFO logs from predmarket.watch.task and assert that the per-abort record includes:
+Extend the existing test_same_generation_cache_revision_change_fences_stale_evaluation scenario so the strategy is released after token-1 advances in the same valid generation. Capture DEBUG logs from predmarket.watch.task and assert that the per-abort diagnostic record includes:
 
 ~~~
 watch_evaluation_aborted
@@ -62,7 +62,7 @@ sample_expected_revisions=token-1:1
 sample_actual_revisions=token-1:2
 ~~~
 
-Use the injected monotonic clock to force the first summary window to flush; do not sleep in the test. Keep the existing assertion that no stale signal was applied.
+Keep the existing assertion that no stale signal was applied. Window-flush assertions belong to Task 3.
 
 **Step 2: Add independent classification cases.**
 

@@ -47,6 +47,7 @@ from predmarket.watch.clock import MarketClock
 _NO_CHANGE = object()
 _LOGGER = logging.getLogger(__name__)
 _EVALUATION_SUMMARY_INTERVAL_SECONDS = 10.0
+_MAX_EVALUATION_ABORT_SAMPLES = 4
 _PRICE_CHANGE_PROGRESS_INTERVAL_SECONDS = 10.0
 _SLOW_EVALUATION_SECONDS = 1.0
 _RECOVERY_RETRY_INITIAL_SECONDS = 1.0
@@ -66,6 +67,14 @@ class _RecoveryCleanupResult:
 @dataclass(frozen=True, slots=True)
 class _SubscriptionCloseResult:
     error: Exception | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _EvaluationAbortDiagnostic:
+    reason: str
+    changed_token_ids: tuple[str, ...] = ()
+    expected_revisions: tuple[tuple[str, int], ...] = ()
+    actual_revisions: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +289,16 @@ class WatchTask:
         self._catalog_snapshot_revision = 0
         self._catalog_context_lock = asyncio.Lock()
         self._last_evaluation_summary_at = float("-inf")
+        self._evaluation_abort_counts: dict[tuple[str, str], int] = {}
+        self._evaluation_abort_total = 0
+        self._evaluation_abort_max_elapsed_ms = 0
+        self._evaluation_abort_window_started_at_ms: int | None = None
+        self._last_completed_evaluation_summary_at_ms: int | None = None
+        self._last_evaluation_abort_sample: tuple[
+            str,
+            str,
+            _EvaluationAbortDiagnostic,
+        ] | None = None
         self._last_exchange_clock_skew_warning_monotonic_ms: int | None = None
         self._recovery_retry_initial_seconds = _RECOVERY_RETRY_INITIAL_SECONDS
         self._recovery_retry_max_seconds = _RECOVERY_RETRY_MAX_SECONDS
@@ -1122,6 +1141,7 @@ class WatchTask:
             await asyncio.gather(evaluation_task, return_exceptions=True)
             if self._evaluation_task is evaluation_task:
                 self._evaluation_task = None
+        self._maybe_log_evaluation_abort_summary(force=True)
         metadata_refresh_task = self._metadata_refresh_task
         if (
             metadata_refresh_task is not None
@@ -2095,7 +2115,11 @@ class WatchTask:
         contexts_for_batch = getattr(self._context_source, "contexts_for_batch", None)
         if callable(contexts_for_batch):
             if not self._evaluation_generation_is_current(generation):
-                self._log_evaluation_aborted(generation, "before_batch_context")
+                self._log_evaluation_aborted(
+                    generation,
+                    "before_batch_context",
+                    elapsed_ms=int((time.monotonic() - started_at) * 1_000),
+                )
                 return
             context_started_at = time.monotonic()
             batched_targets = contexts_for_batch(normalized_token_ids, books)
@@ -2105,11 +2129,19 @@ class WatchTask:
             if not isinstance(batched_targets, Mapping):
                 raise TypeError("batch context source must return a mapping")
             if not self._evaluation_generation_is_current(generation):
-                self._log_evaluation_aborted(generation, "after_batch_context")
+                self._log_evaluation_aborted(
+                    generation,
+                    "after_batch_context",
+                    elapsed_ms=int((time.monotonic() - started_at) * 1_000),
+                )
                 return
         for token_id in normalized_token_ids:
             if not self._evaluation_generation_is_current(generation):
-                self._log_evaluation_aborted(generation, "before_context")
+                self._log_evaluation_aborted(
+                    generation,
+                    "before_context",
+                    elapsed_ms=int((time.monotonic() - started_at) * 1_000),
+                )
                 return
             if batched_targets is None:
                 context_started_at = time.monotonic()
@@ -2120,7 +2152,11 @@ class WatchTask:
             else:
                 targets = batched_targets.get(token_id, ())
             if not self._evaluation_generation_is_current(generation):
-                self._log_evaluation_aborted(generation, "after_context")
+                self._log_evaluation_aborted(
+                    generation,
+                    "after_context",
+                    elapsed_ms=int((time.monotonic() - started_at) * 1_000),
+                )
                 return
             materialized = tuple(targets)
             if any(not isinstance(target, EvaluationTarget) for target in materialized):
@@ -2140,7 +2176,13 @@ class WatchTask:
                     revision_snapshot,
                     dependency_token_ids,
                 ):
-                    self._log_evaluation_aborted(generation, "before_strategy")
+                    self._log_evaluation_aborted(
+                        generation,
+                        "before_strategy",
+                        revision_snapshot=revision_snapshot,
+                        dependency_token_ids=dependency_token_ids,
+                        elapsed_ms=int((time.monotonic() - started_at) * 1_000),
+                    )
                     return
                 context = target.context
                 if isinstance(context, StrategyContext):
@@ -2193,7 +2235,13 @@ class WatchTask:
                     revision_snapshot,
                     dependency_token_ids,
                 ):
-                    self._log_evaluation_aborted(generation, "after_strategy")
+                    self._log_evaluation_aborted(
+                        generation,
+                        "after_strategy",
+                        revision_snapshot=revision_snapshot,
+                        dependency_token_ids=dependency_token_ids,
+                        elapsed_ms=int((time.monotonic() - started_at) * 1_000),
+                    )
                     return
                 if not isinstance(decision, StrategyDecision.__args__):
                     raise TypeError("strategy engine returned an invalid decision")
@@ -2218,7 +2266,13 @@ class WatchTask:
                         revision_snapshot,
                         dependency_token_ids,
                     ):
-                        self._log_evaluation_aborted(generation, "before_signal_apply")
+                        self._log_evaluation_aborted(
+                            generation,
+                            "before_signal_apply",
+                            revision_snapshot=revision_snapshot,
+                            dependency_token_ids=dependency_token_ids,
+                            elapsed_ms=int((time.monotonic() - started_at) * 1_000),
+                        )
                         return
                     signal_apply_started_at = time.monotonic()
                     if operation_lock_held:
@@ -2237,6 +2291,9 @@ class WatchTask:
                                 self._log_evaluation_aborted(
                                     generation,
                                     "signal_apply_lock_acquired",
+                                    revision_snapshot=revision_snapshot,
+                                    dependency_token_ids=dependency_token_ids,
+                                    elapsed_ms=int((time.monotonic() - started_at) * 1_000),
                                 )
                                 return
                             signal_id = await self._signal_manager.apply(
@@ -2251,13 +2308,22 @@ class WatchTask:
                         generation,
                         "signal_apply_generation_changed",
                         detail=str(error),
+                        revision_snapshot=revision_snapshot,
+                        dependency_token_ids=dependency_token_ids,
+                        elapsed_ms=int((time.monotonic() - started_at) * 1_000),
                     )
                     return
                 if not self._evaluation_is_current(
                     revision_snapshot,
                     dependency_token_ids,
                 ):
-                    self._log_evaluation_aborted(generation, "after_signal_apply")
+                    self._log_evaluation_aborted(
+                        generation,
+                        "after_signal_apply",
+                        revision_snapshot=revision_snapshot,
+                        dependency_token_ids=dependency_token_ids,
+                        elapsed_ms=int((time.monotonic() - started_at) * 1_000),
+                    )
                     return
                 if signal_id is not None:
                     persisted_signal_count += 1
@@ -2274,6 +2340,7 @@ class WatchTask:
             >= _EVALUATION_SUMMARY_INTERVAL_SECONDS
         ):
             self._last_evaluation_summary_at = completed_at
+            self._last_completed_evaluation_summary_at_ms = self._monotonic_now()
             _LOGGER.info(
                 "watch_evaluation_summary generation=%d tokens=%d generated_targets=%d "
                 "targets=%d deduplicated_targets=%d persisted_signals=%d "
@@ -2359,21 +2426,182 @@ class WatchTask:
         stage: str,
         *,
         detail: str | None = None,
+        revision_snapshot: TokenRevisionSnapshot | None = None,
+        dependency_token_ids: tuple[str, ...] = (),
+        elapsed_ms: int | None = None,
     ) -> None:
+        diagnostic = self._classify_evaluation_abort(
+            generation,
+            revision_snapshot=revision_snapshot,
+            dependency_token_ids=dependency_token_ids,
+        )
         message = (
             "watch_evaluation_aborted expected_generation=%d actual_generation=%d "
-            "cache_state=%s stage=%s"
+            "cache_state=%s stage=%s reason=%s sample_token_ids=%s "
+            "sample_expected_revisions=%s sample_actual_revisions=%s"
         )
         arguments: tuple[Any, ...] = (
             generation,
             self._cache.generation,
             self._cache.state.value,
             stage,
+            diagnostic.reason,
+            _format_token_ids_for_log(diagnostic.changed_token_ids),
+            _format_revisions_for_log(diagnostic.expected_revisions),
+            _format_revisions_for_log(diagnostic.actual_revisions),
         )
         if detail is not None:
             message += " detail=%s"
             arguments += (detail,)
-        _LOGGER.info(message, *arguments)
+        _LOGGER.debug(message, *arguments)
+        self._record_evaluation_abort(
+            stage,
+            diagnostic,
+            elapsed_ms=elapsed_ms,
+        )
+
+    def _classify_evaluation_abort(
+        self,
+        expected_generation: int,
+        *,
+        revision_snapshot: TokenRevisionSnapshot | None,
+        dependency_token_ids: tuple[str, ...],
+    ) -> _EvaluationAbortDiagnostic:
+        if self._closed or self._cache.state is not CacheState.VALID:
+            return _EvaluationAbortDiagnostic("cache_invalid_or_closed")
+        if self._cache.generation != expected_generation:
+            return _EvaluationAbortDiagnostic("generation_changed")
+        if revision_snapshot is None:
+            return _EvaluationAbortDiagnostic("generation_changed")
+
+        expected = dict(revision_snapshot.revisions)
+        actual = dict(self._cache.snapshot_token_revisions().revisions)
+        normalized_token_ids = tuple(
+            sorted(set(dependency_token_ids), key=_utf8)
+        )
+        missing_token_ids = tuple(
+            token_id
+            for token_id in normalized_token_ids
+            if token_id not in expected or token_id not in actual
+        )
+        if missing_token_ids:
+            return _EvaluationAbortDiagnostic(
+                "dependency_missing",
+                changed_token_ids=missing_token_ids[:_MAX_EVALUATION_ABORT_SAMPLES],
+            )
+
+        changed_token_ids = tuple(
+            token_id
+            for token_id in normalized_token_ids
+            if expected[token_id] != actual[token_id]
+        )[:_MAX_EVALUATION_ABORT_SAMPLES]
+        if changed_token_ids:
+            return _EvaluationAbortDiagnostic(
+                "dependency_revision_changed",
+                changed_token_ids=changed_token_ids,
+                expected_revisions=tuple(
+                    (token_id, expected[token_id]) for token_id in changed_token_ids
+                ),
+                actual_revisions=tuple(
+                    (token_id, actual[token_id]) for token_id in changed_token_ids
+                ),
+            )
+        return _EvaluationAbortDiagnostic("dependency_revision_changed")
+
+    def _record_evaluation_abort(
+        self,
+        stage: str,
+        diagnostic: _EvaluationAbortDiagnostic,
+        *,
+        elapsed_ms: int | None,
+    ) -> None:
+        now_ms = self._monotonic_now()
+        if self._evaluation_abort_total == 0:
+            self._evaluation_abort_window_started_at_ms = now_ms
+        self._evaluation_abort_total += 1
+        key = (diagnostic.reason, stage)
+        self._evaluation_abort_counts[key] = (
+            self._evaluation_abort_counts.get(key, 0) + 1
+        )
+        if elapsed_ms is not None:
+            self._evaluation_abort_max_elapsed_ms = max(
+                self._evaluation_abort_max_elapsed_ms,
+                elapsed_ms,
+            )
+        self._last_evaluation_abort_sample = (stage, diagnostic.reason, diagnostic)
+        self._maybe_log_evaluation_abort_summary(now_ms=now_ms)
+
+    def _maybe_log_evaluation_abort_summary(
+        self,
+        *,
+        force: bool = False,
+        now_ms: int | None = None,
+    ) -> None:
+        if self._evaluation_abort_total == 0:
+            return
+        if now_ms is None:
+            now_ms = self._monotonic_now()
+        window_started_at_ms = self._evaluation_abort_window_started_at_ms
+        if (
+            not force
+            and window_started_at_ms is not None
+            and now_ms - window_started_at_ms
+            < int(_EVALUATION_SUMMARY_INTERVAL_SECONDS * 1_000)
+        ):
+            return
+        reason_totals: dict[str, int] = {}
+        stage_totals: dict[str, int] = {}
+        for (reason, stage), count in self._evaluation_abort_counts.items():
+            reason_totals[reason] = reason_totals.get(reason, 0) + count
+            stage_totals[stage] = stage_totals.get(stage, 0) + count
+        reason_counts = ",".join(
+            f"{reason}:{count}" for reason, count in sorted(reason_totals.items())
+        )
+        stage_counts = ",".join(
+            f"{stage}:{count}" for stage, count in sorted(stage_totals.items())
+        )
+        sample_stage, sample_reason, sample = self._last_evaluation_abort_sample or (
+            "none",
+            "none",
+            _EvaluationAbortDiagnostic("none"),
+        )
+        last_completed_summary_age_ms = (
+            "unknown"
+            if self._last_completed_evaluation_summary_at_ms is None
+            else str(
+                max(
+                    0,
+                    now_ms - self._last_completed_evaluation_summary_at_ms,
+                )
+            )
+        )
+        _LOGGER.info(
+            "watch_evaluation_abort_summary window_aborted=%d "
+            "reason_counts=%s stage_counts=%s evaluation_requests=%d "
+            "evaluation_batches=%d evaluation_coalesced=%d pending_tokens=%d "
+            "last_completed_summary_age_ms=%s maximum_evaluation_elapsed_ms=%d "
+            "sample_reason=%s sample_stage=%s sample_token_ids=%s "
+            "sample_expected_revisions=%s sample_actual_revisions=%s",
+            self._evaluation_abort_total,
+            reason_counts or "none",
+            stage_counts or "none",
+            self._evaluation_request_count,
+            self._evaluation_batch_count,
+            self._evaluation_coalesced_count,
+            len(self._pending_evaluation_token_ids),
+            last_completed_summary_age_ms,
+            self._evaluation_abort_max_elapsed_ms,
+            sample_reason,
+            sample_stage,
+            _format_token_ids_for_log(sample.changed_token_ids),
+            _format_revisions_for_log(sample.expected_revisions),
+            _format_revisions_for_log(sample.actual_revisions),
+        )
+        self._evaluation_abort_counts.clear()
+        self._evaluation_abort_total = 0
+        self._evaluation_abort_max_elapsed_ms = 0
+        self._evaluation_abort_window_started_at_ms = None
+        self._last_evaluation_abort_sample = None
 
 
 def _watchable_subscription(
@@ -2878,6 +3106,21 @@ def _merge_refreshed_catalog(
 def _bounded_log_value(value: Any) -> str:
     compact = " ".join(str(value).split())
     return compact[:128] if compact else "none"
+
+
+def _format_token_ids_for_log(token_ids: tuple[str, ...]) -> str:
+    if not token_ids:
+        return "none"
+    return ",".join(_bounded_log_value(token_id) for token_id in token_ids)
+
+
+def _format_revisions_for_log(revisions: tuple[tuple[str, int], ...]) -> str:
+    if not revisions:
+        return "none"
+    return ",".join(
+        f"{_bounded_log_value(token_id)}:{revision}"
+        for token_id, revision in revisions
+    )
 
 
 def _utf8(value: str) -> bytes:
