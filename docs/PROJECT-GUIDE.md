@@ -21,7 +21,7 @@ The runtime is assembled in `predmarket/app.py`:
   (`predmarket/signals/manager.py`) persists their open, update, or close evidence.
 - `Relation` (`predmarket/catalog/relations.py`) discovers, analyzes when an
   injected analyzer is supplied, and manually approves implication relations.
-- `Persistence` (`predmarket/persistence/`) supplies the Schema v3 repositories
+- `Persistence` (`predmarket/persistence/`) supplies the Schema v4 repositories
   and serializes writes through `DatabaseWriter`; `Notifier`
   (`predmarket/notification/notifier.py`) sends signal and operational events
   to the optional macOS desktop channel. Runtime status is emitted through
@@ -53,15 +53,17 @@ the degraded condition. The affected evidence must be refreshed before it can be
 used again. Startup, sync, metadata, order-book, strategy, and persistence
 invariant failures are all handled fail closed.
 
-## Schema v3
+## Schema v4
 
-The local SQLite database is **Schema v3**. Its initializer creates the schema
-and sets `PRAGMA user_version = 3`. An existing Schema v2 database is migrated
-to v3 transactionally; other versions are rejected. Schema v3 retains the v2
-contract that `markets.event_id` may be `NULL`, so an orphan market can remain
-valid until a later catalog sync connects it to an event.
+The local SQLite database is **Schema v4**. Its initializer creates the schema
+and sets `PRAGMA user_version = 4`. A Schema v3 database is migrated to v4
+explicitly and transactionally while the service is stopped; other versions
+are rejected. Catalog data uses copy-on-write generations: `catalog_state`
+points to one committed generation, while staging generations, runtime changes,
+and cleanup state make publication and recovery auditable. The `events`,
+`markets`, and `tokens` views expose the active committed generation.
 
-Apart from SQLite internal tables, Schema v3 has exactly these ten tables:
+The main business objects are:
 
 | Table | Responsibility |
 | --- | --- |
@@ -76,6 +78,12 @@ Apart from SQLite internal tables, Schema v3 has exactly these ten tables:
 | `orderbook_levels` | Bid and ask levels belonging to a persisted snapshot. |
 | `system_events` | Auditable startup, sync, recovery, queue, notification, and relation-activation events. |
 
+The catalog-generation tables (`catalog_generations`, `catalog_state`,
+`catalog_runtime_changes`, and the `catalog_*_ids` identity tables) plus the
+`event_versions`, `market_versions`, and `token_versions` tables hold the
+versioned catalog behind those active views. The exact object set is enforced
+by the Schema v4 tests and the read-only `doctor` command.
+
 `CLOSED` is an opportunity lifecycle result, not an order fill, settlement, or
 realized profit. A later independently valid opportunity receives a distinct
 signal record.
@@ -86,9 +94,9 @@ Decimal-valued SQLite columns use `TEXT`, not IEEE-754 `REAL`. New writes use a
 canonical plain-decimal string: no exponent notation, plus sign, leading or
 trailing redundant zeroes, or negative zero. There is no fixed scale, so prices,
 quantities, fees, and risk values retain arbitrarily long fractional parts in
-Python's `Decimal` type. The v2-to-v3 migration normalizes legacy spellings before
-the rows enter v3; reads accept legacy Decimal spellings at the compatibility
-boundary and return `Decimal`. Fee-schedule parameters use the same canonical
+Python's `Decimal` type. Legacy migrations normalize older spellings before rows
+enter the current schema; reads accept legacy Decimal spellings at the
+compatibility boundary and return `Decimal`. Fee-schedule parameters use the same canonical
 strings inside JSON. Decimal columns are not used as numeric SQLite indexes,
 because their `TEXT` ordering is lexical rather than numeric.
 
@@ -100,3 +108,15 @@ During startup, an incomplete sync does not block `Watch` when the committed
 database already contains at least one active, orderbook-enabled market with a
 token. Sync remains a degraded background task until a complete generation is
 available.
+
+## Schema v4 部署观测
+
+Schema v4 部署由操作人员控制：停止目标数据库的写入服务并确认备份后，执行：
+
+```console
+predmarket migrate --to 4 --database PATH
+predmarket doctor --database PATH
+python scripts/validate_catalog_v4.py --database PATH --duration-seconds 1800 --interval-seconds 30 --output reports/catalog-v4.json
+```
+
+`validate_catalog_v4.py` 只读检查并生成观测报告，不自动停止服务、迁移、重置、全量同步或触发交易。WAL 超过 128 MiB 时只报告失败，由操作人员决定后续动作。证据价格和收益是估计而非成交结果，`realized` 为 `unsupported`。
