@@ -437,6 +437,43 @@ def test_doctor_reports_affected_records_for_semantic_findings(
     ]
 
 
+def test_doctor_classifies_migration_v3_relation_mismatch_as_warning(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+    _corrupt(
+        database_path,
+        "UPDATE event_versions SET market_ids_json = '[\"market-1\"]' "
+        "WHERE entity_id = 'event-1' AND generation_id = 1",
+    )
+    _corrupt(
+        database_path,
+        "UPDATE catalog_generations SET sync_generation = "
+        "'migration-v3-test' WHERE id = 1",
+    )
+
+    payload = run_database_doctor(database_path).to_payload()
+    finding = next(
+        item
+        for item in payload["findings"]
+        if item["code"] == "HISTORICAL_EVENT_MARKETS_MISMATCH"
+    )
+
+    assert finding["category"] == "id_arrays"
+    assert finding["severity"] == "warning"
+    assert finding["records"] == [
+        {
+            "declared_market_count": 1,
+            "field": "market_ids_json",
+            "id": "event-1",
+            "linked_market_count": 2,
+            "sync_generation": "migration-v3-test",
+            "table": "events",
+        }
+    ]
+
+
 def test_doctor_returns_unavailable_for_a_missing_database(tmp_path: Path) -> None:
     report = run_database_doctor(tmp_path / "missing.sqlite3")
     payload = report.to_payload()

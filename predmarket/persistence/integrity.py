@@ -50,6 +50,7 @@ _CODE_CATEGORIES = {
     "SCHEMA_INVALID": "schema",
     "EVENT_MARKET_IDS_INVALID": "id_arrays",
     "EVENT_MARKETS_MISMATCH": "id_arrays",
+    "HISTORICAL_EVENT_MARKETS_MISMATCH": "id_arrays",
     "SIGNAL_MARKET_IDS_INVALID": "id_arrays",
     "SIGNAL_MARKET_MISSING": "id_arrays",
     "JSON_PAYLOAD_INVALID": "json_payloads",
@@ -643,7 +644,8 @@ def _check_id_arrays(
     violations: list[str] | _IntegrityCollector,
 ) -> None:
     for row in connection.execute(
-        "SELECT id, market_ids_json FROM events ORDER BY CAST(id AS BLOB)"
+        "SELECT id, market_ids_json, sync_generation "
+        "FROM events ORDER BY CAST(id AS BLOB)"
     ):
         market_ids = _canonical_id_array(row["market_ids_json"], allow_empty=True)
         if market_ids is None:
@@ -665,10 +667,28 @@ def _check_id_arrays(
             )
         )
         if market_ids != actual:
+            historical = _is_historical_migration_generation(
+                row["sync_generation"]
+            )
+            code = (
+                "HISTORICAL_EVENT_MARKETS_MISMATCH"
+                if historical
+                else "EVENT_MARKETS_MISMATCH"
+            )
+            record = _record("events", row, ("id",), "market_ids_json")
+            if historical:
+                record.update(
+                    {
+                        "declared_market_count": len(market_ids),
+                        "linked_market_count": len(actual),
+                        "sync_generation": row["sync_generation"],
+                    }
+                )
             _add(
                 violations,
-                "EVENT_MARKETS_MISMATCH",
-                record=_record("events", row, ("id",), "market_ids_json"),
+                code,
+                record=record,
+                severity="warning" if historical else "error",
             )
 
     known_market_ids = {
@@ -698,6 +718,10 @@ def _check_id_arrays(
                     "arbitrage_signals", row, ("id",), "market_ids_json"
                 ),
             )
+
+
+def _is_historical_migration_generation(value: object) -> bool:
+    return isinstance(value, str) and value.startswith("migration-v3-")
 
 
 def _check_json_payloads(

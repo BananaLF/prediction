@@ -673,6 +673,39 @@ async def test_complete_generation_accepts_parentless_market(
     assert len(queue.items) == 1
 
 
+async def test_complete_generation_rebuilds_reverse_index_from_market_parent(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    orphan = _snapshot("market-orphan")
+    orphan = replace(
+        orphan,
+        market=replace(orphan.market, event_id=None),
+    )
+    queue = _RecordingQueue(catalog)
+    task = SyncMarketTask(
+        gateway=_FakeGateway(
+            events=(_event(("market-orphan",)),),
+            markets=(orphan,),
+        ),
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 105,
+        generation_factory=lambda: "sync-orphan-reverse-index",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is True
+    stored_event = await catalog.get_event("event-1")
+    stored_market = await catalog.get_market("market-orphan")
+    assert stored_event is not None
+    assert stored_event.market_ids == ()
+    assert stored_market is not None
+    assert stored_market.event_id is None
+
+
 async def test_prepare_complete_missing_events_is_linear() -> None:
     event_count = 20_000
     market_count = 10_000

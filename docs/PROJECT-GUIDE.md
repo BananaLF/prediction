@@ -104,6 +104,11 @@ because their `TEXT` ordering is lexical rather than numeric.
 when its event response is absent. `events.market_ids` is a derived reverse
 index rebuilt from locally stored markets; an event may therefore have an
 empty list. A market without an event is not a database integrity violation.
+For legacy Schema v3 imports that preserve an event-side list without a
+matching market-side `event_id`, `doctor` reports
+`HISTORICAL_EVENT_MARKETS_MISMATCH` as a warning with affected records and
+counts. It does not rewrite or delete those rows: back up the database and
+refetch authoritative data before applying any production repair.
 During startup, an incomplete sync does not block `Watch` when the committed
 database already contains at least one active, orderbook-enabled market with a
 token. Sync remains a degraded background task until a complete generation is
