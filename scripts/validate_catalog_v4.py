@@ -6,6 +6,7 @@ import argparse
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
 import sqlite3
@@ -62,7 +63,13 @@ class ProbeOptions:
 
 
 def parse_args(argv: Sequence[str]) -> ProbeOptions:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=(
+            "Exit codes: 0 means the validation passed, 1 means the report "
+            "contains failed checks, and 2 means the probe could not run."
+        ),
+    )
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--duration-seconds", default=1800, type=int)
     parser.add_argument("--interval-seconds", default=30, type=int)
@@ -85,20 +92,29 @@ def parse_args(argv: Sequence[str]) -> ProbeOptions:
     )
 
 
+def _resolved_database_path(database: Path) -> Path:
+    try:
+        return Path(database).expanduser().resolve(strict=False)
+    except OSError as error:
+        raise ProbeUnavailableError(f"cannot resolve database: {error}") from error
+
+
 def open_read_only(database: Path) -> sqlite3.Connection:
-    database_path = Path(database)
+    database_path = _resolved_database_path(database)
     if not database_path.is_file():
         raise ProbeUnavailableError(f"database does not exist: {database_path}")
     try:
         wal_path = database_path.with_name(database_path.name + "-wal")
         shm_path = database_path.with_name(database_path.name + "-shm")
-        query = "mode=ro"
-        if not wal_path.exists() and not shm_path.exists():
-            query += "&immutable=1"
-        connection = sqlite3.connect(
-            f"file:{database_path.resolve()}?{query}",
-            uri=True,
-        )
+        immutable = not wal_path.exists() and not shm_path.exists()
+        query = "mode=ro" + ("&immutable=1" if immutable else "")
+        connection = sqlite3.connect(f"file:{database_path}?{query}", uri=True)
+        if immutable and (wal_path.exists() or shm_path.exists()):
+            connection.close()
+            connection = sqlite3.connect(
+                f"file:{database_path}?mode=ro",
+                uri=True,
+            )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only = ON")
         return connection
@@ -113,7 +129,8 @@ def _now() -> datetime:
 
 
 def _read_wal_size(database: Path) -> int:
-    wal_path = database.with_name(database.name + "-wal")
+    database_path = _resolved_database_path(database)
+    wal_path = database_path.with_name(database_path.name + "-wal")
     try:
         return wal_path.stat().st_size if wal_path.exists() else 0
     except OSError as error:
@@ -248,7 +265,7 @@ def _catalog_checks(
         )
     )
     catalog["schema_objects_available"] = not missing_tables and not missing_views
-    if "catalog_state" not in objects["table"] or "catalog_generations" not in objects["table"]:
+    if not catalog["schema_objects_available"]:
         return checks, catalog
 
     state_row = connection.execute(
@@ -317,15 +334,31 @@ def _catalog_checks(
             if row[0] is not None
         )
     catalog["visible_generations"] = sorted(generation_values)
-    checks.append(
-        _pass_or_fail(
-            "CATALOG_GENERATION_CONSISTENT",
-            "CATALOG_GENERATION_INCONSISTENT",
-            len(generation_values) <= 1,
-            sorted(generation_values),
-            "at most one visible generation",
-        )
+    active_sync_generation = (
+        str(active_row["sync_generation"])
+        if active_row is not None
+        else None
     )
+    if not generation_values:
+        checks.append(
+            _check(
+                "CATALOG_GENERATION_EMPTY",
+                "fail",
+                [],
+                {"active_generation": active_sync_generation},
+            )
+        )
+    else:
+        checks.append(
+            _pass_or_fail(
+                "CATALOG_GENERATION_CONSISTENT",
+                "CATALOG_GENERATION_INCONSISTENT",
+                active_sync_generation is not None
+                and generation_values == {active_sync_generation},
+                sorted(generation_values),
+                {"active_generation": active_sync_generation},
+            )
+        )
 
     candidate_records: list[dict[str, Any]] = []
     invalid_candidate_records: list[dict[str, Any]] = []
@@ -434,7 +467,7 @@ def _catalog_checks(
     runtime_revision = int(state_row["runtime_revision"]) if state_row else 0
     journal_boundary = int(
         connection.execute(
-            """
+            f"""
             SELECT COALESCE(MIN(base_runtime_revision), ?)
             FROM catalog_generations WHERE status = 'STAGING'
             """,
@@ -529,7 +562,8 @@ def _catalog_checks(
         )
     )
 
-    marker = database.with_name(f".{database.name}.v4-migration.json")
+    database_path = _resolved_database_path(database)
+    marker = database_path.with_name(f".{database_path.name}.v4-migration.json")
     marker_payload: Any = None
     marker_ok = True
     if marker.exists():
@@ -581,7 +615,10 @@ def classify_return_evidence(
         or calculation.get("simulated") is True
     ):
         return "simulated"
-    if orderbook is not None and orderbook.get("status") == "observed":
+    if orderbook is not None and (
+        orderbook.get("status") == "observed"
+        and orderbook.get("executable", {}).get("status") in {"pass", "not_applicable"}
+    ):
         return "orderbook_checked_estimate"
     return "theoretical_estimate"
 
@@ -629,11 +666,17 @@ def _collect_orderbook(
     connection: sqlite3.Connection,
     signal_id: str,
     revision: int,
+    start_epoch: int,
+    end_epoch: int,
+    *,
+    include_start: bool,
+    legs: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
+    start_operator = ">=" if include_start else ">"
     rows = [
         dict(row)
         for row in connection.execute(
-            """
+            f"""
             SELECT orderbook_snapshots.id, orderbook_snapshots.market_id,
                    orderbook_snapshots.token_id,
                    orderbook_snapshots.subscription_generation,
@@ -649,15 +692,31 @@ def _collect_orderbook(
              AND tokens.market_id = orderbook_snapshots.market_id
             WHERE orderbook_snapshots.signal_id = ?
               AND orderbook_snapshots.revision = ?
+              AND orderbook_snapshots.received_timestamp {start_operator} ?
+              AND orderbook_snapshots.received_timestamp <= ?
             ORDER BY orderbook_snapshots.id
             LIMIT ?
             """,
-            (signal_id, revision, MAX_RECORDS),
+            (signal_id, revision, start_epoch, end_epoch, MAX_RECORDS),
         )
     ]
     snapshots: list[dict[str, Any]] = []
+    level_rows_by_snapshot: dict[str, list[dict[str, Any]]] = {}
     valid = bool(rows)
     for row in rows:
+        level_rows = [
+            dict(level)
+            for level in connection.execute(
+                """
+                SELECT side, position, price, size
+                FROM orderbook_levels
+                WHERE snapshot_id = ?
+                ORDER BY side, position
+                """,
+                (row["id"],),
+            )
+        ]
+        level_rows_by_snapshot[str(row["id"])] = level_rows
         levels = [
             dict(level)
             for level in connection.execute(
@@ -705,10 +764,87 @@ def _collect_orderbook(
         )
     if not rows:
         return {"status": "not_observed", "snapshot_ids": [], "snapshots": []}
+    executable_checks: list[dict[str, Any]] = []
+    executable_legs = [
+        leg for leg in legs if leg.get("action") in {"BUY", "SELL"}
+    ]
+    for leg in executable_legs:
+        matching_snapshots = [
+            (snapshot, level_rows_by_snapshot[str(snapshot["snapshot_id"])])
+            for snapshot in snapshots
+            if snapshot["market_id"] == leg.get("market_id")
+            and snapshot["token_id"] == leg.get("token_id")
+        ]
+        if not matching_snapshots:
+            executable_checks.append(
+                {
+                    "leg_id": leg.get("leg_id"),
+                    "status": "fail",
+                    "reason": "snapshot_missing_for_leg",
+                }
+            )
+            continue
+        snapshot, level_rows = max(
+            matching_snapshots,
+            key=lambda item: int(item[0]["received_timestamp"]),
+        )
+        side = "ASK" if leg["action"] == "BUY" else "BID"
+        side_rows = [row for row in level_rows if row["side"] == side]
+        try:
+            quantity = Decimal(str(leg["quantity"]))
+            minimum_order_size = Decimal(str(snapshot["minimum_order_size"]))
+            worst_price = Decimal(str(leg["worst_price"]))
+            available = sum(Decimal(str(row["size"])) for row in side_rows)
+            ordered_rows = sorted(
+                side_rows,
+                key=lambda row: Decimal(str(row["price"])),
+                reverse=leg["action"] == "SELL",
+            )
+            remaining = quantity
+            price_within_worst = True
+            for row in ordered_rows:
+                price = Decimal(str(row["price"]))
+                if (leg["action"] == "BUY" and price > worst_price) or (
+                    leg["action"] == "SELL" and price < worst_price
+                ):
+                    price_within_worst = False
+                    break
+                remaining -= min(remaining, Decimal(str(row["size"])))
+                if remaining <= 0:
+                    break
+            reasons: list[str] = []
+            if quantity < minimum_order_size:
+                reasons.append("below_minimum_order_size")
+            if available < quantity:
+                reasons.append("insufficient_depth")
+            if remaining > 0:
+                reasons.append("quantity_not_fillable")
+            if not price_within_worst:
+                reasons.append("outside_worst_price")
+        except (InvalidOperation, TypeError, ValueError):
+            reasons = ["invalid_decimal_evidence"]
+        executable_checks.append(
+            {
+                "leg_id": leg.get("leg_id"),
+                "status": "pass" if not reasons else "fail",
+                "side": side,
+                "reasons": reasons,
+                "snapshot_id": snapshot["snapshot_id"],
+            }
+        )
+    executable_status = (
+        "not_applicable"
+        if not executable_legs
+        else "pass"
+        if all(check["status"] == "pass" for check in executable_checks)
+        else "fail"
+    )
+    executable = {"status": executable_status, "checks": executable_checks}
     return {
         "status": "observed" if valid else "incomplete",
         "snapshot_ids": [row["id"] for row in rows],
         "snapshots": snapshots,
+        "executable": executable,
     }
 
 
@@ -717,8 +853,12 @@ def collect_signal_evidence(
     signal_ids: Sequence[str],
     window_start: datetime,
     observed_at: datetime,
+    *,
+    include_start: bool = True,
 ) -> list[dict[str, Any]]:
-    del window_start, observed_at
+    start_epoch = _epoch(window_start)
+    end_epoch = _epoch(observed_at)
+    start_operator = ">=" if include_start else ">"
     signals: list[dict[str, Any]] = []
     for signal_id in signal_ids[:MAX_RECORDS]:
         signal_row = connection.execute(
@@ -732,18 +872,27 @@ def collect_signal_evidence(
         ).fetchone()
         if signal_row is None:
             continue
-        revision_number = int(signal_row["latest_revision"])
+        current_revision_number = int(signal_row["latest_revision"])
         revision_row = connection.execute(
-            """
+            f"""
             SELECT revision, event_type, observed_at, quantity, total_capital,
                    expected_profit, return_rate, worst_case_loss, risk_rate,
                    unhedged_notional, risk_flags_json, calculation_json,
                    closure_context_json
             FROM signal_revisions
-            WHERE signal_id = ? AND revision = ?
+            WHERE signal_id = ?
+              AND observed_at {start_operator} ?
+              AND observed_at <= ?
+            ORDER BY revision DESC
+            LIMIT 1
             """,
-            (signal_id, revision_number),
+            (signal_id, start_epoch, end_epoch),
         ).fetchone()
+        revision_number = (
+            int(revision_row["revision"])
+            if revision_row is not None
+            else current_revision_number
+        )
         if revision_row is None:
             revision: dict[str, Any] = {"status": "not_observed", "revision": revision_number}
         else:
@@ -787,8 +936,20 @@ def collect_signal_evidence(
                 """,
                 (signal_id, revision_number, MAX_RECORDS),
             )
-        ]
-        orderbook = _collect_orderbook(connection, signal_id, revision_number)
+        ] if revision_row is not None else []
+        orderbook = (
+            _collect_orderbook(
+                connection,
+                signal_id,
+                revision_number,
+                start_epoch,
+                end_epoch,
+                include_start=include_start,
+                legs=legs,
+            )
+            if revision_row is not None
+            else {"status": "not_observed", "snapshot_ids": [], "snapshots": []}
+        )
         signal = {
             "signal_id": signal_row["id"],
             "opportunity_key": signal_row["opportunity_key"],
@@ -842,10 +1003,29 @@ def collect_runtime_evidence(
             (start_epoch, end_epoch, MAX_RECORDS),
         )
     ]
-    event_counts = Counter(
-        (event["component"], event["severity"], event["event_type"])
-        for event in events
+    event_count_rows = connection.execute(
+        f"""
+        SELECT component, severity, event_type, COUNT(*) AS count
+        FROM system_events
+        WHERE occurred_at {start_operator} ? AND occurred_at <= ?
+        GROUP BY component, severity, event_type
+        ORDER BY component, severity, event_type
+        """,
+        (start_epoch, end_epoch),
     )
+    alert_total = int(
+        connection.execute(
+            f"""
+            SELECT COUNT(*) FROM system_events
+            WHERE occurred_at {start_operator} ? AND occurred_at <= ?
+              AND severity IN ('WARNING', 'ERROR', 'FATAL')
+            """,
+            (start_epoch, end_epoch),
+        ).fetchone()[0]
+    )
+    alerts = [
+        event for event in events if event["severity"] in {"WARNING", "ERROR", "FATAL"}
+    ]
     orderbook_count = int(
         connection.execute(
             f"""
@@ -883,12 +1063,17 @@ def collect_runtime_evidence(
         "window": {"start": _iso(window_start), "end": _iso(observed_at)},
         "system_events": events,
         "event_counts": [
-            {"component": key[0], "severity": key[1], "event_type": key[2], "count": count}
-            for key, count in sorted(event_counts.items())
+            {
+                "component": row["component"],
+                "severity": row["severity"],
+                "event_type": row["event_type"],
+                "count": row["count"],
+            }
+            for row in event_count_rows
         ],
-        "alerts": [
-            event for event in events if event["severity"] in {"WARNING", "ERROR", "FATAL"}
-        ],
+        "alerts": alerts,
+        "alerts_total": alert_total,
+        "alerts_truncated": alert_total > len(alerts),
         "signal_revision_count": revision_count,
         "orderbook_snapshot_count": orderbook_count,
         "catalog_runtime_change_count": runtime_change_count,
@@ -912,6 +1097,8 @@ def collect_catalog_sample(
             "system_events": [],
             "event_counts": [],
             "alerts": [],
+            "alerts_total": 0,
+            "alerts_truncated": False,
             "signal_revision_count": 0,
             "orderbook_snapshot_count": 0,
             "catalog_runtime_change_count": 0,
@@ -930,6 +1117,7 @@ def collect_catalog_sample(
             runtime["signal_ids"],
             window_start,
             observed_at,
+            include_start=include_start,
         )
     if signals:
         for signal in signals:
@@ -943,6 +1131,18 @@ def collect_catalog_sample(
                             "orderbook_status": signal["orderbook"]["status"],
                         },
                         "observed orderbook metadata and BID/ASK levels",
+                    )
+                )
+            elif signal["orderbook"]["executable"]["status"] == "fail":
+                checks.append(
+                    _check(
+                        "ORDERBOOK_EXECUTION_CHECK_FAILED",
+                        "fail",
+                        {
+                            "signal_id": signal["signal_id"],
+                            "checks": signal["orderbook"]["executable"]["checks"],
+                        },
+                        "all executable legs satisfy local quantity, depth, side, and worst-price checks",
                     )
                 )
     checks.append(
@@ -996,8 +1196,9 @@ def build_report(
         for signal in sample.get("signals", [])
     )
     runtime_events = sum(
-        len(sample.get("runtime", {}).get("system_events", []))
+        int(event_count["count"])
         for sample in samples
+        for event_count in sample.get("runtime", {}).get("event_counts", [])
     )
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -1052,16 +1253,20 @@ def sample_window(
     while True:
         observed_at = clock().astimezone(timezone.utc)
         with open_read_only(database) as connection:
-            samples.append(
-                collect_catalog_sample(
-                    connection,
-                    database,
-                    observed_at,
-                    wal_reader(database),
-                    window_start=window_start,
-                    include_start=include_start,
+            connection.execute("BEGIN")
+            try:
+                samples.append(
+                    collect_catalog_sample(
+                        connection,
+                        database,
+                        observed_at,
+                        wal_reader(database),
+                        window_start=window_start,
+                        include_start=include_start,
+                    )
                 )
-            )
+            finally:
+                connection.rollback()
         if options.duration_seconds == 0 or observed_at.timestamp() >= deadline:
             break
         window_start = observed_at
@@ -1106,9 +1311,26 @@ def write_report(path: Path, report: Mapping[str, Any]) -> None:
         raise ProbeOutputError(str(error)) from error
 
 
+def _validate_output_path(output: Path, database: Path) -> None:
+    output_path = Path(output).expanduser().resolve(strict=False)
+    database_path = _resolved_database_path(database)
+    protected_paths = {
+        database_path,
+        database_path.with_name(database_path.name + "-wal"),
+        database_path.with_name(database_path.name + "-shm"),
+        database_path.with_name(f".{database_path.name}.v4-migration.json"),
+    }
+    if output_path in protected_paths:
+        raise ProbeOutputError(
+            f"output path must not overwrite database artifacts: {output}"
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         options = parse_args(sys.argv[1:] if argv is None else argv)
+        if options.output is not None:
+            _validate_output_path(options.output, options.database)
         report = run_probe(options)
         if options.output is not None:
             write_report(options.output, report)

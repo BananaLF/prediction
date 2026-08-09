@@ -228,11 +228,74 @@ def test_parse_args_requires_database_and_rejects_non_positive_interval() -> Non
         module.parse_args(["--interval-seconds", "0"])
 
 
+def test_cli_help_documents_exit_codes(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as error:
+        module.parse_args(["--help"])
+
+    assert error.value.code == 0
+    assert "exit codes" in capsys.readouterr().out.lower()
+
+
 def test_open_read_only_does_not_create_missing_database(tmp_path: Path) -> None:
     database = tmp_path / "missing.sqlite3"
     with pytest.raises(module.ProbeUnavailableError):
         module.open_read_only(database)
     assert not database.exists()
+
+
+def test_open_read_only_resolves_symlink_before_reading_wal(tmp_path: Path) -> None:
+    database = make_v4_database(tmp_path / "target.sqlite3", generation="g1")
+    symlink = tmp_path / "catalog.sqlite3"
+    symlink.symlink_to(database)
+    wal_path = Path(f"{database}-wal")
+    wal_path.write_bytes(b"wal")
+
+    assert module._read_wal_size(symlink) == 3
+
+
+def test_output_cannot_overwrite_database_artifacts(tmp_path: Path) -> None:
+    database = make_v4_database(tmp_path / "catalog.sqlite3", generation="g1")
+    marker = database.with_name(f".{database.name}.v4-migration.json")
+    marker.write_text('{"stage":"COMPLETE"}\n', encoding="utf-8")
+    output_paths = [
+        database,
+        Path(f"{database}-wal"),
+        Path(f"{database}-shm"),
+        marker,
+    ]
+
+    for output_path in output_paths:
+        if not output_path.exists():
+            output_path.write_bytes(b"sentinel")
+        before = output_path.read_bytes()
+        assert module.main(
+            [
+                "--database",
+                str(database),
+                "--duration-seconds",
+                "0",
+                "--output",
+                str(output_path),
+            ]
+        ) == 2
+        assert output_path.read_bytes() == before
+
+
+def test_sample_queries_run_in_one_read_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = make_v4_database(tmp_path / "snapshot.sqlite3", generation="g1")
+    transaction_states: list[bool] = []
+    original = module.collect_catalog_sample
+
+    def wrapped(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        transaction_states.append(args[0].in_transaction)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "collect_catalog_sample", wrapped)
+    run_single(database)
+
+    assert transaction_states == [True]
 
 
 def test_duration_zero_produces_one_sample_without_output_side_effect(tmp_path: Path) -> None:
@@ -284,6 +347,9 @@ def test_open_read_only_does_not_create_sidecars_for_checkpointed_database(
 
 def test_healthy_v4_sample_reports_schema_integrity_generation_and_wal(tmp_path: Path) -> None:
     database = make_v4_database(tmp_path / "healthy.sqlite3", generation="g1")
+    with sqlite3.connect(database) as connection:
+        _seed_catalog_rows(connection)
+        connection.commit()
     sample = run_single(database, wal_bytes=4096)["samples"][0]
 
     assert codes(sample) >= {
@@ -294,6 +360,27 @@ def test_healthy_v4_sample_reports_schema_integrity_generation_and_wal(tmp_path:
         "WAL_SIZE",
     }
     assert all(check["status"] == "pass" for check in sample["checks"])
+
+
+def test_empty_catalog_views_fail_generation_validation(tmp_path: Path) -> None:
+    database = make_v4_database(tmp_path / "empty.sqlite3", generation="g1")
+
+    report = run_single(database)
+
+    assert "CATALOG_GENERATION_EMPTY" in failure_codes(report)
+    assert report["exit_code"] == 1
+
+
+def test_missing_schema_objects_are_reported_without_query_error(tmp_path: Path) -> None:
+    database = make_v4_database(tmp_path / "missing-table.sqlite3", generation="g1")
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE system_events")
+        connection.commit()
+
+    report = run_single(database)
+
+    assert "SCHEMA_OBJECT_MISSING" in failure_codes(report)
+    assert report["exit_code"] == 1
 
 
 @pytest.mark.parametrize(
@@ -359,6 +446,23 @@ def test_missing_orderbook_metadata_is_not_reported_as_executable(tmp_path: Path
     assert "ORDERBOOK_METADATA_UNAVAILABLE" in failure_codes(report)
 
 
+def test_orderbook_depth_failure_downgrades_estimate(tmp_path: Path) -> None:
+    database = make_v4_database(tmp_path / "shallow-book.sqlite3", generation="g1")
+    seed_signal_revision_legs_orderbook_and_event(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE orderbook_levels SET size = '0.5' WHERE snapshot_id = 'snapshot-1' AND side = 'ASK'"
+        )
+        connection.commit()
+
+    report = run_single(database)
+    signal = report["samples"][0]["signals"][0]
+
+    assert signal["evidence_class"] == "theoretical_estimate"
+    assert signal["orderbook"]["executable"]["status"] == "fail"
+    assert "ORDERBOOK_EXECUTION_CHECK_FAILED" in failure_codes(report)
+
+
 def test_realized_is_always_unsupported_without_fill_source(tmp_path: Path) -> None:
     database = make_v4_database(tmp_path / "realized.sqlite3", generation="g1")
     seed_signal_revision_legs_orderbook_and_event(database)
@@ -402,8 +506,71 @@ def test_window_evidence_is_not_counted_again_at_each_sample(tmp_path: Path) -> 
     assert report["aggregates"]["runtime"]["system_event_count"] == 1
 
 
+def test_runtime_event_counts_include_records_beyond_report_limit(tmp_path: Path) -> None:
+    database = make_v4_database(tmp_path / "many-events.sqlite3", generation="g1")
+    timestamp = 1_786_233_600
+    with sqlite3.connect(database) as connection:
+        connection.executemany(
+            """
+            INSERT INTO system_events (
+                component, severity, event_type, message, details_json, occurred_at
+            ) VALUES ('SYNC', 'WARNING', 'RETRY', 'retry', NULL, ?)
+            """,
+            [(timestamp,) for _ in range(module.MAX_RECORDS + 1)],
+        )
+        connection.commit()
+
+    report = run_single(database)
+    runtime = report["samples"][0]["runtime"]
+
+    assert len(runtime["system_events"]) == module.MAX_RECORDS
+    assert runtime["event_counts"] == [
+        {
+            "component": "SYNC",
+            "severity": "WARNING",
+            "event_type": "RETRY",
+            "count": module.MAX_RECORDS + 1,
+        }
+    ]
+    assert runtime["alerts_total"] == module.MAX_RECORDS + 1
+    assert runtime["alerts_truncated"] is True
+    assert report["aggregates"]["runtime"]["system_event_count"] == module.MAX_RECORDS + 1
+
+
+def test_signal_evidence_uses_revision_and_orderbook_inside_window(
+    tmp_path: Path,
+) -> None:
+    database = make_v4_database(tmp_path / "revision-window.sqlite3", generation="g1")
+    seed_signal_revision_legs_orderbook_and_event(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            INSERT INTO signal_revisions (
+                signal_id, revision, event_type, observed_at, quantity,
+                total_capital, expected_profit, return_rate, worst_case_loss,
+                risk_rate, unhedged_notional, risk_flags_json, calculation_json
+            ) VALUES ('signal-1', 2, 'UPDATED', ?, '1', '0.5', '0.2', '0.4',
+                      '0', '0', '0', '[]', '{}')
+            """,
+            (1_786_233_600 + 120,),
+        )
+        connection.execute(
+            "UPDATE arbitrage_signals SET latest_revision = 2 WHERE id = 'signal-1'"
+        )
+        connection.commit()
+
+    signal = run_single(database)["samples"][0]["signals"][0]
+
+    assert signal["latest_revision"] == 1
+    assert signal["revision"]["observed_at"] == 1_786_233_600
+    assert signal["orderbook"]["snapshot_ids"] == ["snapshot-1"]
+
+
 def test_report_has_stable_top_level_keys_and_bounded_summaries(tmp_path: Path) -> None:
     database = make_v4_database(tmp_path / "report.sqlite3", generation="g1")
+    with sqlite3.connect(database) as connection:
+        _seed_catalog_rows(connection)
+        connection.commit()
     report_path = tmp_path / "reports" / "catalog.json"
     report_path.parent.mkdir()
 
