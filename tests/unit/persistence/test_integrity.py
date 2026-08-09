@@ -578,6 +578,44 @@ def test_integrity_rejects_bad_risk_formula(tmp_path: Path) -> None:
     _assert_violation(database_path, "RISK_FORMULA_INVALID")
 
 
+def test_integrity_accepts_risk_formula_at_persisted_precision(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+    _corrupt(
+        database_path,
+        """
+        UPDATE signal_revisions
+        SET total_capital = '3',
+            worst_case_loss = '1',
+            risk_rate = '0.3333333333333333333333333333333333333333'
+        WHERE signal_id = 'signal-1'
+        """,
+    )
+
+    check_database_integrity(database_path)
+
+
+def test_integrity_rejects_risk_formula_mismatch_at_persisted_precision(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    _seed_valid_database(database_path)
+    _corrupt(
+        database_path,
+        """
+        UPDATE signal_revisions
+        SET total_capital = '3',
+            worst_case_loss = '1',
+            risk_rate = '0.3333333333333333333333333333333333333334'
+        WHERE signal_id = 'signal-1'
+        """,
+    )
+
+    _assert_violation(database_path, "RISK_FORMULA_INVALID")
+
+
 def test_integrity_rejects_stale_latest_revision(tmp_path: Path) -> None:
     database_path = tmp_path / "market.db"
     _seed_valid_database(database_path)

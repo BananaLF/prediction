@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, localcontext
 import json
 from pathlib import Path
 import sqlite3
@@ -866,7 +866,11 @@ def _check_decimals(
             risk_rate = parse_decimal(row["risk_rate"])
         except ValueError:
             continue
-        if total_capital == 0 or risk_rate != worst_case_loss / total_capital:
+        if total_capital == 0 or not _risk_rate_matches_persisted_precision(
+            worst_case_loss,
+            total_capital,
+            risk_rate,
+        ):
             _add(
                 violations,
                 "RISK_FORMULA_INVALID",
@@ -877,6 +881,27 @@ def _check_decimals(
                     "risk_rate",
                 ),
             )
+
+
+def _risk_rate_matches_persisted_precision(
+    worst_case_loss: Decimal,
+    total_capital: Decimal,
+    risk_rate: Decimal,
+) -> bool:
+    """Check a stored ratio at the precision represented by ``risk_rate``.
+
+    Strategy calculations use an input-derived Decimal context and persist the
+    resulting coefficient without a separate precision marker. Recomputing at
+    the process-wide default precision can therefore reject a value that was
+    produced by the strategy itself. The stored coefficient length is the
+    available precision contract at this validation boundary.
+    """
+
+    precision = max(1, len(risk_rate.as_tuple().digits))
+    with localcontext() as context:
+        context.prec = precision
+        expected = worst_case_loss / total_capital
+    return risk_rate == expected
 
 
 def _check_decimal_columns(
