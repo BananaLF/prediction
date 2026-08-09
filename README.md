@@ -135,6 +135,11 @@ predmarket doctor --database data/predmarket-v1.sqlite3
 
 `doctor` 会报告 schema、SQLite 完整性、孤立 market、没有 market 的 event 和可 watch catalog；孤立 market 在关系合法且具备 token 时不是完整性错误。
 
+从 Schema v3 迁移而来的历史 catalog 如果保留了 event 侧市场列表、但 market 侧没有对应
+`event_id`，`doctor` 会以 `HISTORICAL_EVENT_MARKETS_MISMATCH` warning 列出受影响 event
+及数量。这类记录不自动修复或删除；`markets.event_id` 仍是关系事实，生产修复前应备份数据库，
+重新获取权威 market/event 数据后再按唯一关系执行修复。
+
 `status`、`signals` 和 `relations list/show` 要求数据库已经由 `run` 初始化；数据库不存在或尚未完成初始化时，先初始化或迁移数据库。
 
 reset 使用独立脚本，不提供 `predmarket reset` 子命令。执行前必须先停止运行中的服务，先检查 dry-run 输出的绝对路径，确认目标后再使用 `--execute`：
