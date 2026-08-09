@@ -839,8 +839,6 @@ def _validate_complete_source(
     old_event_ids = {event.id for event in previous.events}
     for snapshot in snapshots:
         market = snapshot.market
-        if market.event_id is None:
-            return f"market {market.id} has no parent event"
         authoritative_resolved = (
             market.status is MarketStatus.RESOLVED
             and market.resolved_at is not None

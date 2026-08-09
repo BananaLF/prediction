@@ -490,10 +490,6 @@ def _validate_v4_connection(connection: sqlite3.Connection) -> None:
     ).fetchall()
     if active != [("COMMITTED",)]:
         raise ValueError("v4 active catalog generation is invalid")
-    if connection.execute(
-        "SELECT COUNT(*) FROM markets WHERE event_id IS NULL"
-    ).fetchone()[0]:
-        raise ValueError("v4 catalog contains parentless markets")
 
 
 def _install_validated_v4(marker: _Marker) -> _Marker:

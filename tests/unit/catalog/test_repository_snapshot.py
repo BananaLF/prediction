@@ -97,7 +97,7 @@ async def test_catalog_snapshot_materialization_runs_off_event_loop_thread(
     assert materialization_threads[0] is not event_loop_thread
 
 
-async def test_catalog_repository_rejects_orphan_market_then_rebuilds_event_index(
+async def test_catalog_repository_accepts_orphan_market_then_rebuilds_event_index(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "catalog.db"
@@ -133,14 +133,17 @@ async def test_catalog_repository_rejects_orphan_market_then_rebuilds_event_inde
         sync_generation_complete=True,
     )
     try:
-        with pytest.raises(CatalogConstraintError, match="parent"):
-            await catalog.save_catalog(
-                events=(event,),
-                markets=(orphan,),
-                tokens=(token,),
-            )
-        assert await catalog.load_catalog() == repositories_module.CatalogSnapshot(
-            (), (), ()
+        await catalog.save_catalog(
+            events=(event,),
+            markets=(orphan,),
+            tokens=(token,),
+        )
+        stored_event = await catalog.get_event(event.id)
+        assert stored_event is not None
+        assert stored_event.market_ids == ()
+        assert (await catalog.get_market(orphan.id)) == replace(
+            orphan,
+            sync_generation="bootstrap-v4",
         )
 
         linked = Market(

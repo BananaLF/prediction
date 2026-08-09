@@ -46,7 +46,7 @@ def _create_v3(path: Path, *, seeded: bool = False) -> None:
                 neg_risk_conversion_supported, market_ids_json,
                 sync_generation, sync_generation_complete, created_at, updated_at
             ) VALUES ('event-1', 'Event', 'ACTIVE', 0, 0, 0,
-                      '["market-1","market-2"]', 'sync-1', 1, 1, 2);
+                      '["market-1"]', 'sync-1', 1, 1, 2);
             INSERT INTO markets (
                 id, event_id, condition_id, question, status, active,
                 accepting_orders, enable_orderbook, neg_risk,
@@ -55,7 +55,7 @@ def _create_v3(path: Path, *, seeded: bool = False) -> None:
             ) VALUES
                 ('market-1', 'event-1', 'condition-1', 'Question 1?', 'ACTIVE',
                  1, 1, 1, 0, 0, 'sync-1', 1, 1, 2),
-                ('market-2', 'event-1', 'condition-2', 'Question 2?', 'ACTIVE',
+                ('market-2', NULL, 'condition-2', 'Question 2?', 'ACTIVE',
                  1, 1, 1, 0, 0, 'sync-1', 1, 1, 1);
             INSERT INTO tokens (
                 id, market_id, outcome, position, sync_generation,

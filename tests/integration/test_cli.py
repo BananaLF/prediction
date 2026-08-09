@@ -55,13 +55,16 @@ def _seed_doctor_issue(path: Path) -> None:
     initialize_database(path)
     with sqlite3.connect(path) as connection:
         connection.execute(
+            "INSERT INTO catalog_event_ids (id, created_at) VALUES ('event-1', 1)"
+        )
+        connection.execute(
             """
-            INSERT INTO events (
-                id, title, status, neg_risk, neg_risk_complete,
+            INSERT INTO event_versions (
+                entity_id, generation_id, title, status, neg_risk, neg_risk_complete,
                 neg_risk_conversion_supported, market_ids_json,
-                sync_generation, sync_generation_complete, created_at, updated_at
-            ) VALUES ('event-1', 'Event', 'ACTIVE', 0, 0, 0,
-                      '["market-1",1]', 'sync-1', 1, 1, 1)
+                created_at, updated_at
+            ) VALUES ('event-1', 1, 'Event', 'ACTIVE', 0, 0, 0,
+                      '["market-1",1]', 1, 1)
             """
         )
 
@@ -276,13 +279,18 @@ def test_doctor_reports_legal_orphans_without_failing(tmp_path: Path) -> None:
     with sqlite3.connect(database_path) as connection:
         connection.execute(
             """
-            INSERT INTO markets (
-                id, event_id, condition_id, question, status, active,
+            INSERT INTO catalog_market_ids (id, event_id, created_at)
+            VALUES ('market-orphan', NULL, 1)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO market_versions (
+                entity_id, generation_id, condition_id, question, status, active,
                 accepting_orders, enable_orderbook, neg_risk,
-                neg_risk_member_complete, sync_generation,
-                sync_generation_complete, created_at, updated_at
-            ) VALUES ('market-orphan', NULL, 'condition-orphan', 'Orphan?',
-                      'ACTIVE', 1, 1, 1, 0, 0, 'sync-1', 1, 1, 1)
+                neg_risk_member_complete, created_at, updated_at
+            ) VALUES ('market-orphan', 1, 'condition-orphan', 'Orphan?',
+                      'ACTIVE', 1, 1, 1, 0, 0, 1, 1)
             """
         )
 
@@ -292,6 +300,6 @@ def test_doctor_reports_legal_orphans_without_failing(tmp_path: Path) -> None:
         stdout=output,
     ) == 0
     report = json.loads(output.getvalue())
-    assert report["schema_version"] == 3
+    assert report["schema_version"] == 4
     assert report["orphan_markets"] == 1
     assert report["violations"] == []

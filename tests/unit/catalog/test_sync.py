@@ -637,7 +637,7 @@ async def test_pending_reconciliation_is_republished_before_remote_fetch(
     assert await system_events.list_pending_catalog_reconciliations() == ()
 
 
-async def test_complete_generation_rejects_parentless_market(
+async def test_complete_generation_accepts_parentless_market(
     catalog_runtime,
 ) -> None:
     catalog, system_events = catalog_runtime
@@ -661,15 +661,16 @@ async def test_complete_generation_rejects_parentless_market(
 
     result = await task.run_once()
 
-    assert result.complete is False
-    assert result.error == "market market-orphan has no parent event"
-    assert result.markets_persisted == 0
+    assert result.complete is True
+    assert result.error is None
+    assert result.markets_persisted == 1
     stored_event = await catalog.get_event("event-1")
     stored_market = await catalog.get_market("market-orphan")
     assert stored_event is not None
     assert stored_event.market_ids == ()
-    assert stored_market is None
-    assert queue.items == []
+    assert stored_market is not None
+    assert stored_market.event_id is None
+    assert len(queue.items) == 1
 
 
 async def test_prepare_complete_missing_events_is_linear() -> None:

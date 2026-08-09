@@ -213,6 +213,41 @@ async def test_v4_repository_runs_stage_validate_activate_and_unique_outbox(
     assert pending[0].market_ids == ("market-1",)
 
 
+async def test_v4_generation_accepts_market_without_event_relation(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    coordinator = CatalogGenerationCoordinator(_V4Writer(database_path))
+    value = _input("sync-standalone", title="Standalone")
+    standalone_event = replace(value.events[0], market_ids=())
+    standalone_market = replace(value.markets[0], event_id=None)
+    standalone = replace(
+        value,
+        events=(standalone_event,),
+        markets=(standalone_market,),
+        input_digest=catalog_input_digest(
+            sync_generation=value.sync_generation,
+            updated_at=value.updated_at,
+            events=(standalone_event,),
+            markets=(standalone_market,),
+            tokens=value.tokens,
+        ),
+    )
+
+    generation = await coordinator.stage(standalone)
+    await coordinator.activate(
+        await coordinator.validate_candidate(generation),
+        None,
+    )
+
+    snapshot = await CatalogRepository(
+        database_path,
+        _V4Writer(database_path),  # type: ignore[arg-type]
+    ).load_catalog()
+    assert snapshot.markets[0].event_id is None
+
+
 async def test_effective_candidate_inherits_unchanged_committed_payloads(
     tmp_path: Path,
 ) -> None:

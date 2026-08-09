@@ -619,6 +619,41 @@ class CatalogGenerationCoordinator:
                 )
             sync_generation = str(row[0])
             base_generation_id = int(row[1])
+            effective = await _load_effective_entities(
+                connection,
+                generation_id=validation.generation_id,
+                base_generation_id=base_generation_id,
+                sync_generation=sync_generation,
+            )
+            if (
+                tuple(len(values) for values in effective) != expected[:3]
+                or _snapshot_digest(*effective) != validation.snapshot_digest
+            ):
+                raise CatalogActivationConflict(
+                    "candidate payload changed after validation"
+                )
+            staged = await _load_staged_entities(
+                connection,
+                generation_id=validation.generation_id,
+                sync_generation=sync_generation,
+            )
+            for effective_values, staged_values in zip(
+                effective,
+                staged,
+                strict=True,
+            ):
+                staged_by_id = {entity.id: entity for entity in staged_values}
+                for entity in effective_values:
+                    staged_entity = staged_by_id.get(entity.id)
+                    if staged_entity is not None and (
+                        _canonical_payload(entity)
+                        != _canonical_payload(staged_entity)
+                    ):
+                        await _upsert_entity(
+                            connection,
+                            validation.generation_id,
+                            entity,
+                        )
             cursor = await connection.execute(
                 """
                 UPDATE catalog_generations
@@ -1228,27 +1263,46 @@ async def write_runtime_catalog(
     if not any(changed):
         return None
 
-    for values in changed:
-        for entity in values:
-            if isinstance(entity, Market):
-                await connection.execute(
-                    """
-                    INSERT INTO catalog_market_ids (id, event_id, created_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET event_id = excluded.event_id
-                    """,
-                    (entity.id, entity.event_id, entity.created_at),
-                )
-            elif isinstance(entity, Token):
-                await connection.execute(
-                    """
-                    INSERT INTO catalog_token_ids (id, market_id, created_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET market_id = excluded.market_id
-                    """,
-                    (entity.id, entity.market_id, entity.created_at),
-                )
-            await _upsert_entity(connection, generation_id, entity)
+    changed_events, changed_markets, changed_tokens = changed
+    if changed_events:
+        await connection.executemany(
+            "INSERT INTO catalog_event_ids (id, created_at) VALUES (?, ?) "
+            "ON CONFLICT(id) DO NOTHING",
+            ((event.id, event.created_at) for event in changed_events),
+        )
+        await connection.executemany(
+            _UPSERT_EVENT_VERSION,
+            (_event_values(generation_id, event) for event in changed_events),
+        )
+    if changed_markets:
+        await connection.executemany(
+            """
+            INSERT INTO catalog_market_ids (id, event_id, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET event_id = excluded.event_id
+            """,
+            (
+                (market.id, market.event_id, market.created_at)
+                for market in changed_markets
+            ),
+        )
+        await connection.executemany(
+            _UPSERT_MARKET_VERSION,
+            (_market_values(generation_id, market) for market in changed_markets),
+        )
+    if changed_tokens:
+        await connection.executemany(
+            """
+            INSERT INTO catalog_token_ids (id, market_id, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET market_id = excluded.market_id
+            """,
+            ((token.id, token.market_id, token.created_at) for token in changed_tokens),
+        )
+        await connection.executemany(
+            _UPSERT_TOKEN_VERSION,
+            (_token_values(generation_id, token) for token in changed_tokens),
+        )
 
     next_revision = runtime_revision + 1
     cursor = await connection.execute(
@@ -1513,7 +1567,7 @@ async def _fetch_version_rows(
     else:
         where = f"""
         versions.generation_id = (
-            SELECT MAX(candidate.generation_id)
+            SELECT candidate.generation_id
             FROM {version_table} AS candidate
             JOIN catalog_generations AS candidate_generation
               ON candidate_generation.id = candidate.generation_id
@@ -1527,9 +1581,13 @@ async def _fetch_version_rows(
                       AND candidate_generation.status = 'COMMITTED'
                   )
               )
+            ORDER BY candidate.updated_at DESC,
+                     CASE WHEN candidate.generation_id = ? THEN 1 ELSE 0 END DESC,
+                     candidate.generation_id DESC
+            LIMIT 1
         )
         """
-        parameters = (generation_id, base_generation_id)
+        parameters = (generation_id, base_generation_id, generation_id)
     cursor = await connection.execute(
         f"""
         SELECT {columns}
@@ -1709,7 +1767,7 @@ def _validate_effective_constraints(
     )
     event_ids = {event.id for event in events}
     for market in markets:
-        if market.event_id is None or market.event_id not in event_ids:
+        if market.event_id is not None and market.event_id not in event_ids:
             raise CatalogConstraintError(
                 f"market parent event is missing for {market.id!r}"
             )
