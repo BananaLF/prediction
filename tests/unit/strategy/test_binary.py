@@ -156,6 +156,30 @@ def test_binary_overpriced_uses_split_and_net_l2_sales(
     assert [leg.action for leg in decision.legs] == [Action.SPLIT, Action.SELL, Action.SELL]
 
 
+def test_binary_overpriced_records_split_and_partial_sales_risk_scenarios(
+    context_factory, market_factory, token_factory, book_factory
+) -> None:
+    # Catches treating an unsold split inventory scenario as an execution event.
+    context = _binary_context(
+        context_factory,
+        market_factory,
+        token_factory,
+        book_factory,
+        strategy_type=StrategyType.BINARY_OVERPRICED,
+        yes_bid="0.10",
+        no_bid="0.10",
+        yes_ask="",
+        no_ask="",
+    )
+
+    decision = evaluate_binary(context)
+
+    assert isinstance(decision, OpportunityAbsent)
+    assert {"SPLIT_ONLY", "PARTIAL_SALES_1"} <= set(
+        decision.calculation.risk_flags
+    )
+
+
 def test_binary_returns_absent_for_complete_but_unprofitable_books(
     context_factory, market_factory, token_factory, book_factory
 ) -> None:
@@ -478,6 +502,8 @@ def test_buy_strategy_values_empty_reverse_depth_as_zero_recovery(
     assert isinstance(decision, OpportunityPresent)
     assert decision.calculation.worst_case_loss == Decimal("8.00")
     assert decision.calculation.risk_rate == Decimal("1")
+    assert "FIRST_LEG_ONLY" in decision.calculation.risk_flags
+    assert "CONVERSION_FAILURE" in decision.calculation.risk_flags
     assert "UNCLOSEABLE_EXPOSURE" in decision.calculation.risk_flags
 
 
