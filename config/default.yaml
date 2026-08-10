@@ -14,6 +14,8 @@ runtime:
   watch_market_limit: 50
   watch_minimum_end_horizon_seconds: 1800
   market_stream_queue_capacity: 65536
+  catalog_cleanup_interval_seconds: 10
+  catalog_cleanup_batch_rows: 8000
 
 strategy:
   bankroll: "1000"

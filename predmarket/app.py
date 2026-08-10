@@ -22,6 +22,7 @@ from predmarket.domain.signal import (
 )
 from predmarket.notification.notifier import Notifier, macos_desktop_notification
 from predmarket.persistence.catalog_migration import recover_v4_switch
+from predmarket.persistence.catalog_generations import CatalogGenerationCoordinator
 from predmarket.persistence.integrity import check_database_startup
 from predmarket.persistence.repositories import (
     CatalogSnapshot,
@@ -104,8 +105,17 @@ class Supervisor:
                 self._sync_forever(sync, notifier), name="SyncMarketTask"
             )
             _LOGGER.info("component_started component=sync_task")
+            catalog_cleanup = CatalogGenerationCoordinator(
+                writer,
+                database_path=self._config.database.path,
+            )
+            cleanup_task = asyncio.create_task(
+                self._catalog_cleanup_forever(catalog_cleanup),
+                name="CatalogCleanupTask",
+            )
+            _LOGGER.info("component_started component=catalog_cleanup_task")
             _LOGGER.info("runtime_started")
-            tasks = (watch_task, sync_task)
+            tasks = (watch_task, sync_task, cleanup_task)
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 if task.cancelled():
@@ -323,6 +333,36 @@ class Supervisor:
             interval = self._config.polymarket.sync_interval_seconds
             _LOGGER.info("sync_cycle_sleeping interval_seconds=%s", interval)
             await self._sleep(interval)
+
+    async def _catalog_cleanup_forever(
+        self, coordinator: CatalogGenerationCoordinator
+    ) -> None:
+        while True:
+            try:
+                result = await coordinator.cleanup(
+                    max_rows=self._config.runtime.catalog_cleanup_batch_rows
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                _LOGGER.warning(
+                    "catalog_cleanup_failed error=%s",
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+            else:
+                _LOGGER.info(
+                    "catalog_cleanup_cycle_completed deleted_versions=%d "
+                    "deleted_journal_rows=%d remaining_versions=%d "
+                    "remaining_journal_rows=%d",
+                    result.deleted_versions,
+                    result.deleted_journal_rows,
+                    result.remaining_versions,
+                    result.remaining_journal_rows,
+                )
+            await self._sleep(
+                self._config.runtime.catalog_cleanup_interval_seconds
+            )
 
     async def _record_overflow(
         self, system_events: SystemEventRepository, overflow: MarketChangeOverflow

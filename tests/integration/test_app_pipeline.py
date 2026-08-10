@@ -175,6 +175,28 @@ class _SkippedPeriodicSync:
         )()
 
 
+class _CleanupCoordinator:
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+        self.succeeded = asyncio.Event()
+
+    async def cleanup(self, *, max_rows: int):
+        self.calls.append(max_rows)
+        if len(self.calls) == 1:
+            raise RuntimeError("cleanup temporarily unavailable")
+        self.succeeded.set()
+        return type(
+            "CleanupResult",
+            (),
+            {
+                "deleted_versions": 2,
+                "deleted_journal_rows": 3,
+                "remaining_versions": 0,
+                "remaining_journal_rows": 0,
+            },
+        )()
+
+
 class _Watch:
     def __init__(self, calls: list[str], *, crash: bool) -> None:
         self.calls = calls
@@ -621,6 +643,45 @@ async def test_periodic_sync_notifies_when_generation_is_incomplete(
             await task
 
     assert output.getvalue() == ""
+
+
+@pytest.mark.asyncio
+async def test_catalog_cleanup_worker_retries_after_failure_and_uses_configured_batch(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="predmarket.app")
+    coordinator = _CleanupCoordinator()
+    sleep_started = asyncio.Event()
+    release_sleep = asyncio.Event()
+    sleep_calls = 0
+
+    async def sleep(_: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            sleep_started.set()
+            await release_sleep.wait()
+        else:
+            await asyncio.sleep(0)
+
+    supervisor = Supervisor(
+        _config(tmp_path),
+        sleep=sleep,
+    )
+    task = asyncio.create_task(supervisor._catalog_cleanup_forever(coordinator))
+
+    try:
+        await asyncio.wait_for(coordinator.succeeded.wait(), timeout=1)
+        await asyncio.wait_for(sleep_started.wait(), timeout=1)
+        assert "catalog_cleanup_cycle_completed" in caplog.text
+    finally:
+        release_sleep.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert coordinator.calls[:2] == [8_000, 8_000]
+    assert "catalog_cleanup_failed" in caplog.text
 
 
 @pytest.mark.asyncio
