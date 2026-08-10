@@ -26,6 +26,7 @@ from predmarket.polymarket.gateway import (
     MarketSnapshot,
     MarketStreamEvent,
     PolymarketGateway,
+    ParentEventNotFoundError,
 )
 
 
@@ -301,12 +302,14 @@ class FakePublicClient:
     ) -> None:
         self.event_paginator = FakePaginator(((events[0],), (events[1],)))
         self.market_paginator = FakePaginator(((markets[0],), (markets[1],)))
+        self.events = events
         self.markets = markets
         self.books = books
         self.event_kwargs: dict[str, Any] | None = None
         self.market_kwargs: dict[str, Any] | None = None
         self.book_token_ids: tuple[str, ...] | None = None
         self.refreshed_market_id: str | None = None
+        self.fetched_event_id: str | None = None
         self.subscription_spec: Any = None
         self.subscription_handle = FakeSubscriptionHandle(stream_events)
         self._market_manager = FakeMarketManager()
@@ -329,6 +332,10 @@ class FakePublicClient:
     async def get_market(self, *, id: str) -> Any:
         self.refreshed_market_id = id
         return next(market for market in self.markets if market.id == id)
+
+    async def get_event(self, *, id: str) -> Any:
+        self.fetched_event_id = id
+        return next(event for event in self.events if event.id == id)
 
     async def get_order_books(self, *, token_ids: tuple[str, ...]) -> tuple[Any, ...]:
         self.operations.append("get_order_books")
@@ -394,6 +401,23 @@ class RejectingOrderBookClient(FakePublicClient):
         )
 
 
+class EventuallyAvailableEventClient(FakePublicClient):
+    def __init__(self, *, event_failures: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.event_failures = event_failures
+        self.event_attempts = 0
+
+    async def get_event(self, *, id: str) -> Any:
+        self.event_attempts += 1
+        if self.event_failures > 0:
+            self.event_failures -= 1
+            raise RequestRejectedError(
+                "event is not available yet",
+                status=404,
+            )
+        return await super().get_event(id=id)
+
+
 @pytest.fixture
 def sdk_fixture() -> dict[str, tuple[Any, ...]]:
     events_payload = json.loads((FIXTURES / "events.json").read_text())
@@ -449,6 +473,67 @@ async def test_list_active_events_drains_every_sdk_page_and_maps_explicit_neg_ri
         "neg_risk_fee_bips": "25",
     }
     assert isinstance(event.neg_risk_metadata, MappingProxyType)
+
+
+async def test_get_event_maps_parent_by_id(
+    gateway: PolymarketGateway,
+    fake_client: FakePublicClient,
+) -> None:
+    event = await gateway.get_event("100")
+
+    assert event.id == "100"
+    assert event.status is MarketStatus.ACTIVE
+    assert fake_client.fetched_event_id == "100"
+
+
+async def test_get_event_retries_transient_parent_propagation_delay(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = EventuallyAvailableEventClient(**sdk_fixture, event_failures=2)
+    gateway = PolymarketGateway(
+        client=client,
+        clock_ms=lambda: 1_785_405_970_000,
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "_PARENT_EVENT_FETCH_RETRY_DELAY_SECONDS",
+        0.0,
+    )
+
+    event = await gateway.get_event("100")
+
+    assert event.id == "100"
+    assert client.event_attempts == 3
+    assert client.fetched_event_id == "100"
+
+
+async def test_get_event_classifies_terminal_not_found_parent(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MissingEventClient(FakePublicClient):
+        async def get_event(self, *, id: str) -> Any:
+            raise RequestRejectedError("id not found", status=404)
+
+    client = MissingEventClient(**sdk_fixture)
+    gateway = PolymarketGateway(
+        client=client,
+        clock_ms=lambda: 1_785_405_970_000,
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "_PARENT_EVENT_FETCH_RETRY_DELAY_SECONDS",
+        0.0,
+    )
+
+    with pytest.raises(
+        ParentEventNotFoundError,
+        match=r"event lookup missing-parent failed: id not found",
+    ) as raised:
+        await gateway.get_event("missing-parent")
+
+    assert raised.value.event_id == "missing-parent"
 
 
 async def test_list_active_events_logs_periodic_page_progress(

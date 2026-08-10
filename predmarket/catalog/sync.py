@@ -24,11 +24,17 @@ from predmarket.persistence.repositories import (
     CatalogSnapshot,
     SystemEventRepository,
 )
-from predmarket.polymarket.gateway import MarketMappingWarning, MarketSnapshot
+from predmarket.polymarket.gateway import (
+    MarketMappingWarning,
+    MarketSnapshot,
+    ParentEventNotFoundError,
+)
 
 
 T = TypeVar("T")
 _LOGGER = logging.getLogger(__name__)
+_PARENT_EVENT_FETCH_CONCURRENCY = 16
+_PARENT_EVENT_FETCH_TIMEOUT_SECONDS = 15.0
 
 
 async def _await_auxiliary_write(
@@ -69,6 +75,8 @@ async def _await_auxiliary_write(
 
 class _Gateway(Protocol):
     async def list_active_events(self) -> tuple[Event, ...]: ...
+
+    async def get_event(self, event_id: str) -> Event: ...
 
     async def list_active_markets(self) -> tuple[MarketSnapshot, ...]: ...
 
@@ -167,6 +175,7 @@ class SyncMarketTask:
         events: list[Event] = []
         snapshots: list[MarketSnapshot] = []
         market_warnings: tuple[MarketMappingWarning, ...] = ()
+        sync_warnings: list[str] = []
 
         stage_started_at = time.monotonic()
         _LOGGER.info(
@@ -215,6 +224,7 @@ class SyncMarketTask:
             snapshots, validation_error = _validated_snapshots(raw_snapshots)
             if validation_error is not None:
                 errors.append(validation_error)
+            sync_warnings.extend(warning.error for warning in market_warnings)
             _LOGGER.info(
                 "sync_stage_completed sync_generation=%s stage=markets_fetch "
                 "markets=%d tokens=%d warnings=%d elapsed_ms=%d",
@@ -239,6 +249,37 @@ class SyncMarketTask:
             len(previous.tokens),
             int((time.monotonic() - stage_started_at) * 1_000),
         )
+        if not errors:
+            stage_started_at = time.monotonic()
+            _LOGGER.info(
+                "sync_stage_started sync_generation=%s "
+                "stage=parent_event_reconciliation",
+                generation,
+            )
+            (
+                events,
+                snapshots,
+                parent_errors,
+                parent_warnings,
+            ) = await _reconcile_missing_parent_events(
+                gateway=self._gateway,
+                events=events,
+                snapshots=snapshots,
+                previous=previous,
+            )
+            errors.extend(parent_errors)
+            sync_warnings.extend(parent_warnings)
+            _LOGGER.info(
+                "sync_stage_completed sync_generation=%s "
+                "stage=parent_event_reconciliation events=%d errors=%d "
+                "warnings=%d "
+                "elapsed_ms=%d",
+                generation,
+                len(events),
+                len(parent_errors),
+                len(parent_warnings),
+                int((time.monotonic() - stage_started_at) * 1_000),
+            )
         published_market_ids = await self._system_events.list_published_market_ids()
         persisted_refresh_cursor = (
             await self._system_events.get_settlement_refresh_cursor()
@@ -373,7 +414,7 @@ class SyncMarketTask:
                 skipped_market_ids=tuple(
                     warning.market_id for warning in market_warnings
                 ),
-                warnings=tuple(warning.error for warning in market_warnings),
+                warnings=tuple(sync_warnings),
             )
 
         stage_started_at = time.monotonic()
@@ -480,7 +521,7 @@ class SyncMarketTask:
                 skipped_market_ids=tuple(
                     warning.market_id for warning in market_warnings
                 ),
-                warnings=tuple(warning.error for warning in market_warnings),
+                warnings=tuple(sync_warnings),
             )
         _LOGGER.info(
             "sync_stage_completed sync_generation=%s stage=catalog_persist "
@@ -574,7 +615,7 @@ class SyncMarketTask:
             skipped_market_ids=tuple(
                 warning.market_id for warning in market_warnings
             ),
-            warnings=tuple(warning.error for warning in market_warnings),
+            warnings=tuple(sync_warnings),
         )
 
     async def _republish_pending_reconciliations(self) -> None:
@@ -771,6 +812,129 @@ def _gateway_market_mapping_warnings(
     return materialized
 
 
+async def _reconcile_missing_parent_events(
+    *,
+    gateway: _Gateway,
+    events: Sequence[Event],
+    snapshots: Sequence[MarketSnapshot],
+    previous: CatalogSnapshot,
+) -> tuple[
+    list[Event],
+    list[MarketSnapshot],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
+    """Complete the event set for market snapshots with non-pageable parents."""
+
+    incoming_event_ids = {event.id for event in events}
+    previous_events = {event.id: event for event in previous.events}
+    missing_event_ids = sorted(
+        {
+            snapshot.market.event_id
+            for snapshot in snapshots
+            if snapshot.market.event_id is not None
+            and snapshot.market.event_id not in incoming_event_ids
+        },
+        key=_utf8,
+    )
+    if not missing_event_ids:
+        return list(events), list(snapshots), (), ()
+
+    reconciled = list(events)
+    errors: list[str] = []
+    fetch_event_ids: list[str] = []
+    for event_id in missing_event_ids:
+        old_event = previous_events.get(event_id)
+        if old_event is not None:
+            reconciled.append(old_event)
+            continue
+        fetch_event_ids.append(event_id)
+
+    async def fetch_parent_event(
+        event_id: str,
+        semaphore: asyncio.Semaphore,
+    ) -> tuple[str, Event | None, str | None, bool]:
+        async with semaphore:
+            try:
+                event = await asyncio.wait_for(
+                    gateway.get_event(event_id),
+                    timeout=_PARENT_EVENT_FETCH_TIMEOUT_SECONDS,
+                )
+            except ParentEventNotFoundError:
+                return event_id, None, None, True
+            except Exception as error:
+                return (
+                    event_id,
+                    None,
+                    _error_text(f"parent event {event_id} request failed", error),
+                    False,
+                )
+            if not isinstance(event, Event):
+                return (
+                    event_id,
+                    None,
+                    f"parent event {event_id} returned invalid type",
+                    False,
+                )
+            if event.id != event_id:
+                return (
+                    event_id,
+                    None,
+                    f"parent event {event_id} returned {event.id}",
+                    False,
+                )
+            return event_id, event, None, False
+
+    if not fetch_event_ids:
+        return reconciled, list(snapshots), (), ()
+
+    semaphore = asyncio.Semaphore(
+        min(_PARENT_EVENT_FETCH_CONCURRENCY, len(fetch_event_ids))
+    )
+    fetched = await asyncio.gather(
+        *(
+            fetch_parent_event(event_id, semaphore)
+            for event_id in fetch_event_ids
+        )
+    )
+    unresolved_event_ids: list[str] = []
+    for event_id, event, error, permanently_missing in fetched:
+        if error is not None:
+            errors.append(error)
+        elif permanently_missing:
+            unresolved_event_ids.append(event_id)
+        elif event is not None:
+            reconciled.append(event)
+
+    reconciled_snapshots = list(snapshots)
+    warnings: list[str] = []
+    if unresolved_event_ids:
+        unresolved = set(unresolved_event_ids)
+        affected_market_ids = sorted(
+            {
+                snapshot.market.id
+                for snapshot in snapshots
+                if snapshot.market.event_id in unresolved
+            },
+            key=_utf8,
+        )
+        reconciled_snapshots = [
+            replace(
+                snapshot,
+                market=replace(snapshot.market, event_id=None),
+            )
+            if snapshot.market.event_id in unresolved
+            else snapshot
+            for snapshot in snapshots
+        ]
+        warnings.append(
+            "sync_market_parent_missing "
+            f"event_ids={','.join(sorted(unresolved, key=_utf8))} "
+            f"market_count={len(affected_market_ids)}"
+        )
+    return reconciled, reconciled_snapshots, tuple(errors), tuple(warnings)
+
+
 async def _refresh_missing_markets(
     *,
     gateway: _Gateway,
@@ -932,33 +1096,7 @@ def _prepare_complete(
                 updated_at=occurred_at,
             )
             continue
-        event = None
-        if item.market.event_id is not None:
-            event = incoming_events.get(item.market.event_id) or old_events[
-                item.market.event_id
-            ]
         market = item.market
-        authoritative_market_resolution = (
-            market.status is MarketStatus.RESOLVED
-            and market.resolved_at is not None
-        )
-        if event is not None and not authoritative_market_resolution and (
-            event.status is not MarketStatus.ACTIVE
-            or event.resolved_at is not None
-        ):
-            market = replace(
-                market,
-                status=(
-                    MarketStatus.RESOLVED
-                    if event.status is MarketStatus.RESOLVED
-                    or event.resolved_at is not None
-                    else MarketStatus.CLOSED
-                ),
-                active=False,
-                accepting_orders=False,
-                enable_orderbook=False,
-                resolved_at=event.resolved_at or market.resolved_at,
-            )
         final_markets[market_id] = replace(
             market,
             sync_generation=generation,

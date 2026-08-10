@@ -44,6 +44,8 @@ _MALFORMED_NEW_MARKET_LOG_INTERVAL = 100
 _MARKET_STREAM_PROGRESS_INTERVAL_SECONDS = 10.0
 _MARKET_STREAM_HANDOFF_QUEUE_CAPACITY = 4_096
 _MARKET_STREAM_CLOSED = object()
+_PARENT_EVENT_FETCH_RETRY_ATTEMPTS = 3
+_PARENT_EVENT_FETCH_RETRY_DELAY_SECONDS = 1.0
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -53,6 +55,14 @@ class GatewayMappingError(ValueError):
     def __init__(self, message: str, *, market_id: str | None = None) -> None:
         super().__init__(message)
         self.market_id = market_id
+
+
+class ParentEventNotFoundError(GatewayMappingError):
+    """The upstream permanently reported that a parent event does not exist."""
+
+    def __init__(self, event_id: str, message: str) -> None:
+        self.event_id = _require_string(event_id, "parent event id")
+        super().__init__(message)
 
 
 class MissingOrderBooksError(GatewayMappingError):
@@ -130,6 +140,27 @@ def _market_recovery_transient_error(
         return MarketRecoveryTransientError("timeout")
     if isinstance(error, TransportError | ConnectionError | OSError):
         return MarketRecoveryTransientError("transport_error")
+    return None
+
+
+def _parent_event_fetch_retry_delay(error: Exception) -> float | None:
+    """Return a bounded retry delay for transient Gamma event lookups."""
+
+    if isinstance(error, RequestRejectedError):
+        if error.status == 404 or error.status in {408, 425, 429} or (
+            500 <= error.status <= 599
+        ):
+            return max(
+                0.0,
+                error.retry_after
+                if error.retry_after is not None
+                else _PARENT_EVENT_FETCH_RETRY_DELAY_SECONDS,
+            )
+        return None
+    if isinstance(error, (PolymarketTimeoutError, TransportError)):
+        return _PARENT_EVENT_FETCH_RETRY_DELAY_SECONDS
+    if isinstance(error, (ConnectionError, OSError)):
+        return _PARENT_EVENT_FETCH_RETRY_DELAY_SECONDS
     return None
 
 
@@ -1004,6 +1035,48 @@ class PolymarketGateway:
             int((time.monotonic() - started_at) * 1_000),
         )
         return tuple(events)
+
+    async def get_event(self, event_id: str) -> Event:
+        """Fetch and map one parent event by its stable upstream ID."""
+
+        event_id = _require_string(event_id, "event id")
+        received_at = self._now()
+        generation = self._current_sync_generation(received_at)
+        for attempt in range(_PARENT_EVENT_FETCH_RETRY_ATTEMPTS):
+            try:
+                sdk_event = await self._client.get_event(id=event_id)
+                event = _map_event(
+                    sdk_event,
+                    received_at=received_at,
+                    sync_generation=generation,
+                )
+            except GatewayMappingError as error:
+                raise GatewayMappingError(
+                    f"event lookup {event_id} failed: {error}"
+                ) from error
+            except Exception as error:
+                retry_delay = _parent_event_fetch_retry_delay(error)
+                if (
+                    retry_delay is None
+                    or attempt + 1 >= _PARENT_EVENT_FETCH_RETRY_ATTEMPTS
+                ):
+                    if isinstance(error, RequestRejectedError) and error.status == 404:
+                        raise ParentEventNotFoundError(
+                            event_id,
+                            f"event lookup {event_id} failed: {error}",
+                        ) from error
+                    raise GatewayMappingError(
+                        f"event lookup {event_id} failed: {error}"
+                    ) from error
+                if retry_delay > 0:
+                    await asyncio.sleep(retry_delay)
+                continue
+            break
+        if event.id != event_id:
+            raise GatewayMappingError(
+                f"event lookup requested {event_id} but SDK returned {event.id}"
+            )
+        return event
 
     async def list_active_markets(self) -> tuple[MarketSnapshot, ...]:
         started_at = time.monotonic()

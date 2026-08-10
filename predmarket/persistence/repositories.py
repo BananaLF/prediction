@@ -66,6 +66,10 @@ class CatalogRepository:
     def __init__(self, path: Path, writer: DatabaseWriter) -> None:
         self._path = Path(path)
         self._writer = writer
+        # Staged market versions read parent IDs from the shared identity table.
+        # Keep runtime writes from changing that identity while a full catalog
+        # is being staged, validated, and activated.
+        self._catalog_write_lock = asyncio.Lock()
 
     async def save_catalog(
         self,
@@ -87,9 +91,32 @@ class CatalogRepository:
                 changed_at=int(time.time()),
             )
 
-        await self._writer.execute(command)
+        async with self._catalog_write_lock:
+            await self._writer.execute(command)
 
     async def save_complete_catalog(
+        self,
+        *,
+        generation: str,
+        updated_at: int,
+        events: Sequence[Event],
+        markets: Sequence[Market],
+        tokens: Sequence[Token],
+        reconciliation_change: MarketChange | None = None,
+        reconciliation_market_ids: Sequence[str] = (),
+    ) -> None:
+        async with self._catalog_write_lock:
+            await self._save_complete_catalog(
+                generation=generation,
+                updated_at=updated_at,
+                events=events,
+                markets=markets,
+                tokens=tokens,
+                reconciliation_change=reconciliation_change,
+                reconciliation_market_ids=reconciliation_market_ids,
+            )
+
+    async def _save_complete_catalog(
         self,
         *,
         generation: str,
@@ -236,7 +263,8 @@ class CatalogRepository:
                 changed_at=int(time.time()),
             )
 
-        await self._writer.execute(command)
+        async with self._catalog_write_lock:
+            await self._writer.execute(command)
 
     async def save_market(self, market: Market) -> None:
         _require_type(market, Market, "market")
@@ -248,7 +276,8 @@ class CatalogRepository:
                 changed_at=int(time.time()),
             )
 
-        await self._writer.execute(command)
+        async with self._catalog_write_lock:
+            await self._writer.execute(command)
 
     async def save_token(self, token: Token) -> None:
         _require_type(token, Token, "token")
@@ -260,7 +289,8 @@ class CatalogRepository:
                 changed_at=int(time.time()),
             )
 
-        await self._writer.execute(command)
+        async with self._catalog_write_lock:
+            await self._writer.execute(command)
 
     async def get_event(self, event_id: str) -> Event | None:
         row = await _fetch_one(self._path, "SELECT * FROM events WHERE id = ?", (event_id,))

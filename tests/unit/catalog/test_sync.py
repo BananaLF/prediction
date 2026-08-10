@@ -29,6 +29,7 @@ from predmarket.polymarket.gateway import (
     GatewayMappingError,
     MarketMappingWarning,
     MarketSnapshot,
+    ParentEventNotFoundError,
 )
 
 
@@ -107,13 +108,16 @@ class _FakeGateway:
     markets: Any
     market_mapping_warnings: tuple[MarketMappingWarning, ...] = ()
     refreshed: dict[str, Any] | None = None
+    fetched_events: dict[str, Any] | None = None
     refresh_delay: float = 0
     event_calls: int = 0
     market_calls: int = 0
     refresh_calls: list[str] | None = None
+    get_event_calls: list[str] | None = None
 
     def __post_init__(self) -> None:
         self.refresh_calls = []
+        self.get_event_calls = []
 
     async def list_active_events(self) -> tuple[Event, ...]:
         self.event_calls += 1
@@ -126,6 +130,20 @@ class _FakeGateway:
         if isinstance(self.markets, BaseException):
             raise self.markets
         return tuple(self.markets)
+
+    async def get_event(self, event_id: str) -> Event:
+        assert self.get_event_calls is not None
+        self.get_event_calls.append(event_id)
+        value = (
+            None
+            if self.fetched_events is None
+            else self.fetched_events.get(event_id)
+        )
+        if isinstance(value, BaseException):
+            raise value
+        if value is None:
+            raise RuntimeError(f"no event fixture for {event_id}")
+        return value
 
     async def refresh_market(self, market_id: str) -> MarketSnapshot:
         assert self.refresh_calls is not None
@@ -671,6 +689,123 @@ async def test_complete_generation_accepts_parentless_market(
     assert stored_market is not None
     assert stored_market.event_id is None
     assert len(queue.items) == 1
+
+
+async def test_complete_generation_reconciles_missing_parent_event_without_downgrading_market(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    parent = replace(
+        _event(("market-parent",)),
+        id="event-parent",
+        status=MarketStatus.CLOSED,
+    )
+    snapshot = _snapshot("market-parent")
+    snapshot = replace(
+        snapshot,
+        market=replace(snapshot.market, event_id="event-parent"),
+    )
+    gateway = _FakeGateway(
+        events=(),
+        markets=(snapshot,),
+        fetched_events={"event-parent": parent},
+    )
+    queue = _RecordingQueue(catalog)
+    task = SyncMarketTask(
+        gateway=gateway,
+        catalog=catalog,
+        changes=queue,
+        system_events=system_events,
+        clock_ms=lambda: 106,
+        generation_factory=lambda: "sync-parent-reconciled",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is True
+    assert gateway.get_event_calls == ["event-parent"]
+    stored_event = await catalog.get_event("event-parent")
+    stored_market = await catalog.get_market("market-parent")
+    assert stored_event is not None
+    assert stored_event.status is MarketStatus.CLOSED
+    assert stored_event.market_ids == ("market-parent",)
+    assert stored_market is not None
+    assert stored_market.event_id == "event-parent"
+    assert stored_market.status is MarketStatus.ACTIVE
+    assert stored_market.active is True
+    assert stored_market.accepting_orders is True
+    assert stored_market.enable_orderbook is True
+
+
+async def test_missing_parent_event_keeps_generation_incomplete_without_orphan_market(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    snapshot = _snapshot("market-parent")
+    snapshot = replace(
+        snapshot,
+        market=replace(snapshot.market, event_id="event-parent"),
+    )
+    gateway = _FakeGateway(
+        events=(),
+        markets=(snapshot,),
+        fetched_events={"event-parent": RuntimeError("upstream unavailable")},
+    )
+    task = SyncMarketTask(
+        gateway=gateway,
+        catalog=catalog,
+        changes=_RecordingQueue(),
+        system_events=system_events,
+        clock_ms=lambda: 107,
+        generation_factory=lambda: "sync-parent-incomplete",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is False
+    assert "event-parent" in (result.error or "")
+    assert await catalog.get_market("market-parent") is None
+
+
+async def test_terminal_missing_parent_event_detaches_market_and_completes(
+    catalog_runtime,
+) -> None:
+    catalog, system_events = catalog_runtime
+    snapshot = _snapshot("market-parent-missing")
+    snapshot = replace(
+        snapshot,
+        market=replace(snapshot.market, event_id="event-parent-missing"),
+    )
+    gateway = _FakeGateway(
+        events=(),
+        markets=(snapshot,),
+        fetched_events={
+            "event-parent-missing": ParentEventNotFoundError(
+                "event-parent-missing",
+                "event lookup event-parent-missing failed: id not found",
+            )
+        },
+    )
+    task = SyncMarketTask(
+        gateway=gateway,
+        catalog=catalog,
+        changes=_RecordingQueue(catalog),
+        system_events=system_events,
+        clock_ms=lambda: 108,
+        generation_factory=lambda: "sync-parent-missing-detached",
+    )
+
+    result = await task.run_once()
+
+    assert result.complete is True
+    assert result.error is None
+    assert result.warnings == (
+        "sync_market_parent_missing event_ids=event-parent-missing market_count=1",
+    )
+    stored_market = await catalog.get_market("market-parent-missing")
+    assert stored_market is not None
+    assert stored_market.event_id is None
+    assert await catalog.get_token("market-parent-missing-token-0") is not None
 
 
 async def test_complete_generation_rebuilds_reverse_index_from_market_parent(

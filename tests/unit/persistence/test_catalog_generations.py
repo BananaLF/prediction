@@ -690,6 +690,7 @@ async def test_validate_candidate_freezes_effective_snapshot(tmp_path: Path) -> 
         token_count=1,
         snapshot_digest=validation.snapshot_digest,
         validated_runtime_revision=0,
+        market_event_ids=(("market-1", "event-1"),),
     )
     assert len(validation.snapshot_digest) == 64
     with _connect(database_path) as connection:
@@ -703,6 +704,61 @@ async def test_validate_candidate_freezes_effective_snapshot(tmp_path: Path) -> 
         ).fetchone()
     assert row[:4] == (1, 1, 1, validation.snapshot_digest)
     assert row[4] is not None
+
+
+async def test_complete_generation_reconciles_existing_market_parent_at_activation(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    coordinator = CatalogGenerationCoordinator(_CatalogTestWriter(database_path))
+
+    initial = _related_generation_input(generation="sync-initial")
+    initial_staged = await coordinator.stage(initial)
+    initial_validation = await coordinator.validate_candidate(initial_staged)
+    await coordinator.activate(initial_validation, None)
+
+    moved_event = replace(
+        initial.events[0],
+        id="event-2",
+        slug="event-slug-2",
+        market_ids=("market-1",),
+        sync_generation="sync-moved",
+    )
+    old_event = replace(
+        initial.events[0],
+        market_ids=(),
+        sync_generation="sync-moved",
+    )
+    moved_market = replace(
+        initial.markets[0],
+        event_id="event-2",
+        sync_generation="sync-moved",
+    )
+    moved_token = replace(
+        initial.tokens[0],
+        sync_generation="sync-moved",
+    )
+    moved = replace(
+        initial,
+        sync_generation="sync-moved",
+        events=(old_event, moved_event),
+        markets=(moved_market,),
+        tokens=(moved_token,),
+        input_digest="digest-sync-moved",
+    )
+
+    staged = await coordinator.stage(moved)
+    validation = await coordinator.validate_candidate(staged)
+    await coordinator.activate(validation, None)
+
+    with _connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT event_id FROM catalog_market_ids WHERE id = 'market-1'"
+        ).fetchone() == ("event-2",)
+        assert connection.execute(
+            "SELECT event_id FROM markets WHERE id = 'market-1'"
+        ).fetchone() == ("event-2",)
 
 
 @pytest.mark.parametrize(
