@@ -890,3 +890,125 @@ async def test_full_sync_rebases_concurrent_watch_write_without_mixed_reads(
         assert {values[0] for values in observed} <= {"sync-old", "sync-new"}
     finally:
         await writer.close()
+
+
+async def test_complete_sync_serializes_runtime_parent_relation_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "market.db"
+    create_v4_database(database_path)
+    writer = DatabaseWriter(database_path)
+    await writer.start()
+    try:
+        catalog = CatalogRepository(database_path, writer)
+        old_event = Event(
+            id="event-1",
+            title="Event 1",
+            status=MarketStatus.ACTIVE,
+            market_ids=("market-1",),
+            sync_generation="sync-old",
+            sync_generation_complete=True,
+            updated_at=10,
+        )
+        alternate_event = Event(
+            id="event-2",
+            title="Event 2",
+            status=MarketStatus.ACTIVE,
+            market_ids=(),
+            sync_generation="sync-old",
+            sync_generation_complete=True,
+            updated_at=10,
+        )
+        old_market = Market(
+            id="market-1",
+            event_id="event-1",
+            condition_id="condition-1",
+            question="Old?",
+            status=MarketStatus.ACTIVE,
+            active=True,
+            accepting_orders=True,
+            enable_orderbook=True,
+            sync_generation="sync-old",
+            sync_generation_complete=True,
+            updated_at=10,
+        )
+        old_token = Token(
+            id="token-1",
+            market_id="market-1",
+            outcome="YES",
+            position=0,
+            sync_generation="sync-old",
+            sync_generation_complete=True,
+            updated_at=10,
+        )
+        await catalog.save_complete_catalog(
+            generation="sync-old",
+            updated_at=10,
+            events=(old_event, alternate_event),
+            markets=(old_market,),
+            tokens=(old_token,),
+        )
+
+        new_event = replace(old_event, sync_generation="sync-new", updated_at=20)
+        new_alternate_event = replace(
+            alternate_event,
+            sync_generation="sync-new",
+            updated_at=20,
+        )
+        new_market = replace(
+            old_market,
+            question="Full sync?",
+            sync_generation="sync-new",
+            sync_generation_complete=True,
+            updated_at=20,
+        )
+        new_token = replace(old_token, sync_generation="sync-new", updated_at=20)
+
+        stage_ready = asyncio.Event()
+        release_stage = asyncio.Event()
+        original_stage = CatalogGenerationCoordinator.stage
+
+        async def paused_stage(
+            coordinator: CatalogGenerationCoordinator,
+            value: GenerationInput,
+        ) -> object:
+            staged = await original_stage(coordinator, value)
+            stage_ready.set()
+            await release_stage.wait()
+            return staged
+
+        monkeypatch.setattr(CatalogGenerationCoordinator, "stage", paused_stage)
+        complete_task = asyncio.create_task(
+            catalog.save_complete_catalog(
+                generation="sync-new",
+                updated_at=20,
+                events=(new_event, new_alternate_event),
+                markets=(new_market,),
+                tokens=(new_token,),
+            )
+        )
+        await stage_ready.wait()
+
+        runtime_task = asyncio.create_task(
+            catalog.save_market(
+                replace(
+                    old_market,
+                    event_id="event-2",
+                    question="Watch?",
+                    updated_at=30,
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        assert not runtime_task.done()
+
+        release_stage.set()
+        await complete_task
+        await runtime_task
+
+        snapshot = await catalog.load_catalog()
+        assert snapshot.markets[0].event_id == "event-2"
+        assert snapshot.markets[0].question == "Watch?"
+    finally:
+        await writer.close()

@@ -146,6 +146,7 @@ class StagedGeneration:
     sync_generation: str
     base_generation_id: int
     base_runtime_revision: int
+    market_event_ids: tuple[tuple[str, str | None], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +157,7 @@ class CandidateValidation:
     token_count: int
     snapshot_digest: str
     validated_runtime_revision: int
+    market_event_ids: tuple[tuple[str, str | None], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -624,6 +626,7 @@ class CatalogGenerationCoordinator:
                 generation_id=validation.generation_id,
                 base_generation_id=base_generation_id,
                 sync_generation=sync_generation,
+                market_event_ids=dict(validation.market_event_ids),
             )
             if (
                 tuple(len(values) for values in effective) != expected[:3]
@@ -636,6 +639,7 @@ class CatalogGenerationCoordinator:
                 connection,
                 generation_id=validation.generation_id,
                 sync_generation=sync_generation,
+                market_event_ids=dict(validation.market_event_ids),
             )
             for effective_values, staged_values in zip(
                 effective,
@@ -654,6 +658,10 @@ class CatalogGenerationCoordinator:
                             validation.generation_id,
                             entity,
                         )
+            await _apply_market_event_ids(
+                connection,
+                validation.market_event_ids,
+            )
             cursor = await connection.execute(
                 """
                 UPDATE catalog_generations
@@ -793,9 +801,11 @@ class CatalogGenerationCoordinator:
                 connection,
                 generation_id=validation.generation_id,
                 sync_generation=sync_generation,
+                market_event_ids=dict(validation.market_event_ids),
             )
             active_maps = tuple({entity.id: entity for entity in values} for values in active)
             staged_maps = tuple({entity.id: entity for entity in values} for values in staged)
+            market_event_ids = dict(validation.market_event_ids)
             kind_index = {"EVENT": 0, "MARKET": 1, "TOKEN": 2}
             copied = [0, 0, 0]
             for change in changes:
@@ -819,6 +829,8 @@ class CatalogGenerationCoordinator:
                             sync_generation_complete=True,
                         ),
                     )
+                    if index == 1:
+                        market_event_ids[entity_id] = active_entity.event_id
                     copied[index] += 1
 
             effective = await _load_effective_entities(
@@ -826,6 +838,7 @@ class CatalogGenerationCoordinator:
                 generation_id=validation.generation_id,
                 base_generation_id=base_generation_id,
                 sync_generation=sync_generation,
+                market_event_ids=market_event_ids,
             )
             _validate_effective_constraints(*effective)
             rebased = CandidateValidation(
@@ -835,6 +848,7 @@ class CatalogGenerationCoordinator:
                 token_count=len(effective[2]),
                 snapshot_digest=_snapshot_digest(*effective),
                 validated_runtime_revision=through_revision,
+                market_event_ids=_sorted_market_event_ids(market_event_ids),
             )
             cursor = await connection.execute(
                 """
@@ -927,6 +941,7 @@ class CatalogGenerationCoordinator:
                     connection,
                     generation_id=generation.id,
                     sync_generation=generation.sync_generation,
+                    market_event_ids=dict(generation.market_event_ids),
                 )
                 _validate_staged_progress(row, staged)
                 effective = await _load_effective_entities(
@@ -934,6 +949,7 @@ class CatalogGenerationCoordinator:
                     generation_id=generation.id,
                     base_generation_id=generation.base_generation_id,
                     sync_generation=generation.sync_generation,
+                    market_event_ids=dict(generation.market_event_ids),
                 )
                 _validate_effective_constraints(*effective)
                 validation = CandidateValidation(
@@ -943,6 +959,7 @@ class CatalogGenerationCoordinator:
                     token_count=len(effective[2]),
                     snapshot_digest=_snapshot_digest(*effective),
                     validated_runtime_revision=int(row["runtime_revision"]),
+                    market_event_ids=generation.market_event_ids,
                 )
             finally:
                 await connection.execute("ROLLBACK")
@@ -1000,6 +1017,9 @@ class CatalogGenerationCoordinator:
         plans: tuple[_EntityPlan, ...],
     ) -> tuple[StagedGeneration, tuple[str | None, str | None, str | None]]:
         now = self._clock()
+        market_event_ids = _sorted_market_event_ids(
+            {market.id: market.event_id for market in value.markets}
+        )
 
         async def command(connection: aiosqlite.Connection) -> StagedGeneration:
             cursor = await connection.execute(
@@ -1026,6 +1046,7 @@ class CatalogGenerationCoordinator:
                         sync_generation=str(existing[1]),
                         base_generation_id=int(existing[3]),
                         base_runtime_revision=int(existing[4]),
+                        market_event_ids=market_event_ids,
                     ),
                     tuple(existing[11:14]),
                 )
@@ -1082,6 +1103,7 @@ class CatalogGenerationCoordinator:
                     sync_generation=value.sync_generation,
                     base_generation_id=int(state[0]),
                     base_runtime_revision=int(state[1]),
+                    market_event_ids=market_event_ids,
                 ),
                 (None, None, None),
             )
@@ -1383,7 +1405,19 @@ async def _load_staged_entities(
     *,
     generation_id: int,
     sync_generation: str,
+    market_event_ids: Mapping[str, str | None] | None = None,
 ) -> tuple[tuple[Event, ...], tuple[Market, ...], tuple[Token, ...]]:
+    market_values = tuple(
+        _market_with_event_id_overrides(
+            _market_from_version_row(row, sync_generation),
+            market_event_ids,
+        )
+        for row in await _fetch_version_rows(
+            connection,
+            kind="market",
+            generation_id=generation_id,
+        )
+    )
     return (
         tuple(
             _event_from_version_row(row, sync_generation)
@@ -1393,14 +1427,7 @@ async def _load_staged_entities(
                 generation_id=generation_id,
             )
         ),
-        tuple(
-            _market_from_version_row(row, sync_generation)
-            for row in await _fetch_version_rows(
-                connection,
-                kind="market",
-                generation_id=generation_id,
-            )
-        ),
+        market_values,
         tuple(
             _token_from_version_row(row, sync_generation)
             for row in await _fetch_version_rows(
@@ -1521,7 +1548,20 @@ async def _load_effective_entities(
     generation_id: int,
     base_generation_id: int,
     sync_generation: str,
+    market_event_ids: Mapping[str, str | None] | None = None,
 ) -> tuple[tuple[Event, ...], tuple[Market, ...], tuple[Token, ...]]:
+    market_values = tuple(
+        _market_with_event_id_overrides(
+            _market_from_version_row(row, sync_generation),
+            market_event_ids,
+        )
+        for row in await _fetch_version_rows(
+            connection,
+            kind="market",
+            generation_id=generation_id,
+            base_generation_id=base_generation_id,
+        )
+    )
     return (
         tuple(
             _event_from_version_row(row, sync_generation)
@@ -1532,15 +1572,7 @@ async def _load_effective_entities(
                 base_generation_id=base_generation_id,
             )
         ),
-        tuple(
-            _market_from_version_row(row, sync_generation)
-            for row in await _fetch_version_rows(
-                connection,
-                kind="market",
-                generation_id=generation_id,
-                base_generation_id=base_generation_id,
-            )
-        ),
+        market_values,
         tuple(
             _token_from_version_row(row, sync_generation)
             for row in await _fetch_version_rows(
@@ -1601,6 +1633,41 @@ async def _fetch_version_rows(
     )
     cursor.row_factory = aiosqlite.Row
     return list(await cursor.fetchall())
+
+
+def _sorted_market_event_ids(
+    market_event_ids: Mapping[str, str | None],
+) -> tuple[tuple[str, str | None], ...]:
+    return tuple(
+        sorted(
+            market_event_ids.items(),
+            key=lambda item: item[0].encode("utf-8"),
+        )
+    )
+
+
+def _market_with_event_id_overrides(
+    market: Market,
+    market_event_ids: Mapping[str, str | None] | None,
+) -> Market:
+    if market_event_ids is None or market.id not in market_event_ids:
+        return market
+    return replace(market, event_id=market_event_ids[market.id])
+
+
+async def _apply_market_event_ids(
+    connection: aiosqlite.Connection,
+    market_event_ids: Sequence[tuple[str, str | None]],
+) -> None:
+    for market_id, event_id in market_event_ids:
+        cursor = await connection.execute(
+            "UPDATE catalog_market_ids SET event_id = ? WHERE id = ?",
+            (event_id, market_id),
+        )
+        if cursor.rowcount != 1:
+            raise CatalogActivationConflict(
+                f"market identity {market_id!r} is missing during activation"
+            )
 
 
 _VERSION_QUERIES = {
