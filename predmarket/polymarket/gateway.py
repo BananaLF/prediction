@@ -46,6 +46,7 @@ _MARKET_STREAM_HANDOFF_QUEUE_CAPACITY = 4_096
 _MARKET_STREAM_CLOSED = object()
 _PARENT_EVENT_FETCH_RETRY_ATTEMPTS = 3
 _PARENT_EVENT_FETCH_RETRY_DELAY_SECONDS = 1.0
+_PARENT_EVENT_FETCH_MAX_RETRY_DELAY_SECONDS = 5.0
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -150,11 +151,14 @@ def _parent_event_fetch_retry_delay(error: Exception) -> float | None:
         if error.status == 404 or error.status in {408, 425, 429} or (
             500 <= error.status <= 599
         ):
-            return max(
-                0.0,
+            retry_delay = (
                 error.retry_after
                 if error.retry_after is not None
-                else _PARENT_EVENT_FETCH_RETRY_DELAY_SECONDS,
+                else _PARENT_EVENT_FETCH_RETRY_DELAY_SECONDS
+            )
+            return min(
+                _PARENT_EVENT_FETCH_MAX_RETRY_DELAY_SECONDS,
+                max(0.0, retry_delay),
             )
         return None
     if isinstance(error, (PolymarketTimeoutError, TransportError)):

@@ -402,9 +402,16 @@ class RejectingOrderBookClient(FakePublicClient):
 
 
 class EventuallyAvailableEventClient(FakePublicClient):
-    def __init__(self, *, event_failures: int, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        event_failures: int,
+        retry_after: float | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.event_failures = event_failures
+        self.retry_after = retry_after
         self.event_attempts = 0
 
     async def get_event(self, *, id: str) -> Any:
@@ -414,6 +421,7 @@ class EventuallyAvailableEventClient(FakePublicClient):
             raise RequestRejectedError(
                 "event is not available yet",
                 status=404,
+                retry_after=self.retry_after,
             )
         return await super().get_event(id=id)
 
@@ -506,6 +514,33 @@ async def test_get_event_retries_transient_parent_propagation_delay(
     assert event.id == "100"
     assert client.event_attempts == 3
     assert client.fetched_event_id == "100"
+
+
+async def test_get_event_caps_retry_after_before_retrying_parent_lookup(
+    sdk_fixture: dict[str, tuple[Any, ...]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = EventuallyAvailableEventClient(
+        **sdk_fixture,
+        event_failures=2,
+        retry_after=60.0,
+    )
+    gateway = PolymarketGateway(
+        client=client,
+        clock_ms=lambda: 1_785_405_970_000,
+    )
+    sleep_delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr(gateway_module.asyncio, "sleep", record_sleep)
+
+    event = await gateway.get_event("100")
+
+    assert event.id == "100"
+    assert client.event_attempts == 3
+    assert sleep_delays == [5.0, 5.0]
 
 
 async def test_get_event_classifies_terminal_not_found_parent(
