@@ -395,7 +395,7 @@ class Supervisor:
                 )
             interval = self._config.runtime.catalog_cleanup_interval_seconds
             if consecutive_failures:
-                interval *= min(2**consecutive_failures, 32)
+                interval *= 2 ** min(consecutive_failures, 5)
             await self._sleep(interval)
 
     async def _record_overflow(

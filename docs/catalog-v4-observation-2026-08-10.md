@@ -11,10 +11,10 @@
 The runtime log timestamps are host local time in `Asia/Hong_Kong` (UTC+08:00).
 The validator uses UTC. Its `03:37:16Z`–`04:07:21Z` window therefore maps to
 `11:37:16`–`12:07:21` in the runtime log. Runtime activity is present throughout
-that mapped interval; for example, the cleanup cycle at `11:37:18` follows the
-validator start, and the final cleanup cycle at `12:07:17` precedes the validator
+that mapped interval; for example, the cleanup cycle at `11:37:21.871` follows the
+validator start, and the final cleanup cycle at `12:07:16.782` precedes the validator
 finish. The runtime itself started earlier at `11:26:22` and stopped after the
-validator at `12:09:08`.
+validator at `12:07:56.848`.
 
 All validator samples passed the schema, SQLite integrity, foreign-key,
 catalog generation, staging, journal, cleanup, migration marker, and WAL
