@@ -103,7 +103,7 @@ def test_curve_taker_only_schedule_does_not_charge_maker_path() -> None:
     ) == Decimal("0")
 
 
-def test_curve_fee_has_protocol_minimum_after_rounding() -> None:
+def test_curve_fee_below_protocol_precision_rounds_to_zero() -> None:
     schedule = FeeSchedule.from_json(
         {
             "model": "CURVE",
@@ -124,7 +124,7 @@ def test_curve_fee_has_protocol_minimum_after_rounding() -> None:
         Decimal("1"),
         evaluated_at_ms=100,
         max_age_seconds=300,
-    ) == Decimal("0.00001")
+    ) == Decimal("0.00000")
 
 
 def test_disabled_known_schedule_returns_zero() -> None:

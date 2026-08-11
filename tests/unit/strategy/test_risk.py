@@ -77,7 +77,7 @@ def test_failure_risk_enumerates_partial_legs_and_conversion_failure() -> None:
                 "FIRST_LEG_ONLY", Decimal("2.50"), (first,), Decimal("2.50")
             ),
             FailureScenario(
-                "PARTIAL_LEGS", Decimal("4.50"), (first, second), Decimal("1.25")
+                "PARTIAL_LEGS_2", Decimal("4.50"), (first, second), Decimal("1.25")
             ),
             FailureScenario(
                 "CONVERSION_FAILURE", Decimal("5.00"), (first, second), Decimal("0")
@@ -90,14 +90,14 @@ def test_failure_risk_enumerates_partial_legs_and_conversion_failure() -> None:
     assert tuple((item.name, item.loss) for item in risk.scenarios) == (
         ("CONVERSION_FAILURE", Decimal("2.60")),
         ("FIRST_LEG_ONLY", Decimal("0.50")),
-        ("PARTIAL_LEGS", Decimal("2.10")),
+        ("PARTIAL_LEGS_2", Decimal("2.10")),
     )
     assert risk.worst_case_loss == Decimal("2.60")
     assert risk.unhedged_notional == Decimal("2.50")
     assert risk.risk_flags == (
         "CONVERSION_FAILURE",
         "FIRST_LEG_ONLY",
-        "PARTIAL_LEGS",
+        "PARTIAL_LEGS_2",
         "UNCLOSEABLE_EXPOSURE",
     )
 
@@ -148,6 +148,42 @@ def test_risk_loss_is_clamped_at_zero_when_recovery_exceeds_capital() -> None:
     )
 
     assert risk.worst_case_loss == Decimal("0")
+
+
+def test_failure_flag_is_derived_from_modelled_loss_not_execution_event() -> None:
+    # Scenario names describe hypothetical exposures supplied to the calculator;
+    # they are not evidence that an order or conversion was submitted.
+    exposure = OpenExposure(
+        "a",
+        Decimal("1"),
+        Decimal("0.50"),
+        _book("a", bids=(("0.40", "1"),)),
+        _zero_fee(),
+    )
+
+    with_loss = assess_failure_scenarios(
+        (
+            FailureScenario(
+                "CONVERSION_FAILURE", Decimal("0.50"), (exposure,), Decimal("0")
+            ),
+        ),
+        evaluated_at_ms=1_000,
+        fee_max_age_seconds=1,
+    )
+    without_loss = assess_failure_scenarios(
+        (
+            FailureScenario(
+                "CONVERSION_FAILURE", Decimal("0.40"), (exposure,), Decimal("0")
+            ),
+        ),
+        evaluated_at_ms=1_000,
+        fee_max_age_seconds=1,
+    )
+
+    assert with_loss.risk_flags == ("CONVERSION_FAILURE",)
+    assert with_loss.scenarios[0].loss == Decimal("0.10")
+    assert without_loss.risk_flags == ()
+    assert without_loss.scenarios[0].loss == Decimal("0")
 
 
 def test_risk_rejects_scenario_count_over_numeric_resource_policy() -> None:
