@@ -47,8 +47,11 @@ class Notifier:
         event_type: str | None = None,
         message: str | None = None,
         details: Mapping[str, object] | None = None,
+        persist: bool = False,
+        component: str = "NOTIFIER",
+        severity: str = "INFO",
     ) -> None:
-        """Attempt desktop delivery if configured."""
+        """Optionally audit an event, then attempt desktop delivery if configured."""
         if notification is not None:
             if not isinstance(notification, SignalNotification):
                 raise TypeError("notification must be a SignalNotification")
@@ -65,6 +68,21 @@ class Notifier:
             raise ValueError("message must be a non-empty string")
         if details is not None and not isinstance(details, Mapping):
             raise TypeError("details must be a mapping or None")
+        if type(persist) is not bool:
+            raise TypeError("persist must be a boolean")
+        if not isinstance(component, str) or not component:
+            raise ValueError("component must be a non-empty string")
+        if not isinstance(severity, str) or not severity:
+            raise ValueError("severity must be a non-empty string")
+
+        if persist:
+            await self._record_event(
+                component=component,
+                severity=severity,
+                event_type=event_type,
+                message=message,
+                details=details,
+            )
 
         if self._desktop is None:
             return
@@ -74,6 +92,31 @@ class Notifier:
                 await result
         except Exception as error:
             await self._record_desktop_failure(event_type, error)
+
+    async def _record_event(
+        self,
+        *,
+        component: str,
+        severity: str,
+        event_type: str,
+        message: str,
+        details: Mapping[str, object] | None,
+    ) -> None:
+        if self._system_events is None:
+            return
+        occurred_at = self._clock_ms()
+        if type(occurred_at) is not int or occurred_at < 0:
+            raise ValueError("clock_ms must return a non-negative integer")
+        result = self._system_events.append(
+            component=component,
+            severity=severity,
+            event_type=event_type,
+            message=message,
+            occurred_at=occurred_at,
+            details=dict(details) if details is not None else None,
+        )
+        if inspect.isawaitable(result):
+            await result
 
     async def _record_desktop_failure(
         self,

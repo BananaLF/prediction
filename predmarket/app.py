@@ -364,6 +364,9 @@ class Supervisor:
                                 "error": str(error),
                                 "consecutive_failures": consecutive_failures,
                             },
+                            persist=True,
+                            component="CATALOG_CLEANUP",
+                            severity="ERROR",
                         )
                     except Exception:
                         _LOGGER.warning("catalog_cleanup_notification_failed", exc_info=True)
@@ -374,6 +377,9 @@ class Supervisor:
                             event_type="CATALOG_CLEANUP_RECOVERED",
                             message="Catalog cleanup recovered",
                             details={"failures_before_recovery": consecutive_failures},
+                            persist=True,
+                            component="CATALOG_CLEANUP",
+                            severity="INFO",
                         )
                     except Exception:
                         _LOGGER.warning("catalog_cleanup_notification_failed", exc_info=True)
