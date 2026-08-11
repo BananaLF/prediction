@@ -6,6 +6,7 @@ from decimal import Decimal
 from io import StringIO
 import logging
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -723,6 +724,86 @@ async def test_catalog_cleanup_worker_reports_failure_recovery_and_backs_off(
     assert [item["event_type"] for item in notifications] == [
         "CATALOG_CLEANUP_FAILED",
         "CATALOG_CLEANUP_RECOVERED",
+    ]
+    assert notifications[0] == {
+        "event_type": "CATALOG_CLEANUP_FAILED",
+        "message": "Catalog cleanup cycle failed",
+        "details": {
+            "error": "cleanup temporarily unavailable",
+            "consecutive_failures": 1,
+        },
+        "persist": True,
+        "component": "SUPERVISOR",
+        "severity": "ERROR",
+    }
+    assert notifications[1] == {
+        "event_type": "CATALOG_CLEANUP_RECOVERED",
+        "message": "Catalog cleanup recovered",
+        "details": {"failures_before_recovery": 1},
+        "persist": True,
+        "component": "SUPERVISOR",
+        "severity": "INFO",
+    }
+
+
+@pytest.mark.asyncio
+async def test_default_runtime_persists_cleanup_failure_and_recovery_without_desktop(
+    tmp_path: Path,
+) -> None:
+    coordinator = _CleanupCoordinator()
+    finished = asyncio.Event()
+
+    async def sleep(_: float) -> None:
+        if len(coordinator.calls) >= 2:
+            finished.set()
+            await asyncio.Event().wait()
+        await asyncio.sleep(0)
+
+    supervisor = Supervisor(
+        _config(tmp_path),
+        gateway=object(),
+        sync_task_factory=lambda **_: _Sync([]),
+        watch_task_factory=lambda **_: _Watch([], crash=False),
+        sleep=sleep,
+        clock_ms=lambda: 44,
+    )
+    writer, _, notifier, _, watch = await supervisor._build_runtime()
+    task = asyncio.create_task(
+        supervisor._catalog_cleanup_forever(coordinator, notifier)
+    )
+
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=1)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await watch.close()
+        await writer.close()
+
+    with sqlite3.connect(_config(tmp_path).database.path) as connection:
+        rows = connection.execute(
+            "SELECT component, severity, event_type, message, occurred_at, "
+            "details_json FROM system_events ORDER BY id"
+        ).fetchall()
+
+    assert rows == [
+        (
+            "SUPERVISOR",
+            "ERROR",
+            "CATALOG_CLEANUP_FAILED",
+            "Catalog cleanup cycle failed",
+            44,
+            '{"consecutive_failures":1,"error":"cleanup temporarily unavailable"}',
+        ),
+        (
+            "SUPERVISOR",
+            "INFO",
+            "CATALOG_CLEANUP_RECOVERED",
+            "Catalog cleanup recovered",
+            44,
+            '{"failures_before_recovery":1}',
+        ),
     ]
 
 

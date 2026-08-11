@@ -365,7 +365,7 @@ class Supervisor:
                                 "consecutive_failures": consecutive_failures,
                             },
                             persist=True,
-                            component="CATALOG_CLEANUP",
+                            component="SUPERVISOR",
                             severity="ERROR",
                         )
                     except Exception:
@@ -378,7 +378,7 @@ class Supervisor:
                             message="Catalog cleanup recovered",
                             details={"failures_before_recovery": consecutive_failures},
                             persist=True,
-                            component="CATALOG_CLEANUP",
+                            component="SUPERVISOR",
                             severity="INFO",
                         )
                     except Exception:

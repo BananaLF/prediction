@@ -88,13 +88,13 @@ async def test_persistent_operational_notification_is_audited_without_desktop() 
         message="Catalog cleanup failed",
         details={"error": "database busy", "consecutive_failures": 1},
         persist=True,
-        component="CATALOG_CLEANUP",
+        component="SUPERVISOR",
         severity="ERROR",
     )
 
     assert events.entries == [
         {
-            "component": "CATALOG_CLEANUP",
+            "component": "SUPERVISOR",
             "severity": "ERROR",
             "event_type": "CATALOG_CLEANUP_FAILED",
             "message": "Catalog cleanup failed",
