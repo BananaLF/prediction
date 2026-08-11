@@ -77,7 +77,7 @@ def test_failure_risk_enumerates_partial_legs_and_conversion_failure() -> None:
                 "FIRST_LEG_ONLY", Decimal("2.50"), (first,), Decimal("2.50")
             ),
             FailureScenario(
-                "PARTIAL_LEGS", Decimal("4.50"), (first, second), Decimal("1.25")
+                "PARTIAL_LEGS_2", Decimal("4.50"), (first, second), Decimal("1.25")
             ),
             FailureScenario(
                 "CONVERSION_FAILURE", Decimal("5.00"), (first, second), Decimal("0")
@@ -90,14 +90,14 @@ def test_failure_risk_enumerates_partial_legs_and_conversion_failure() -> None:
     assert tuple((item.name, item.loss) for item in risk.scenarios) == (
         ("CONVERSION_FAILURE", Decimal("2.60")),
         ("FIRST_LEG_ONLY", Decimal("0.50")),
-        ("PARTIAL_LEGS", Decimal("2.10")),
+        ("PARTIAL_LEGS_2", Decimal("2.10")),
     )
     assert risk.worst_case_loss == Decimal("2.60")
     assert risk.unhedged_notional == Decimal("2.50")
     assert risk.risk_flags == (
         "CONVERSION_FAILURE",
         "FIRST_LEG_ONLY",
-        "PARTIAL_LEGS",
+        "PARTIAL_LEGS_2",
         "UNCLOSEABLE_EXPOSURE",
     )
 

@@ -153,8 +153,7 @@ class FeeCalculator:
             amount = quantity * rate * (base**exponent)
             if amount <= Decimal("0"):
                 return Decimal("0")
-            rounded = amount.quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP)
-            return max(rounded, Decimal("0.00001"))
+            return amount.quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP)
         raise ValueError(f"unknown fee model: {schedule.model}")
 
 

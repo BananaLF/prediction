@@ -1,7 +1,7 @@
 # Polymarket arbitrage strategy research and evaluation
 
 **Issue:** [#29](https://github.com/BananaLF/prediction/issues/29)
-**Research date:** 2026-08-10
+**Research date:** 2026-08-11
 **Scope:** research, replay, and acceptance design only; no live orders or funds
 
 ## Executive recommendation
@@ -20,13 +20,14 @@ This ordering is a risk and observability recommendation, not a claim that any s
 
 ## Official source register
 
-Sources were checked on 2026-08-10. Polymarket documentation is time-sensitive; the fee rate and market capabilities must be fetched for each market at evaluation time rather than hard-coded.
+Sources were checked on 2026-08-11. Polymarket documentation is time-sensitive; the fee rate and market capabilities must be fetched for each market at evaluation time rather than hard-coded.
 
 | Topic | Official source and current fact used |
 | --- | --- |
 | Price and executable book | [Prices & Orderbook](https://docs.polymarket.com/concepts/prices-orderbook): buys consume asks, sells consume bids; displayed prices and midpoints are not a fill guarantee. |
-| Fees | [Fees](https://docs.polymarket.com/trading/fees): taker fees are applied at match time and fee parameters are market-dependent. |
-| Order states and partial fills | [Order Lifecycle](https://docs.polymarket.com/concepts/order-lifecycle) and [Create Order](https://docs.polymarket.com/trading/orders/create): orders can be partially filled; FOK is all-or-nothing and FAK permits a partial fill. |
+| Fees | [Fees](https://docs.polymarket.com/trading/fees): current taker formula is `C × feeRate × p × (1-p)`; fees are rounded to five decimals and values below the precision round to zero. |
+| Order states, precision, and partial fills | [Place Orders](https://docs.polymarket.com/trading/place-orders): each FOK order fills entirely or not at all; tick, size, amount precision, and `min_order_size` must be validated before submission. |
+| Position-operation gas | [Wallets & Authentication](https://docs.polymarket.com/trading/wallets-auth#execute-gasless-transactions): account-wallet relayer/builder flows may sponsor position operations; direct EOA operations require POL gas. |
 | Trading boundary | [Trading overview](https://docs.polymarket.com/trading/overview): matching is off-chain while settlement is on-chain; authenticated order APIs are distinct from public market data. |
 | Binary positions | [Positions & Tokens](https://docs.polymarket.com/concepts/positions-tokens): splitting creates Yes and No tokens and merging consumes equal quantities. |
 | Split/merge | [Merge tokens](https://docs.polymarket.com/trading/ctf/merge): merge is atomic and requires equal quantities; insufficient balances revert. |
@@ -37,7 +38,7 @@ The official docs describe platform mechanics. They do not establish a guarantee
 
 ## Candidate strategies
 
-Let q be the candidate quantity, a_i the ask consumed for a buy leg, b_i the bid consumed for a sell leg, f_i the fee charged for that fill, and c the conversion, gas, and safety cost. Every price and fee must come from the same valid catalog and order-book observation.
+Let `q` be the candidate quantity, `q_i` the quantity consumed at depth level `i`, `a_i`/`b_i` that level's ask/bid, `f_i` the fee charged for a fill, and `c` the conversion, gas, and safety cost. Every price and fee must come from the same valid catalog and order-book observation.
 
 | Strategy | Gross calculation | Necessary execution conditions | Main failure or risk |
 | --- | --- | --- | --- |
@@ -52,19 +53,23 @@ For binary paths, sums mean depth-walked fills rather than top-of-book multiplic
 
 ## Cost, capital, and atomicity assessment
 
-- Fees: use the market current fee-enabled state and parameters. A displayed spread is not a net spread until each fill fee and conversion or gas cost is included.
+- Net profit: `proceeds - leg notionals - all fill fees - conversion cost - conservative gas bound - safety buffer`. Any unknown term rejects the plan.
+- Fees: for the current official schedule, `fee = shares × feeRate × price × (1-price)`, rounded half-up to five decimals; smaller values round to zero. Example: 10 taker shares at `p=0.40`, `feeRate=0.05` cost `0.12000`; at `p=0.50` they cost `0.12500`. Buying complementary legs at those prices costs `9.24500`, leaving `0.75500` before conversion, gas, and safety costs.
 - Slippage: consume every visible level needed for q and report average and worst price per leg. Reject a plan when required depth is absent or the price changes beyond the evidence window.
-- Liquidity: apply the smallest common quantity across all legs and each market minimum order size. A positive unit margin at one level is not enough for the complete quantity.
+- Precision and liquidity: quantize price to the market tick, round share quantity down to the documented size precision (currently two decimals), encode USD amount with the tick-dependent precision table, then recheck `min_order_size`. Reject if the exact SDK-encoded amount cannot be reproduced or any leg falls below its minimum.
 - Capital: reserve collateral for split or merge and a safety buffer; include capital locked while waiting for resolution or transfer.
-- Atomicity: CTF or NegRisk conversion may be atomic at the conversion boundary, but preceding exchange orders can still be partial. A multi-order plan must define every filled-leg prefix.
+- Gas: use zero only after confirming an authenticated sponsored relayer route for that operation; direct EOA split/merge/conversion requires a configured conservative POL gas quote. Missing credentials, route confirmation, quote, or bound fails closed.
+- Atomicity: CTF or NegRisk conversion may be atomic at the conversion boundary, but each FOK guarantee applies to one order only. Sequential or batched multi-order submission is not all-leg atomic, so every filled-leg prefix and delayed `pending` response must be modelled explicitly.
 - Settlement: immediate conversion differs from hold-to-resolution. A settlement payoff is not a realized return until the position is actually settled and reconciled.
 
 ## Replay and simulation plan
 
+The committed historical fixture is [signal-execution-diagnosis-evidence-2026-08-10.json](signal-execution-diagnosis-evidence-2026-08-10.json). Running `python scripts/replay_signal_evidence.py docs/signal-execution-diagnosis-evidence-2026-08-10.json` independently walks full depth and recalculates fees for two binary strategies across four revisions. It exactly reproduces profits `1.12821`, `-0.222895`, `4.48684`, and `-0.222645`, including the transition from profitable to below-threshold. It validates the binary candidate paths as `orderbook_checked_estimate`; NegRisk, implication, timing, and cross-platform candidates remain research-only until equivalent fixtures exist.
+
 1. Freeze a catalog generation ID and complete event, market, and token metadata.
 2. Capture immutable order-book snapshots for every required token, including exchange timestamps, subscription generation, full depth, minimum order size, tick size, and fee parameters.
 3. Re-run each strategy at each snapshot with exact decimal arithmetic. Store theoretical_estimate separately from orderbook_checked_estimate.
-4. Apply a deterministic fill model: FOK either fills every requested leg or none; FAK consumes available depth and records the filled prefix; GTC remains pending until an explicit match or cancellation. The model must not convert a theoretical leg into a fill without evidence.
+4. Apply a deterministic fill model: each individual FOK order either fills completely or not at all; this does not make several FOK legs atomic. FAK consumes available depth and records the filled prefix; GTC or a delayed response remains pending until an explicit match or cancellation. The model must not convert a theoretical leg into a fill without evidence.
 5. Replay conversion, cancellation, residual-exposure, and resolution paths. Record simulated cash, token inventory, fees, slippage, capital lock time, and terminal settlement separately.
 6. Compare decisions and outcomes against the source snapshot and preserve a replay manifest containing source hashes, strategy version, fee version, and assumptions. Do not call the result realized.
 

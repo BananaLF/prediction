@@ -2,7 +2,7 @@
 
 **Issue:** [#28](https://github.com/BananaLF/prediction/issues/28)
 **Evidence date:** 2026-08-10
-**Repository baseline:** origin/main at 77f389fc
+**Repository baseline:** origin/main at 238e3b9
 
 ## Conclusion
 
@@ -12,7 +12,14 @@ The root cause of the reported return false positive is an observability and sem
 
 ## Evidence boundary
 
-The reproduction used the local side-by-side database data/catalog-v4-acceptance.sqlite3. It is a v3 test or acceptance database, not the production target, and is intentionally not treated as production evidence. It contains signal, revision, leg, order-book snapshot, order-book level, and system-event records, but no order, fill, trade, wallet, or realized-P&L source.
+The reproduction used `data/catalog-v4-acceptance.sqlite3`. It is a v3 acceptance database, not the production target. A deterministic, reviewable subset is committed as [signal-execution-diagnosis-evidence-2026-08-10.json](signal-execution-diagnosis-evidence-2026-08-10.json) (SHA-256 `9808f6bf1a3a7796dbae1cd215d0a582d4b27fc7037974340452e8bd341817e2`). The bundle records the source database SHA-256 (`1778c19b9ac2e36a459655182f0b8182a288600255d48232e002cadd1b8008d6`) and contains the relevant signals, revisions, legs, full order-book depth, fee schedules, and table-capability inventory. The source database itself remains uncommitted.
+
+Reproduce the bundle when the source database is available:
+
+```bash
+python scripts/export_signal_diagnosis.py data/catalog-v4-acceptance.sqlite3 \
+  --output docs/signal-execution-diagnosis-evidence-2026-08-10.json
+```
 
 Runtime and schema inspection confirm the boundary:
 
@@ -36,7 +43,7 @@ For the underpriced signal, the buy asks changed from approximately 0.34/0.40 to
 
 There are eight order-book snapshots, two per signal revision, with complete levels and matching subscription generation. No system event links either signal to a conversion, order, fill, cancellation, or execution failure. The observed system-event types are sync, queue, and settlement events; they do not constitute trading events.
 
-The evidence chain is reproducible from the local database copy:
+The evidence chain is independently reviewable from the committed bundle:
 
 | Signal | Revision evidence | Leg evidence | Order-book evidence | System-event evidence |
 | --- | --- | --- | --- | --- |
@@ -56,6 +63,10 @@ The runtime has no order submission, cancellation, wallet, or settlement adapter
 
 No reproducible code defect was found in the failure-label calculation. The defect is in the meaning assigned downstream if these fields are presented as execution outcomes. The minimal safe policy is to label these values as theoretical_estimate or orderbook_checked_estimate, and to report simulated and realized as unavailable unless an explicit execution source exists.
 
+## Deterministic replay
+
+Run `python scripts/replay_signal_evidence.py docs/signal-execution-diagnosis-evidence-2026-08-10.json`. The replay independently walks the committed L2 levels, recalculates average/worst prices and current fee schedules, separates the inferred safety buffer, and checks all persisted expected-profit values exactly. The four results are `1.12821`, `-0.222895`, `4.48684`, and `-0.222645`; inferred buffers are `0.00925`, `0.012625`, `0.063`, and `0.012375`. This is an `orderbook_checked_estimate`, not fill or realized-P&L evidence.
+
 ## Regression contract
 
 The risk tests reproduce positive-loss scenario labels using deterministic exposures and visible bid depth. They must continue to assert that:
@@ -69,4 +80,4 @@ The existing tests cover the conservative depth walk, partial-leg and conversion
 
 ## Follow-up acceptance
 
-This diagnosis is complete for the current read-only implementation when a reviewer can reproduce the table above from a supplied database copy and verify that no order or fill source exists. A behavior change is deliberately not proposed until the product defines an execution model, event states, fill authority, and realized-P&L reconciliation. Production v4 observation and the 30-minute runtime window remain Issue #20/#25 operational prerequisites.
+This diagnosis is complete for the current read-only implementation when a reviewer can reproduce the table above from the committed bundle and verify that no order or fill source exists. A source-database holder can additionally regenerate the bundle byte-for-byte using the recorded hash and command. A behavior change is deliberately not proposed until the product defines an execution model, event states, fill authority, and realized-P&L reconciliation.
