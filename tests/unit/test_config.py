@@ -26,6 +26,19 @@ def test_default_config_has_greenfield_limits(tmp_path: Path) -> None:
     assert config.relations.llm_enabled is False
 
 
+def test_load_uses_cleanup_defaults_for_legacy_runtime_config(tmp_path: Path) -> None:
+    raw = yaml.safe_load(Path("config/default.yaml").read_text())
+    del raw["runtime"]["catalog_cleanup_interval_seconds"]
+    del raw["runtime"]["catalog_cleanup_batch_rows"]
+    path = tmp_path / "legacy-runtime.yaml"
+    path.write_text(yaml.safe_dump(raw))
+
+    config = AppConfig.load(path)
+
+    assert config.runtime.catalog_cleanup_interval_seconds == 10
+    assert config.runtime.catalog_cleanup_batch_rows == 8_000
+
+
 @pytest.mark.parametrize(
     ("section", "key", "value"),
     [

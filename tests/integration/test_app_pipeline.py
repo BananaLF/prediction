@@ -685,6 +685,48 @@ async def test_catalog_cleanup_worker_retries_after_failure_and_uses_configured_
 
 
 @pytest.mark.asyncio
+async def test_catalog_cleanup_worker_reports_failure_recovery_and_backs_off(
+    tmp_path: Path,
+) -> None:
+    coordinator = _CleanupCoordinator()
+    sleep_intervals: list[float] = []
+    notifications: list[dict[str, object]] = []
+    finished = asyncio.Event()
+
+    class RecordingNotifier:
+        async def notify(self, **payload: object) -> None:
+            notifications.append(payload)
+
+    async def sleep(interval: float) -> None:
+        sleep_intervals.append(interval)
+        if len(sleep_intervals) >= 2:
+            finished.set()
+            await asyncio.Event().wait()
+        await asyncio.sleep(0)
+
+    supervisor = Supervisor(_config(tmp_path), sleep=sleep)
+    task = asyncio.create_task(
+        supervisor._catalog_cleanup_forever(
+            coordinator,
+            RecordingNotifier(),  # type: ignore[arg-type]
+        )
+    )
+
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=1)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert sleep_intervals == [20, 10]
+    assert [item["event_type"] for item in notifications] == [
+        "CATALOG_CLEANUP_FAILED",
+        "CATALOG_CLEANUP_RECOVERED",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_periodic_sync_notifies_when_generation_skips_malformed_markets(
     tmp_path: Path,
 ) -> None:

@@ -137,6 +137,9 @@ def _polymarket_config(raw: dict[str, Any]) -> PolymarketConfig:
 
 
 def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
+    raw = dict(raw)
+    raw.setdefault("catalog_cleanup_interval_seconds", 10)
+    raw.setdefault("catalog_cleanup_batch_rows", 8_000)
     _require_keys(
         raw,
         {

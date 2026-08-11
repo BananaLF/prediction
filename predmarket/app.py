@@ -110,7 +110,7 @@ class Supervisor:
                 database_path=self._config.database.path,
             )
             cleanup_task = asyncio.create_task(
-                self._catalog_cleanup_forever(catalog_cleanup),
+                self._catalog_cleanup_forever(catalog_cleanup, notifier),
                 name="CatalogCleanupTask",
             )
             _LOGGER.info("component_started component=catalog_cleanup_task")
@@ -335,8 +335,11 @@ class Supervisor:
             await self._sleep(interval)
 
     async def _catalog_cleanup_forever(
-        self, coordinator: CatalogGenerationCoordinator
+        self,
+        coordinator: CatalogGenerationCoordinator,
+        notifier: Notifier | None = None,
     ) -> None:
+        consecutive_failures = 0
         while True:
             try:
                 result = await coordinator.cleanup(
@@ -345,12 +348,36 @@ class Supervisor:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                consecutive_failures += 1
                 _LOGGER.warning(
-                    "catalog_cleanup_failed error=%s",
+                    "catalog_cleanup_failed consecutive_failures=%d error=%s",
+                    consecutive_failures,
                     error,
                     exc_info=(type(error), error, error.__traceback__),
                 )
+                if notifier is not None:
+                    try:
+                        await notifier.notify(
+                            event_type="CATALOG_CLEANUP_FAILED",
+                            message="Catalog cleanup cycle failed",
+                            details={
+                                "error": str(error),
+                                "consecutive_failures": consecutive_failures,
+                            },
+                        )
+                    except Exception:
+                        _LOGGER.warning("catalog_cleanup_notification_failed", exc_info=True)
             else:
+                if consecutive_failures and notifier is not None:
+                    try:
+                        await notifier.notify(
+                            event_type="CATALOG_CLEANUP_RECOVERED",
+                            message="Catalog cleanup recovered",
+                            details={"failures_before_recovery": consecutive_failures},
+                        )
+                    except Exception:
+                        _LOGGER.warning("catalog_cleanup_notification_failed", exc_info=True)
+                consecutive_failures = 0
                 _LOGGER.info(
                     "catalog_cleanup_cycle_completed deleted_versions=%d "
                     "deleted_journal_rows=%d remaining_versions=%d "
@@ -360,9 +387,10 @@ class Supervisor:
                     result.remaining_versions,
                     result.remaining_journal_rows,
                 )
-            await self._sleep(
-                self._config.runtime.catalog_cleanup_interval_seconds
-            )
+            interval = self._config.runtime.catalog_cleanup_interval_seconds
+            if consecutive_failures:
+                interval *= min(2**consecutive_failures, 32)
+            await self._sleep(interval)
 
     async def _record_overflow(
         self, system_events: SystemEventRepository, overflow: MarketChangeOverflow
