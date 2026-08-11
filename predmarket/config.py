@@ -35,6 +35,8 @@ class RuntimeConfig:
     watch_market_limit: int
     watch_minimum_end_horizon_seconds: int
     market_stream_queue_capacity: int
+    catalog_cleanup_interval_seconds: int
+    catalog_cleanup_batch_rows: int
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,9 @@ def _polymarket_config(raw: dict[str, Any]) -> PolymarketConfig:
 
 
 def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
+    raw = dict(raw)
+    raw.setdefault("catalog_cleanup_interval_seconds", 10)
+    raw.setdefault("catalog_cleanup_batch_rows", 8_000)
     _require_keys(
         raw,
         {
@@ -142,6 +147,8 @@ def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
             "watch_market_limit",
             "watch_minimum_end_horizon_seconds",
             "market_stream_queue_capacity",
+            "catalog_cleanup_interval_seconds",
+            "catalog_cleanup_batch_rows",
         },
         "runtime",
     )
@@ -153,6 +160,12 @@ def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
         ),
         market_stream_queue_capacity=_integer(
             raw, "market_stream_queue_capacity", "runtime"
+        ),
+        catalog_cleanup_interval_seconds=_positive_integer(
+            raw, "catalog_cleanup_interval_seconds", "runtime"
+        ),
+        catalog_cleanup_batch_rows=_bounded_integer(
+            raw, "catalog_cleanup_batch_rows", "runtime", maximum=8_000
         ),
     )
 
@@ -278,6 +291,22 @@ def _integer(raw: dict[str, Any], key: str, section: str) -> int:
     value = raw[key]
     if type(value) is not int:
         raise ValueError(f"{section}.{key} must be an integer")
+    return value
+
+
+def _positive_integer(raw: dict[str, Any], key: str, section: str) -> int:
+    value = _integer(raw, key, section)
+    if value < 1:
+        raise ValueError(f"{section}.{key} must be positive")
+    return value
+
+
+def _bounded_integer(
+    raw: dict[str, Any], key: str, section: str, *, maximum: int
+) -> int:
+    value = _positive_integer(raw, key, section)
+    if value > maximum:
+        raise ValueError(f"{section}.{key} must be at most {maximum}")
     return value
 
 

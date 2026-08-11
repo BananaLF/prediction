@@ -78,6 +78,32 @@ async def test_operational_error_notification_does_not_print_details() -> None:
     assert output.getvalue() == ""
 
 
+@pytest.mark.asyncio
+async def test_persistent_operational_notification_is_audited_without_desktop() -> None:
+    events = _SystemEvents()
+    notifier = Notifier(system_events=events, clock_ms=lambda: 43)
+
+    await notifier.notify(
+        event_type="CATALOG_CLEANUP_FAILED",
+        message="Catalog cleanup failed",
+        details={"error": "database busy", "consecutive_failures": 1},
+        persist=True,
+        component="SUPERVISOR",
+        severity="ERROR",
+    )
+
+    assert events.entries == [
+        {
+            "component": "SUPERVISOR",
+            "severity": "ERROR",
+            "event_type": "CATALOG_CLEANUP_FAILED",
+            "message": "Catalog cleanup failed",
+            "occurred_at": 43,
+            "details": {"error": "database busy", "consecutive_failures": 1},
+        }
+    ]
+
+
 def test_macos_desktop_notification_escapes_double_quoted_applescript_literals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

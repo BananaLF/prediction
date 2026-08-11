@@ -19,9 +19,24 @@ def test_default_config_has_greenfield_limits(tmp_path: Path) -> None:
     assert config.runtime.watch_market_limit == 50
     assert config.runtime.watch_minimum_end_horizon_seconds == 1_800
     assert config.runtime.market_stream_queue_capacity == 65_536
+    assert config.runtime.catalog_cleanup_interval_seconds == 10
+    assert config.runtime.catalog_cleanup_batch_rows == 8_000
     assert config.strategy.bankroll == Decimal("1000")
     assert config.strategy.exchange_clock_skew_warning_ms == 100
     assert config.relations.llm_enabled is False
+
+
+def test_load_uses_cleanup_defaults_for_legacy_runtime_config(tmp_path: Path) -> None:
+    raw = yaml.safe_load(Path("config/default.yaml").read_text())
+    del raw["runtime"]["catalog_cleanup_interval_seconds"]
+    del raw["runtime"]["catalog_cleanup_batch_rows"]
+    path = tmp_path / "legacy-runtime.yaml"
+    path.write_text(yaml.safe_dump(raw))
+
+    config = AppConfig.load(path)
+
+    assert config.runtime.catalog_cleanup_interval_seconds == 10
+    assert config.runtime.catalog_cleanup_batch_rows == 8_000
 
 
 @pytest.mark.parametrize(
