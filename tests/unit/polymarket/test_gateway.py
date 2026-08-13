@@ -7,6 +7,7 @@ from decimal import Decimal
 import importlib.metadata
 import json
 import logging
+import os
 from pathlib import Path
 import re
 from types import MappingProxyType, SimpleNamespace
@@ -58,6 +59,26 @@ DATETIME_FIELDS = {
     "game_start_time",
     "timestamp",
 }
+HOST_PROXY_ENVIRONMENT_VARIABLES = (
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_proxy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    for variable in HOST_PROXY_ENVIRONMENT_VARIABLES:
+        monkeypatch.delenv(variable, raising=False)
+
+
+def test_gateway_tests_do_not_inherit_host_proxy_environment() -> None:
+    assert all(
+        variable not in os.environ for variable in HOST_PROXY_ENVIRONMENT_VARIABLES
+    )
 
 
 class FixtureModel(SimpleNamespace):
